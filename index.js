@@ -19,12 +19,12 @@ app.use((_, res, next) => {
 app.options("*", (_, res) => res.sendStatus(200));
 
 // ─────────────────────────────────────────────────────────
-// ENV (Vercel injeta isso via Dashboard)
+// ENV
 // ─────────────────────────────────────────────────────────
 const ENV = {
   jackettUrl: (process.env.JACKETT_URL || "").replace(/\/+$/, ""),
   apiKey:     (process.env.JACKETT_API_KEY || "").trim(),
-  redisUrl:   process.env.REDIS_URL || "", // Recomendado: Upstash Redis
+  redisUrl:   process.env.REDIS_URL || "", 
 };
 
 // ─────────────────────────────────────────────────────────
@@ -45,7 +45,7 @@ const rc = {
   async keys(p)        { try { return redis ? await redis.keys(p) : []; } catch { return []; } },
 };
 
-const CACHE_VERSION = "v4-ptbr-strict-vercel";
+const CACHE_VERSION = "v4-ptbr-strict-proxy-v5";
 
 // ─────────────────────────────────────────────────────────
 // INDEXERS (ISOLAMENTO DE ANIME)
@@ -177,6 +177,7 @@ const VISUAL = [
   { re: /\bhdr\b/i,                   label: "HDR"    },
   { re: /\bsdr\b/i,                   label: "SDR"    },
 ];
+
 const LANG = [
   { re: /(dublado|pt[-.]?br|portugu[eê]s|portuguese|brazilian)/i, code: "pt-br", emoji: "🇧🇷", label: "PT-BR" },
   { re: /\b(english|eng)\b/i,  code: "en", emoji: "🇺🇸", label: "EN" },
@@ -613,6 +614,28 @@ app.get("/:userConfig/manifest.json", (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────
+// ⚡ KEEP-ALIVE PARA RENDER (P/ VERCEL COLD STARTS)
+// ─────────────────────────────────────────────────────────
+function startKeepAlive() {
+  if (!ENV.jackettUrl || ENV.jackettUrl.includes("localhost") || ENV.jackettUrl.includes("127.0.0.1")) return;
+
+  const pingJackett = async () => {
+    try {
+      await axios.get(`${ENV.jackettUrl}/api/v2.0/indexers`, { timeout: 8000, validateStatus: () => true });
+      console.log(`💓 [KeepAlive] Ping de Cold Start enviado para o Jackett no Render.`);
+    } catch (e) {
+      console.warn(`💔 [KeepAlive] Falha ao contactar o Jackett: ${e.message}`);
+    }
+  };
+
+  // Dispara o ping agora mesmo para acordar o render assim que a função Vercel for invocada
+  pingJackett();
+
+  // Define um timer de cortesia caso a função se mantenha quente tempo suficiente (útil para VPS tb)
+  setInterval(pingJackett, 9 * 60 * 1000);
+}
+
+// ─────────────────────────────────────────────────────────
 // ⚡ STREAMS COM BACKEND PROXY
 // ─────────────────────────────────────────────────────────
 const BAD_RE = /\b(cam|hdcam|camrip|workprint)\b/i; 
@@ -693,5 +716,18 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
   }
 });
 
-// Vercel Entrypoint
+// ─────────────────────────────────────────────────────────
+// INICIALIZAÇÃO VERCEL (INTERCEPTAÇÃO APP.HANDLE)
+// ─────────────────────────────────────────────────────────
+let appInitialized = false;
+const originalHandler = app.handle.bind(app);
+
+app.handle = function(req, res, next) {
+  if (!appInitialized) {
+    appInitialized = true;
+    startKeepAlive();
+  }
+  return originalHandler(req, res, next);
+};
+
 module.exports = app;
