@@ -1,18 +1,14 @@
 {
-  "name": "prowjack-pro",
-  "version": "3.0.0",
-  "description": "ProwJack PRO — Jackett Stremio Addon",
-  "main": "addon.js",
+  "name": "prowjack-pro-vercel",
+  "version": "3.6.0",
+  "description": "ProwJack PRO for Vercel",
+  "main": "index.js",
   "scripts": {
-    "start": "node addon.js",
-    "dev":   "nodemon addon.js"
+    "start": "node index.js"
   },
   "dependencies": {
-    "axios":   "^1.7.0",
-    "express": "^4.19.0",
-    "ioredis": "^5.3.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.0"
+    "axios": "^1.6.8",
+    "express": "^4.19.2",
+    "ioredis": "^5.3.2"
   }
 }
