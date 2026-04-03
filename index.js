@@ -467,7 +467,7 @@ async function jackettSearch(queries, indexers, prefs) {
   
   if (cached) return JSON.parse(cached); 
 
-  const FAST_TIMEOUT = 12000, SLOW_TIMEOUT = 50000; 
+  const FAST_TIMEOUT = 8000, SLOW_TIMEOUT = 30000; 
   const tasks = [];
   for (const query of queryList) {
       for (const indexer of indexers) {
