@@ -257,7 +257,12 @@ function normalizeTitleTokens(str) {
     .replace(/\s+/g, " ")
     .trim()
     .split(" ")
-    .filter(tok => tok.length >= 3);
+    .filter(tok => tok.length >= 3 || /^(?:[a-z]\d|\d[a-z]|[a-z]\d[a-z]|\d[a-z]\d)$/i.test(tok))
+    .filter(tok => !new Set(["the", "movie", "film", "one", "two", "and", "for", "with", "from", "into", "part"]).has(tok));
+}
+
+function escapedWordRegex(text) {
+  return String(text || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function titleMatchScore(title, aliases = []) {
@@ -276,8 +281,11 @@ function titleMatchScore(title, aliases = []) {
     const coverage = matched / aliasTokens.length;
     const density  = matched / Math.max(titleTokens.length, aliasTokens.length);
     const phraseHit = aliasText.length >= 5 && titleText.includes(aliasText);
+    const exactShortHit = aliasTokens.length === 1 && aliasTokens[0].length <= 3
+      ? new RegExp(`(^|[^a-z0-9])${escapedWordRegex(aliasTokens[0])}([^a-z0-9]|$)`, "i").test(String(title || ""))
+      : false;
 
-    if (!phraseHit) {
+    if (!phraseHit && !exactShortHit) {
       if (aliasTokens.length <= 2 && matched < aliasTokens.length) continue;
       if (aliasTokens.length === 3 && matched < 2) continue;
     }
@@ -287,6 +295,7 @@ function titleMatchScore(title, aliases = []) {
     if (aliasTokens.length >= 2 && matched >= aliasTokens.length - 1) score += 0.15;
     if (titleTokens.some(tok => aliasSet.has(tok))) score += 0.05;
     if (phraseHit) score += 0.25;
+    if (exactShortHit) score += 0.35;
     best = Math.max(best, Math.min(score, 1));
   }
   return best;
@@ -295,6 +304,11 @@ function titleMatchScore(title, aliases = []) {
 function extractReleaseYear(text) {
   const m = String(text || "").match(/\b(19\d{2}|20\d{2}|21\d{2})\b/);
   return m ? parseInt(m[1], 10) : null;
+}
+
+function looksLikeEpisodeRelease(title) {
+  const t = String(title || "");
+  return /\bs\d{1,2}[\s._-]*e\d{1,3}\b|\b\d{1,2}x\d{1,3}\b|\bseason\s?\d{1,2}\b|\btemporada\s?\d{1,2}\b|\bepisode\s?\d{1,3}\b|\bcap[ií]tulo\s?\d{1,3}\b/i.test(t);
 }
 
 function isCompletePack(title) {
@@ -900,9 +914,16 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     let rejectedBySeriesFilter = 0;
     let rejectedByTitleMatch   = 0;
     let rejectedByYear         = 0;
+    let rejectedByMovieShape   = 0;
     const candidates = results
       .filter(r => r?.InfoHash || r?.MagnetUri || r?.Link)
       .filter(r => !prefs.skipBadReleases || !BAD_RE.test(r.Title || ""))
+      .filter(r => {
+        if (type !== "movie") return true;
+        const ok = !looksLikeEpisodeRelease(r.Title || "");
+        if (!ok) rejectedByMovieShape++;
+        return ok;
+      })
       .filter(r => {
         if (parsed.isAnime) return animeEpisodeMatches(r.Title || "", episode);
         if (type === "series") {
@@ -963,6 +984,8 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       console.log(`Filtro de Titulo: ${rejectedByTitleMatch} resultados descartados.`);
     if (rejectedByYear > 0)
       console.log(`Filtro de Ano: ${rejectedByYear} resultados descartados.`);
+    if (rejectedByMovieShape > 0)
+      console.log(`Filtro de Filme: ${rejectedByMovieShape} resultados episodicos descartados.`);
 
     const langLabel = priorityLang
       ? `Idioma prioritário: ${priorityLang.toUpperCase()}`
