@@ -244,39 +244,89 @@ function score(r, weights = {}, isAnime = false, priorityLang = "") {
   const codec = first(CODEC, t); if (codec) s += codec.score * w.codec * 5;
   return s;
 }
+
+function normalizeTitleTokens(str) {
+  return (str || "")
+    .toLowerCase()
+    .replace(/[._]+/g, " ")
+    .replace(/[\[\(][^\]\)]*[\]\)]/g, " ")
+    .replace(/\b(19|20)\d{2}\b/g, " ")
+    .replace(/\b(s\d{1,2}e\d{1,3}|\d{1,2}x\d{1,3}|season\s?\d{1,2}|temporada\s?\d{1,2}|episode\s?\d{1,3}|ep\s?\d{1,3})\b/gi, " ")
+    .replace(/\b(2160p|1440p|1080p|720p|576p|480p|4k|remux|blu[-.]?ray|web[-.]?dl|webrip|hdrip|dvdrip|hdtv|brrip|x26[45]|h\.?26[45]|hevc|av1|avc|dual|multi|audio|dublado|legendado|pt[-.]?br|eng|english|spanish|espa[nñ]ol|french|fran[cç]ais|aac|ac3|ddp?|eac3|atmos|truehd|dts(?:[-.]?hd|[-.]?x)?|10bit|8bit|proper|repack|extended|uncut|complete|completa|batch)\b/gi, " ")
+    .replace(/[^a-z0-9\s]/g, " " )
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .filter(tok => tok.length >= 3);
+}
+
+function titleMatchScore(title, aliases = []) {
+  const titleTokens = normalizeTitleTokens(title);
+  if (!titleTokens.length) return 0;
+
+  let best = 0;
+  for (const alias of aliases.filter(Boolean)) {
+    const aliasTokens = normalizeTitleTokens(alias);
+    if (!aliasTokens.length) continue;
+
+    const aliasSet = new Set(aliasTokens);
+    const matched  = aliasTokens.filter(tok => titleTokens.includes(tok)).length;
+    const coverage = matched / aliasTokens.length;
+    const density  = matched / Math.max(titleTokens.length, aliasTokens.length);
+    let score      = coverage * 0.8 + density * 0.2;
+
+    if (aliasTokens.length >= 2 && matched >= aliasTokens.length - 1) score += 0.15;
+    if (titleTokens.some(tok => aliasSet.has(tok))) score += 0.05;
+    best = Math.max(best, Math.min(score, 1));
+  }
+  return best;
+}
+
+function isCompletePack(title) {
+  return /\b(complete|completa|complete season|season pack|series pack|batch|全集)\b/i.test(title || "");
+}
+
+function episodeMatchRank(title, season, episode) {
+  if (season == null || episode == null) return 1;
+  const t    = (title || "").toLowerCase();
+  const sRaw = parseInt(season, 10);
+  const eRaw = parseInt(episode, 10);
+
+  if (new RegExp(`\\bs0*${sRaw}[\\s._-]*e0*${eRaw}\\b|\\b0*${sRaw}x0*${eRaw}\\b`, "i").test(t)) return 3;
+  if (isCompletePack(t)) {
+    const seasonOnly = new RegExp(`\\bs0*${sRaw}\\b|\\bseason\\s?0*${sRaw}\\b|\\btemporada\\s?0*${sRaw}\\b`, "i");
+    return seasonOnly.test(t) ? 1 : 0;
+  }
+  return 0;
+}
+
+function animeEpisodeMatchRank(title, ep) {
+  if (ep == null) return 1;
+  const t = (title || "").replace(/\./g, " ");
+  const n = ep;
+
+  if (new RegExp(`-\\s*0*${n}(?:v\\d+)?\\s*[\\[\\(\\s]`, "i").test(t)) return 3;
+  if (new RegExp(`\\[0*${n}(?:v\\d+)?\\]`, "i").test(t)) return 3;
+  if (new RegExp(`(?<=[\\s._\-\\[\\(])0*${String(n).padStart(2, "0")}(?:v\\d+)?(?=[\\s._\-\\]\\)\\[]|$)`, "i").test(t)) return 3;
+  if (new RegExp(`(?<=[\\s._\-\\[\\(])0*${String(n).padStart(3, "0")}(?:v\\d+)?(?=[\\s._\-\\]\\)\\[]|$)`, "i").test(t)) return 3;
+  if (new RegExp(`\\bE(?:p(?:isode)?)?\\s*0*${n}\\b`, "i").test(t)) return 3;
+
+  for (const m of t.matchAll(/\b(\d{1,3})\s*[-~]\s*(\d{1,3})\b/g)) {
+    const lo = parseInt(m[1], 10), hi = parseInt(m[2], 10);
+    if (n >= lo && n <= hi) return 2;
+  }
+
+  if (isCompletePack(t)) return 1;
+  return 0;
+}
 // ─────────────────────────────────────────────────────────
 // FILTRO ESTRITO DE EPISÓDIOS
 // ─────────────────────────────────────────────────────────
 function seriesEpisodeMatches(title, season, episode) {
-  if (season == null || episode == null) return true;
-  const t    = (title || "").toLowerCase();
-  const sRaw = parseInt(season,  10);
-  const eRaw = parseInt(episode, 10);
-  if (new RegExp(`\\bs0*${sRaw}[\\s.-_]?e0*${eRaw}\\b|\\b0*${sRaw}x0*${eRaw}\\b`, 'i').test(t)) return true;
-  if (new RegExp(`\\bs0*${sRaw}\\b(?!\\s?[.-_]?e\\d)|\\bseason\\s?0*${sRaw}\\b|\\btemporada\\s?0*${sRaw}\\b`, 'i').test(t)) return true;
-  const mm = t.match(/s0*(\d{1,2})\s*[-~]\s*s?0*(\d{1,2})/i);
-  if (mm && sRaw >= parseInt(mm[1],10) && sRaw <= parseInt(mm[2],10)) return true;
-  if (/\b(complete|completa|todas as temporadas|series pack)\b/i.test(t)) return true;
-  return false;
+  return episodeMatchRank(title, season, episode) > 0;
 }
 function animeEpisodeMatches(title, ep) {
-  if (ep == null) return true;
-  const t = (title || "").replace(/\./g, " ");
-  const n = ep;
-  for (const m of t.matchAll(/\b(\d{1,3})\s*[-~]\s*(\d{1,3})\b/g)) {
-    const lo = parseInt(m[1], 10), hi = parseInt(m[2], 10);
-    if (n >= lo && n <= hi) return true;
-  }
-  const pad2 = String(n).padStart(2, "0");
-  const pad3 = String(n).padStart(3, "0");
-  if (new RegExp(`-\\s*0*${n}(?:v\\d+)?\\s*[\\[\\(\\s]`, "i").test(t)) return true;
-  for (const v of [pad2, pad3, String(n)]) {
-    if (new RegExp(`\\[0*${n}(?:v\\d+)?\\]`).test(t)) return true;
-    if (new RegExp(`(?<=[\\s\\._\\-\\[\\(])0*${v}(?:v\\d+)?(?=[\\s\\._\\-\\]\\)\\[]|$)`, "i").test(t)) return true;
-  }
-  if (new RegExp(`\\bE(?:p(?:isode)?)?\\s*0*${n}\\b`, "i").test(t)) return true;
-  if (new RegExp(`(?:^|[\\s\\[\\(\\-_])0*${n}(?:v\\d+)?(?=[\\s\\]\\)\\[\\-_]|$)`).test(t)) return true;
-  return false;
+  return animeEpisodeMatchRank(title, ep) > 0;
 }
 // ─────────────────────────────────────────────────────────
 // DEDUPLICAÇÃO
@@ -589,7 +639,7 @@ async function buildQueries(type, id) {
           `${t} ${ep}`,
         ]))
       : uniq(meta.aliases);
-    return { parsed, displayTitle: meta.title, queries, episode: ep };
+    return { parsed, displayTitle: meta.title, aliases: meta.aliases, queries, episode: ep };
   }
   const meta = await getCinemetaTitle(type, parsed.metaId);
   if (meta.isAnime) {
@@ -618,6 +668,7 @@ async function buildQueries(type, id) {
   return {
     parsed,
     displayTitle: meta.title,
+    aliases     : meta.aliases,
     queries     : uniq(queries.map(normTitle)),
     episode,
   };
@@ -706,7 +757,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
   }
   // ── Busca principal ───────────────────────────────────────────────────────
   try {
-    const { parsed, displayTitle, queries, episode } = await buildQueries(type, id);
+    const { parsed, displayTitle, aliases = [], queries, episode } = await buildQueries(type, id);
 
     // Verificação de categorias habilitadas
     const enabledCats = Array.isArray(prefs.categories) && prefs.categories.length
@@ -736,6 +787,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     const priorityLang = prefs.priorityLang ?? "pt-br";
 
     let rejectedBySeriesFilter = 0;
+    let rejectedByTitleMatch   = 0;
     const candidates = results
       .filter(r => r?.InfoHash || r?.MagnetUri || r?.Link)
       .filter(r => !prefs.skipBadReleases || !BAD_RE.test(r.Title || ""))
@@ -756,19 +808,37 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         if (!priorityLang)     return true; // sem lang definida = sem filtro
         return getLangs(r.Title || "", parsed.isAnime).some(l => l.code === priorityLang);
       })
+      .filter(r => {
+        const score = titleMatchScore(r.Title || "", [displayTitle, ...aliases]);
+        const minScore = parsed.isAnime ? 0.34 : 0.45;
+        const ok = score >= minScore;
+        if (!ok) rejectedByTitleMatch++;
+        r._titleMatchScore = score;
+        return ok;
+      })
       // FIX PRINCIPAL: score() agora recebe priorityLang.
       // Quando priorityLang="" : todos os idiomas pontuam igual — não-dublados
       //                          aparecem normalmente, ordenados por qualidade.
       // Quando priorityLang set: idioma selecionado aparece no topo, mas os
       //                          demais ainda aparecem abaixo (sem exclusão).
       .sort((a, b) =>
-        score(b, prefs.weights, parsed.isAnime, priorityLang) -
-        score(a, prefs.weights, parsed.isAnime, priorityLang)
+        ((parsed.isAnime
+          ? animeEpisodeMatchRank(b.Title || "", episode)
+          : episodeMatchRank(b.Title || "", parsed.season, parsed.episode)) * 10000 +
+          (b._titleMatchScore || 0) * 1000 +
+          score(b, prefs.weights, parsed.isAnime, priorityLang)) -
+        ((parsed.isAnime
+          ? animeEpisodeMatchRank(a.Title || "", episode)
+          : episodeMatchRank(a.Title || "", parsed.season, parsed.episode)) * 10000 +
+          (a._titleMatchScore || 0) * 1000 +
+          score(a, prefs.weights, parsed.isAnime, priorityLang))
       );
     // Nota: .slice() aplicado APÓS resolveInfoHash (fix Bug 2 anterior).
 
     if (type === "series" && rejectedBySeriesFilter > 0)
       console.log(`Filtro de Serie: ${rejectedBySeriesFilter} resultados descartados.`);
+    if (rejectedByTitleMatch > 0)
+      console.log(`Filtro de Titulo: ${rejectedByTitleMatch} resultados descartados.`);
 
     const langLabel = priorityLang
       ? `Idioma prioritário: ${priorityLang.toUpperCase()}`
