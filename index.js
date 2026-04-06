@@ -447,9 +447,87 @@ function extractInfoBuf(buf) {
   }
   return depth === 0 ? buf.slice(start, i) : null;
 }
+
+function decodeBencode(buf) {
+  let i = 0;
+  const parse = () => {
+    const c = String.fromCharCode(buf[i]);
+    if (c === "i") {
+      const end = buf.indexOf(0x65, i + 1);
+      const num = parseInt(buf.toString("utf8", i + 1, end), 10);
+      i = end + 1;
+      return num;
+    }
+    if (c === "l") {
+      i++;
+      const out = [];
+      while (buf[i] !== 0x65) out.push(parse());
+      i++;
+      return out;
+    }
+    if (c === "d") {
+      i++;
+      const out = {};
+      while (buf[i] !== 0x65) {
+        const key = parse();
+        out[String(key)] = parse();
+      }
+      i++;
+      return out;
+    }
+    let colon = i;
+    while (buf[colon] !== 0x3a) colon++;
+    const len = parseInt(buf.toString("utf8", i, colon), 10);
+    const start = colon + 1;
+    const end = start + len;
+    const out = buf.toString("utf8", start, end);
+    i = end;
+    return out;
+  };
+  return parse();
+}
+
+function extractTorrentFiles(buf) {
+  try {
+    const meta = decodeBencode(buf);
+    const info = meta?.info;
+    if (!info) return [];
+    if (Array.isArray(info.files)) {
+      return info.files.map((file, idx) => ({
+        idx,
+        name: Array.isArray(file.path) ? file.path.join("/") : String(file.path || info.name || ""),
+        size: Number(file.length) || 0,
+      }));
+    }
+    if (info.name) {
+      return [{ idx: 0, name: String(info.name), size: Number(info.length) || 0 }];
+    }
+  } catch {}
+  return [];
+}
+
+function pickEpisodeFile(files, season, episode, isAnime) {
+  if (!Array.isArray(files) || !files.length || episode == null) return null;
+  const scored = files.map(file => {
+    const name = file.name || "";
+    const rank = isAnime
+      ? animeEpisodeMatchRank(name, episode)
+      : episodeMatchRank(name, season, episode);
+    const videoBonus = /\.(mkv|mp4|avi|ts|m2ts|mov|wmv)$/i.test(name) ? 5 : 0;
+    return { ...file, rank, total: rank * 1000 + videoBonus + Math.min(file.size || 0, 50 * 1e9) / 1e9 };
+  }).filter(file => file.rank > 0);
+
+  if (!scored.length) return null;
+  scored.sort((a, b) => b.total - a.total);
+  return scored[0];
+}
+
 async function resolveInfoHash(r) {
-  if (r.InfoHash)  return r.InfoHash.toLowerCase();
-  if (r.MagnetUri) { const h = extractInfoHash(r.MagnetUri); if (h) return h; }
+  if (r.InfoHash)  return { infoHash: r.InfoHash.toLowerCase(), files: null };
+  if (r.MagnetUri) {
+    const h = extractInfoHash(r.MagnetUri);
+    if (h) return { infoHash: h, files: null };
+  }
   if (!r.Link)     return null;
   try {
     const res = await axios.get(r.Link, {
@@ -458,13 +536,24 @@ async function resolveInfoHash(r) {
       headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
     });
     const finalUrl = res.request?.res?.responseUrl || "";
-    if (finalUrl.startsWith("magnet:")) return extractInfoHash(finalUrl);
+    if (finalUrl.startsWith("magnet:")) {
+      const infoHash = extractInfoHash(finalUrl);
+      return infoHash ? { infoHash, files: null } : null;
+    }
     const buf     = Buffer.from(res.data);
     const bodyStr = buf.toString("utf8", 0, Math.min(buf.length, 200));
-    if (bodyStr.trimStart().startsWith("magnet:")) return extractInfoHash(bodyStr.trim());
+    if (bodyStr.trimStart().startsWith("magnet:")) {
+      const infoHash = extractInfoHash(bodyStr.trim());
+      return infoHash ? { infoHash, files: null } : null;
+    }
     if (buf[0] === 0x64) {
       const infoBuf = extractInfoBuf(buf);
-      if (infoBuf) return crypto.createHash("sha1").update(infoBuf).digest("hex");
+      if (infoBuf) {
+        return {
+          infoHash: crypto.createHash("sha1").update(infoBuf).digest("hex"),
+          files: extractTorrentFiles(buf),
+        };
+      }
     }
   } catch {}
   return null;
@@ -1021,20 +1110,31 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
     const resolvedAll = await Promise.all(
       candidates.map(async r => {
-        const infoHash = await resolveInfoHash(r);
-        if (!infoHash) {
+        const resolved = await resolveInfoHash(r);
+        if (!resolved?.infoHash) {
           console.log(`  Erro ou torrent vazio em "${(r.Title||"").slice(0,60)}"`);
           return null;
         }
+        const matchedFile = (type === "series" || parsed.isAnime)
+          ? pickEpisodeFile(resolved.files, parsed.season, parsed.episode ?? episode, parsed.isAnime)
+          : null;
         const indexerName            = r.Tracker || r.TrackerId || "Unknown";
         const { name, description }  = formatStream(r, indexerName, parsed.isAnime, prefs);
         const sources                = r.MagnetUri ? [r.MagnetUri] : [];
         return {
-          name, description, infoHash, sources,
+          name,
+          description: matchedFile?.name
+            ? `${description}\n📂 ${matchedFile.name}`
+            : description,
+          infoHash: resolved.infoHash,
+          fileIdx: matchedFile?.idx,
+          sources,
           behaviorHints: {
+            filename: matchedFile?.name,
+            videoSize: matchedFile?.size,
             bingeGroup: parsed.isAnime
               ? `prowjack|anime|${displayTitle}`
-              : `prowjack|${infoHash}`,
+              : `prowjack|${resolved.infoHash}`,
           },
         };
       })
