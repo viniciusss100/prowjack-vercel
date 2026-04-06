@@ -306,6 +306,22 @@ function extractReleaseYear(text) {
   return m ? parseInt(m[1], 10) : null;
 }
 
+function normalizeImdbId(value) {
+  if (!value) return null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+  if (/^tt\d+$/i.test(raw)) return raw.toLowerCase();
+  if (/^\d+$/.test(raw)) return `tt${raw}`;
+  const m = raw.match(/tt\d+/i);
+  return m ? m[0].toLowerCase() : null;
+}
+
+function getResultImdbId(r) {
+  return normalizeImdbId(
+    r?.ImdbId || r?.Imdb || r?.imdbId || r?.imdb || r?._imdbId || r?._imdb
+  );
+}
+
 function looksLikeEpisodeRelease(title) {
   const t = String(title || "");
   return /\bs\d{1,2}[\s._-]*e\d{1,3}\b|\b\d{1,2}x\d{1,3}\b|\bseason\s?\d{1,2}\b|\btemporada\s?\d{1,2}\b|\bepisode\s?\d{1,3}\b|\bcap[ií]tulo\s?\d{1,3}\b/i.test(t);
@@ -561,6 +577,7 @@ function parseTorznabResults(xml, indexer) {
       InfoHash: attrs.infohash ? attrs.infohash.toLowerCase() : null,
       Tracker: indexer,
       TrackerId: indexer,
+      ImdbId: normalizeImdbId(attrs.imdbid || attrs.imdb || attrs.imdbidnum || attrs.imdbnum),
       PublishDate: xmlTagValue(item, "pubDate") || null,
       _structuredMatch: true,
     };
@@ -883,6 +900,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
   // ── Busca principal ───────────────────────────────────────────────────────
   try {
     const { parsed, displayTitle, aliases = [], queries, episode, year, search } = await buildQueries(type, id);
+    const requestedImdbId = normalizeImdbId(search?.imdbId || parsed?.metaId);
 
     // Verificação de categorias habilitadas
     const enabledCats = Array.isArray(prefs.categories) && prefs.categories.length
@@ -942,6 +960,12 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         return getLangs(r.Title || "", parsed.isAnime).some(l => l.code === priorityLang);
       })
       .filter(r => {
+        const resultImdbId = getResultImdbId(r);
+        if (requestedImdbId && resultImdbId && resultImdbId === requestedImdbId) {
+          r._titleMatchScore = Math.max(r._titleMatchScore || 0, 1);
+          r._metaIdMatch = true;
+          return true;
+        }
         const score = titleMatchScore(r.Title || "", [displayTitle, ...aliases]);
         const minScore = parsed.isAnime ? 0.34 : 0.45;
         const ok = score >= minScore;
@@ -963,13 +987,15 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       // Quando priorityLang set: idioma selecionado aparece no topo, mas os
       //                          demais ainda aparecem abaixo (sem exclusão).
       .sort((a, b) =>
-        (((b._structuredMatch ? 1 : 0) * 20000) +
+        (((b._metaIdMatch ? 1 : 0) * 40000) +
+          ((b._structuredMatch ? 1 : 0) * 20000) +
           (parsed.isAnime
           ? animeEpisodeMatchRank(b.Title || "", episode)
           : episodeMatchRank(b.Title || "", parsed.season, parsed.episode)) * 10000 +
           (b._titleMatchScore || 0) * 1000 +
           score(b, prefs.weights, parsed.isAnime, priorityLang)) -
-        (((a._structuredMatch ? 1 : 0) * 20000) +
+        (((a._metaIdMatch ? 1 : 0) * 40000) +
+          ((a._structuredMatch ? 1 : 0) * 20000) +
           (parsed.isAnime
           ? animeEpisodeMatchRank(a.Title || "", episode)
           : episodeMatchRank(a.Title || "", parsed.season, parsed.episode)) * 10000 +
