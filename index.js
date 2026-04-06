@@ -292,6 +292,11 @@ function titleMatchScore(title, aliases = []) {
   return best;
 }
 
+function extractReleaseYear(text) {
+  const m = String(text || "").match(/\b(19\d{2}|20\d{2}|21\d{2})\b/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
 function isCompletePack(title) {
   return /\b(complete|completa|complete season|season pack|series pack|batch|全集)\b/i.test(title || "");
 }
@@ -502,6 +507,111 @@ async function jackettFetchIndexers() {
   } catch {}
   return [];
 }
+
+function decodeXmlEntities(str = "") {
+  return str
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'");
+}
+
+function xmlTagValue(xml, tag) {
+  const m = xml.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, "i"));
+  return m ? decodeXmlEntities(m[1].trim()) : null;
+}
+
+function parseTorznabResults(xml, indexer) {
+  const items = xml.match(/<item\b[\s\S]*?<\/item>/gi) || [];
+  return items.map(item => {
+    const attrs = {};
+    for (const m of item.matchAll(/<(?:torznab:)?attr\s+name="([^"]+)"\s+value="([^"]*)"\s*\/?/gi))
+      attrs[m[1].toLowerCase()] = decodeXmlEntities(m[2]);
+
+    const enclosure = item.match(/<enclosure\b[^>]*url="([^"]+)"[^>]*length="([^"]*)"/i);
+    const magnetUri = attrs.magneturl || null;
+    const link = magnetUri ? magnetUri : (xmlTagValue(item, "link") || enclosure?.[1] || null);
+    const size = attrs.size ? parseInt(attrs.size, 10) : (enclosure?.[2] ? parseInt(enclosure[2], 10) : 0);
+    const seeders = attrs.seeders ? parseInt(attrs.seeders, 10) : 0;
+
+    return {
+      Title: xmlTagValue(item, "title") || "",
+      Guid: xmlTagValue(item, "guid") || link || magnetUri || "",
+      Link: link,
+      MagnetUri: magnetUri,
+      Size: Number.isFinite(size) ? size : 0,
+      Seeders: Number.isFinite(seeders) ? seeders : 0,
+      InfoHash: attrs.infohash ? attrs.infohash.toLowerCase() : null,
+      Tracker: indexer,
+      TrackerId: indexer,
+      PublishDate: xmlTagValue(item, "pubDate") || null,
+      _structuredMatch: true,
+    };
+  }).filter(r => r.Title && (r.Link || r.MagnetUri || r.Guid));
+}
+
+async function jackettTextSearch(query, indexer, timeout) {
+  const res = await axios.get(
+    `${ENV.jackettUrl}/api/v2.0/indexers/${indexer}/results`,
+    { params: qp({ Query: query }), timeout, validateStatus: () => true }
+  );
+  if (res.status === 429) throw Object.assign(new Error("Rate limited"), { response: res });
+  if (res.status >= 400) throw new Error(`HTTP ${res.status}`);
+  return (res.data?.Results || []).map(r => ({ ...r, _structuredMatch: false }));
+}
+
+async function jackettStructuredSearch(search, indexer, timeout) {
+  if (!search?.mode || !search?.imdbId) return [];
+  const params = { apikey: ENV.apiKey, t: search.mode, imdbid: search.imdbId, q: search.title };
+  if (search.year)   params.year = search.year;
+  if (search.season != null) params.season = search.season;
+  if (search.episode != null) params.ep = search.episode;
+
+  const res = await axios.get(
+    `${ENV.jackettUrl}/api/v2.0/indexers/${indexer}/results/torznab/api`,
+    { params, timeout, responseType: "text", validateStatus: () => true }
+  );
+  if (res.status === 429) throw Object.assign(new Error("Rate limited"), { response: res });
+  if (res.status >= 400) throw new Error(`HTTP ${res.status}`);
+  return parseTorznabResults(String(res.data || ""), indexer);
+}
+
+async function jackettSearchOneIndexer(indexer, plan, timeout, fastTimeout) {
+  if (await isRateLimited(indexer)) return [];
+  const t0 = Date.now();
+  try {
+    let results = [];
+    if (plan.search && !plan.parsed?.isAnime) {
+      try {
+        results = await jackettStructuredSearch(plan.search, indexer, timeout);
+      } catch (err) {
+        if (err.response?.status === 429) throw err;
+      }
+    }
+    if (results.length === 0) {
+      for (const query of plan.queries) {
+        const textResults = await jackettTextSearch(query, indexer, timeout);
+        results.push(...textResults);
+        if (results.length > 0) break;
+      }
+    }
+    const ms = Date.now() - t0;
+    await trackMetrics(indexer, ms, results.length, true);
+    const mode = results.some(r => r._structuredMatch) ? "estruturado" : "texto";
+    console.log(`  ${indexer}: ${results.length} resultados (${ms}ms, ${mode})`);
+    return results;
+  } catch (err) {
+    const ms = Date.now() - t0;
+    if (err.response?.status === 429) await setRateLimit(indexer, err.response?.headers?.["retry-after"]);
+    if (err.code === "ECONNABORTED" && timeout === fastTimeout)
+      console.log(`  ${indexer}: timeout lento de ${ms}ms (indo para background)`);
+    return [];
+  }
+}
+
 async function trackMetrics(indexer, ms, count, ok) {
   const key = `metrics:${indexer}`;
   const raw = await rc.get(key);
@@ -514,9 +624,9 @@ async function trackMetrics(indexer, ms, count, ok) {
   m.lastCall    = new Date().toISOString();
   await rc.set(key, JSON.stringify(m), 86400);
 }
-async function jackettSearch(queries, indexers, prefs) {
-  const queryList = uniq(Array.isArray(queries) ? queries : [queries]);
-  const cacheKey  = `search:${CACHE_VERSION}:${queryList.join("||")}:${indexers.join(",")}`;
+async function jackettSearch(plan, indexers, prefs) {
+  const queryList = uniq(Array.isArray(plan?.queries) ? plan.queries : [plan?.queries].filter(Boolean));
+  const cacheKey  = `search:${CACHE_VERSION}:${Buffer.from(JSON.stringify({ queryList, search: plan?.search || null, parsed: plan?.parsed || null })).toString("base64")}:${indexers.join(",")}`;
   const cached    = await rc.get(cacheKey);
   if (cached) {
     console.log(`Cache HIT para buscas: ${JSON.stringify(queryList)}`);
@@ -525,43 +635,15 @@ async function jackettSearch(queries, indexers, prefs) {
   // FIX: slowThreshold do usuário como timeout da fase rápida.
   const FAST_TIMEOUT = (prefs?.slowThreshold > 0 ? prefs.slowThreshold : 12000);
   const SLOW_TIMEOUT = 50000;
-  const tasks = [];
-  for (const query of queryList) {
-    console.log(`Jackett iniciando busca: "${query}" em [${indexers.length} indexers]`);
-    for (const indexer of indexers) tasks.push({ query, indexer });
-  }
-  const fetchIndexer = async (task, timeout) => {
-    const { query, indexer } = task;
-    if (await isRateLimited(indexer)) return [];
-    const t0 = Date.now();
-    try {
-      const res = await axios.get(
-        `${ENV.jackettUrl}/api/v2.0/indexers/${indexer}/results`,
-        { params: qp({ Query: query }), timeout, validateStatus: () => true }
-      );
-      const ms = Date.now() - t0;
-      if (res.status === 429) { await setRateLimit(indexer, res.headers?.["retry-after"]); return []; }
-      if (res.status >= 400)  { console.log(`  ${indexer}: Erro HTTP ${res.status} (${ms}ms)`); return []; }
-      const results = res.data?.Results || [];
-      await trackMetrics(indexer, ms, results.length, true);
-      console.log(`  ${indexer}: ${results.length} resultados (${ms}ms)`);
-      return results;
-    } catch (err) {
-      const ms = Date.now() - t0;
-      if (err.response?.status === 429) await setRateLimit(indexer, err.response?.headers?.["retry-after"]);
-      if (err.code === 'ECONNABORTED' && timeout === FAST_TIMEOUT)
-        console.log(`  ${indexer}: timeout lento de ${ms}ms (indo para background)`);
-      return [];
-    }
-  };
+  console.log(`Jackett iniciando busca: "${queryList[0] || plan?.search?.title || "sem titulo"}" em [${indexers.length} indexers]`);
   console.log(`Fase rapida: aguardando respostas... (${FAST_TIMEOUT}ms max)`);
-  const fastFlat    = (await Promise.all(tasks.map(t => fetchIndexer(t, FAST_TIMEOUT)))).flat();
+  const fastFlat    = (await Promise.all(indexers.map(indexer => jackettSearchOneIndexer(indexer, plan, FAST_TIMEOUT, FAST_TIMEOUT)))).flat();
   const fastDeduped = dedupeResults(fastFlat);
   console.log(`Conclusao da janela rapida: ${fastFlat.length} brutos -> ${fastDeduped.length} deduplicados`);
   if (fastDeduped.length === 0) { await rc.set(cacheKey, JSON.stringify([]), 300); return []; }
   setImmediate(async () => {
     try {
-      const slowDeduped = dedupeResults((await Promise.all(tasks.map(t => fetchIndexer(t, SLOW_TIMEOUT)))).flat());
+      const slowDeduped = dedupeResults((await Promise.all(indexers.map(indexer => jackettSearchOneIndexer(indexer, plan, SLOW_TIMEOUT, FAST_TIMEOUT)))).flat());
       if (slowDeduped.length > fastDeduped.length) {
         console.log(`[Background] Cache atualizado: ${fastDeduped.length} -> ${slowDeduped.length}`);
         await rc.set(cacheKey, JSON.stringify(slowDeduped), 1800);
@@ -590,12 +672,14 @@ async function getCinemetaTitle(type, imdbId) {
       (genres.includes("animation") && (country.includes("japan") || country.includes("jp"))) ||
       (genres.includes("animation") && (lang.includes("japanese") || lang.includes("japan") || lang === "ja"));
     return {
-      title  : meta?.name || imdbId,
-      aliases: uniq([meta?.name, meta?.originalName, ...(meta?.aliases || [])]).map(normTitle),
+      title   : meta?.name || imdbId,
+      aliases : uniq([meta?.name, meta?.originalName, ...(meta?.aliases || [])]).map(normTitle),
+      imdbId  : meta?.imdb_id || meta?.id || imdbId,
+      year    : extractReleaseYear(meta?.year || meta?.releaseInfo || meta?.released || ""),
       isAnime,
     };
   } catch {
-    return { title: imdbId, aliases: [normTitle(imdbId)], isAnime: false };
+    return { title: imdbId, aliases: [normTitle(imdbId)], imdbId, year: null, isAnime: false };
   }
 }
 async function getKitsuMeta(kitsuId) {
@@ -649,7 +733,15 @@ async function buildQueries(type, id) {
           `${t} ${ep}`,
         ]))
       : uniq(meta.aliases);
-    return { parsed, displayTitle: meta.title, aliases: meta.aliases, queries, episode: ep };
+    return {
+      parsed,
+      displayTitle: meta.title,
+      aliases: meta.aliases,
+      queries,
+      episode: ep,
+      search: null,
+      year: null,
+    };
   }
   const meta = await getCinemetaTitle(type, parsed.metaId);
   if (meta.isAnime) {
@@ -681,6 +773,15 @@ async function buildQueries(type, id) {
     aliases     : meta.aliases,
     queries     : uniq(queries.map(normTitle)),
     episode,
+    year        : meta.year,
+    search      : parsed.isAnime ? null : {
+      mode   : type === "movie" ? "movie" : "tvsearch",
+      imdbId : meta.imdbId,
+      title  : meta.title,
+      year   : meta.year,
+      season : parsed.season,
+      episode: parsed.episode,
+    },
   };
 }
 // ─────────────────────────────────────────────────────────
@@ -767,7 +868,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
   }
   // ── Busca principal ───────────────────────────────────────────────────────
   try {
-    const { parsed, displayTitle, aliases = [], queries, episode } = await buildQueries(type, id);
+    const { parsed, displayTitle, aliases = [], queries, episode, year, search } = await buildQueries(type, id);
 
     // Verificação de categorias habilitadas
     const enabledCats = Array.isArray(prefs.categories) && prefs.categories.length
@@ -790,7 +891,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     }
 
     const indexers = await resolveSearchIndexers(prefs, parsed.isAnime);
-    const results  = await jackettSearch(queries, indexers, prefs);
+    const results  = await jackettSearch({ parsed, queries, search }, indexers, prefs);
 
     // Idioma prioritário — determina o bônus no score e o alvo do filtro estrito.
     // Vazio = sem preferência de idioma (ranking por qualidade/seeders apenas).
@@ -798,6 +899,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
     let rejectedBySeriesFilter = 0;
     let rejectedByTitleMatch   = 0;
+    let rejectedByYear         = 0;
     const candidates = results
       .filter(r => r?.InfoHash || r?.MagnetUri || r?.Link)
       .filter(r => !prefs.skipBadReleases || !BAD_RE.test(r.Title || ""))
@@ -826,18 +928,28 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         r._titleMatchScore = score;
         return ok;
       })
+      .filter(r => {
+        if (type !== "movie" || !year) return true;
+        const releaseYear = extractReleaseYear(r.Title || "");
+        if (!releaseYear) return true;
+        const ok = releaseYear === year;
+        if (!ok) rejectedByYear++;
+        return ok;
+      })
       // FIX PRINCIPAL: score() agora recebe priorityLang.
       // Quando priorityLang="" : todos os idiomas pontuam igual — não-dublados
       //                          aparecem normalmente, ordenados por qualidade.
       // Quando priorityLang set: idioma selecionado aparece no topo, mas os
       //                          demais ainda aparecem abaixo (sem exclusão).
       .sort((a, b) =>
-        ((parsed.isAnime
+        (((b._structuredMatch ? 1 : 0) * 20000) +
+          (parsed.isAnime
           ? animeEpisodeMatchRank(b.Title || "", episode)
           : episodeMatchRank(b.Title || "", parsed.season, parsed.episode)) * 10000 +
           (b._titleMatchScore || 0) * 1000 +
           score(b, prefs.weights, parsed.isAnime, priorityLang)) -
-        ((parsed.isAnime
+        (((a._structuredMatch ? 1 : 0) * 20000) +
+          (parsed.isAnime
           ? animeEpisodeMatchRank(a.Title || "", episode)
           : episodeMatchRank(a.Title || "", parsed.season, parsed.episode)) * 10000 +
           (a._titleMatchScore || 0) * 1000 +
@@ -849,6 +961,8 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       console.log(`Filtro de Serie: ${rejectedBySeriesFilter} resultados descartados.`);
     if (rejectedByTitleMatch > 0)
       console.log(`Filtro de Titulo: ${rejectedByTitleMatch} resultados descartados.`);
+    if (rejectedByYear > 0)
+      console.log(`Filtro de Ano: ${rejectedByYear} resultados descartados.`);
 
     const langLabel = priorityLang
       ? `Idioma prioritário: ${priorityLang.toUpperCase()}`
