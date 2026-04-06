@@ -262,21 +262,31 @@ function normalizeTitleTokens(str) {
 
 function titleMatchScore(title, aliases = []) {
   const titleTokens = normalizeTitleTokens(title);
+  const titleText   = titleTokens.join(" ");
   if (!titleTokens.length) return 0;
 
   let best = 0;
   for (const alias of aliases.filter(Boolean)) {
     const aliasTokens = normalizeTitleTokens(alias);
+    const aliasText   = aliasTokens.join(" ");
     if (!aliasTokens.length) continue;
 
     const aliasSet = new Set(aliasTokens);
     const matched  = aliasTokens.filter(tok => titleTokens.includes(tok)).length;
     const coverage = matched / aliasTokens.length;
     const density  = matched / Math.max(titleTokens.length, aliasTokens.length);
+    const phraseHit = aliasText.length >= 5 && titleText.includes(aliasText);
+
+    if (!phraseHit) {
+      if (aliasTokens.length <= 2 && matched < aliasTokens.length) continue;
+      if (aliasTokens.length === 3 && matched < 2) continue;
+    }
+
     let score      = coverage * 0.8 + density * 0.2;
 
     if (aliasTokens.length >= 2 && matched >= aliasTokens.length - 1) score += 0.15;
     if (titleTokens.some(tok => aliasSet.has(tok))) score += 0.05;
+    if (phraseHit) score += 0.25;
     best = Math.max(best, Math.min(score, 1));
   }
   return best;
