@@ -331,15 +331,44 @@ function isCompletePack(title) {
   return /\b(complete|completa|complete season|season pack|series pack|batch|全集)\b/i.test(title || "");
 }
 
+function parseEpisodeRanges(title, season) {
+  const t = String(title || "");
+  const s = season != null ? parseInt(season, 10) : null;
+  const ranges = [];
+
+  for (const m of t.matchAll(/\bs0*(\d{1,2})\s*e0*(\d{1,3})\s*[-~]\s*(?:e)?0*(\d{1,3})\b/gi)) {
+    const matchSeason = parseInt(m[1], 10);
+    if (s != null && matchSeason !== s) continue;
+    ranges.push({ season: matchSeason, lo: parseInt(m[2], 10), hi: parseInt(m[3], 10) });
+  }
+  for (const m of t.matchAll(/\b0*(\d{1,2})x0*(\d{1,3})\s*[-~]\s*0*(\d{1,3})\b/gi)) {
+    const matchSeason = parseInt(m[1], 10);
+    if (s != null && matchSeason !== s) continue;
+    ranges.push({ season: matchSeason, lo: parseInt(m[2], 10), hi: parseInt(m[3], 10) });
+  }
+  for (const m of t.matchAll(/\bepisodes?\s*0*(\d{1,3})\s*[-~]\s*0*(\d{1,3})\b/gi)) {
+    ranges.push({ season: s, lo: parseInt(m[1], 10), hi: parseInt(m[2], 10) });
+  }
+  return ranges;
+}
+
+function hasAnyEpisodeMarker(title) {
+  return /\bs\d{1,2}\s*e\d{1,3}\b|\b\d{1,2}x\d{1,3}\b|\bepisodes?\s*\d{1,3}\b|\bep\s*\d{1,3}\b/i.test(String(title || ""));
+}
+
 function episodeMatchRank(title, season, episode) {
   if (season == null || episode == null) return 1;
   const t    = (title || "").toLowerCase();
   const sRaw = parseInt(season, 10);
   const eRaw = parseInt(episode, 10);
 
-  if (new RegExp(`\\bs0*${sRaw}[\\s._-]*e0*${eRaw}\\b|\\b0*${sRaw}x0*${eRaw}\\b`, "i").test(t)) return 3;
+  if (new RegExp(`\\bs0*${sRaw}[\\s._-]*e0*${eRaw}\\b|\\b0*${sRaw}x0*${eRaw}\\b`, "i").test(t)) return 4;
+  for (const range of parseEpisodeRanges(t, sRaw)) {
+    if (eRaw >= range.lo && eRaw <= range.hi) return 3;
+  }
+  const seasonOnly = new RegExp(`\\bs0*${sRaw}\\b|\\bseason\\s?0*${sRaw}\\b|\\btemporada\\s?0*${sRaw}\\b`, "i");
+  if (seasonOnly.test(t) && !hasAnyEpisodeMarker(t)) return 2;
   if (isCompletePack(t)) {
-    const seasonOnly = new RegExp(`\\bs0*${sRaw}\\b|\\bseason\\s?0*${sRaw}\\b|\\btemporada\\s?0*${sRaw}\\b`, "i");
     return seasonOnly.test(t) ? 1 : 0;
   }
   return 0;
@@ -520,6 +549,19 @@ function pickEpisodeFile(files, season, episode, isAnime) {
   if (!scored.length) return null;
   scored.sort((a, b) => b.total - a.total);
   return scored[0];
+}
+
+function relaxedTitleMatchScore(title, aliases = []) {
+  const titleTokens = new Set(normalizeTitleTokens(title));
+  let best = 0;
+  for (const alias of aliases.filter(Boolean)) {
+    const aliasTokens = normalizeTitleTokens(alias);
+    if (!aliasTokens.length) continue;
+    const matched = aliasTokens.filter(tok => titleTokens.has(tok)).length;
+    if (!matched) continue;
+    best = Math.max(best, matched / aliasTokens.length);
+  }
+  return best;
 }
 
 async function resolveInfoHash(r) {
@@ -1056,10 +1098,15 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           return true;
         }
         const score = titleMatchScore(r.Title || "", [displayTitle, ...aliases]);
-        const minScore = parsed.isAnime ? 0.34 : 0.45;
-        const ok = score >= minScore;
+        const relaxedScore = relaxedTitleMatchScore(r.Title || "", [displayTitle, ...aliases]);
+        const episodeRank = parsed.isAnime
+          ? animeEpisodeMatchRank(r.Title || "", episode)
+          : episodeMatchRank(r.Title || "", parsed.season, parsed.episode);
+        const minScore = parsed.isAnime ? 0.34 : (type === "series" && episodeRank >= 2 ? 0.2 : 0.45);
+        const finalScore = Math.max(score, type === "series" ? relaxedScore * 0.8 : 0);
+        const ok = finalScore >= minScore;
         if (!ok) rejectedByTitleMatch++;
-        r._titleMatchScore = score;
+        r._titleMatchScore = finalScore;
         return ok;
       })
       .filter(r => {
