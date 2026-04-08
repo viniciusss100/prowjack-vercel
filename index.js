@@ -1165,12 +1165,14 @@ app.get("/:userConfig/manifest.json", (req, res) => {
   const prefs = resolvePrefs(req.params.userConfig);
   const types = [...new Set((prefs.categories || ["movie","series"]).map(c => c==="movies"?"movie":c==="anime"?"series":c))];
   const name  = prefs.addonName || "ProwJack PRO";
+  const debridMode  = prefs.debridConfig?.mode;
+  const debridLabel = debridMode === "torbox"     ? " · TorBox"
+                    : debridMode === "realdebrid" ? " · Real-Debrid"
+                    : debridMode === "dual"       ? " · TorBox+RD" : "";
+  const debridDesc  = `Jackett Otimizado · Prioridade PT-BR${debridLabel}`;
   res.json({
-    id: "org.prowjack.pro", version: "3.7.0", name,
-    const debridMode = prefs.debridConfig?.mode;
-    const debridLabel = debridMode === "torbox" ? " · TorBox" : debridMode === "realdebrid" ? " · Real-Debrid" : debridMode === "dual" ? " · TorBox+RD" : "";
-    const desc = `Jackett Otimizado · Prioridade PT-BR${debridLabel}`;
-        description: desc,
+    id: "org.prowjack.pro", version: "3.8.0", name,
+    description: debridDesc,
     resources: ["stream"], types, idPrefixes: ["tt", "kitsu:"], catalogs: [],
     behaviorHints: { configurable: true, configurationRequired: false, p2p: !(prefs.debrid || (prefs.debridConfig && prefs.debridConfig.mode)) },
   });
