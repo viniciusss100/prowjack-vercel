@@ -739,20 +739,83 @@ async function torboxAddTorrent(magnet, key) {
 // ── Real-Debrid ───────────────────────────────────────────
 /**
  * Verifica disponibilidade instantânea no Real-Debrid.
+ * Tenta primeiro /instantAvailability; se receber 403 (plano free ou permissão negada),
+ * faz um probe rápido: addMagnet → selectFiles(all) → poll info por até ~4s.
  * Retorna o primeiro set de arquivos cacheados { [fileId]: {filename,filesize} }
  * ou null se não estiver em cache.
  */
 async function rdCheckCache(hash, key) {
-  const h = hash.toLowerCase();
-  const res = await axios.get(
-    `https://api.real-debrid.com/rest/1.0/torrents/instantAvailability/${h}`,
-    { headers: { Authorization: `Bearer ${key}` }, timeout: 8000 }
-  );
-  // Resposta: { [hash]: { rd: [ {[fileId]: {filename,filesize}} ] } } ou { [hash]: [] }
-  const entry = res.data?.[h];
-  if (!entry || !Array.isArray(entry.rd) || !entry.rd.length) return null;
-  // rd[0] é o primeiro set de arquivos disponíveis
-  return entry.rd[0]; // { "1": {filename,filesize}, "2": {...}, ... }
+  const h       = hash.toLowerCase();
+  const headers = { Authorization: `Bearer ${key}` };
+
+  // ── Tentativa 1: endpoint instantAvailability ────────────────────────────
+  try {
+    const res = await axios.get(
+      `https://api.real-debrid.com/rest/1.0/torrents/instantAvailability/${h}`,
+      { headers, timeout: 8000, validateStatus: s => s < 500 }
+    );
+    if (res.status === 200) {
+      const entry = res.data?.[h];
+      if (entry && Array.isArray(entry.rd) && entry.rd.length) return entry.rd[0];
+      if (entry && Array.isArray(entry.rd) && !entry.rd.length) return null; // confirmado MISS
+      // Resposta inesperada — tenta probe abaixo
+    }
+    // 403 ou outro: cai no probe
+  } catch {
+    // timeout / network error — tenta probe
+  }
+
+  // ── Tentativa 2: probe via addMagnet + poll ──────────────────────────────
+  // Adiciona o magnet silenciosamente e verifica o status rapidamente.
+  const hdrs = { ...headers, "Content-Type": "application/x-www-form-urlencoded" };
+  let torrentId = null;
+  try {
+    const addRes = await axios.post(
+      "https://api.real-debrid.com/rest/1.0/torrents/addMagnet",
+      `magnet=${encodeURIComponent(`magnet:?xt=urn:btih:${h}`)}`,
+      { headers: hdrs, timeout: 10000, validateStatus: s => s < 500 }
+    );
+    torrentId = addRes.data?.id;
+    if (!torrentId) return null;
+
+    // Seleciona todos os arquivos para iniciar avaliação
+    await axios.post(
+      `https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${torrentId}`,
+      "files=all",
+      { headers: hdrs, timeout: 10000, validateStatus: s => s < 500 }
+    );
+
+    // Poll rápido: 3 tentativas × 1,2s ≈ max 4s para verificação de cache
+    for (let i = 0; i < 3; i++) {
+      await new Promise(r => setTimeout(r, i === 0 ? 600 : 1200));
+      const infoRes = await axios.get(
+        `https://api.real-debrid.com/rest/1.0/torrents/info/${torrentId}`,
+        { headers, timeout: 8000, validateStatus: s => s < 500 }
+      );
+      const info = infoRes.data;
+      if (info?.status === "downloaded" && info?.links?.length) {
+        // Está em cache — monta estrutura compatível com rdPickFileIds
+        const cacheEntry = {};
+        (info.files || []).forEach((f, idx) => {
+          if (f.selected) cacheEntry[String(idx + 1)] = { filename: f.path || f.name || "", filesize: f.bytes || 0 };
+        });
+        // Não deletamos aqui — rdGetDirectLink reusa este torrentId via fluxo normal
+        // Mas precisamos deletar pois rdGetDirectLink vai criar outro
+        await rdDeleteTorrent(torrentId, key);
+        return Object.keys(cacheEntry).length ? cacheEntry : { "1": { filename: info.filename || "", filesize: info.bytes || 0 } };
+      }
+      if (["magnet_error", "error", "virus", "dead"].includes(info?.status)) {
+        await rdDeleteTorrent(torrentId, key);
+        return null;
+      }
+    }
+    // Não resolveu em tempo — não é cache instantâneo: trata como MISS
+    await rdDeleteTorrent(torrentId, key);
+    return null;
+  } catch (e) {
+    if (torrentId) await rdDeleteTorrent(torrentId, key).catch(() => {});
+    throw e; // propaga para o caller logar corretamente
+  }
 }
 
 /**
@@ -1551,8 +1614,30 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           );
 
           if (!debridResult) {
-            // Não está em cache — foi enfileirado para download, não exibe
-            return null;
+            // Não está em cache — foi enfileirado para download
+            // Exibe como item ⬇️ (em download) para o usuário saber que está sendo processado
+            const addonName = prefs.addonName || "ProwJack PRO";
+            const { mode } = prefs.debridConfig;
+            const providerLabel = mode === "torbox" ? "TorBox" : mode === "realdebrid" ? "Real-Debrid" : "Debrid";
+            return {
+              name: `${addonName}\n⬇️ ${resLabel}`,
+              description: [
+                description,
+                `⬇️ ${providerLabel} — Aguardando cache`,
+              ].filter(Boolean).join("\n"),
+              // Stream P2P como fallback enquanto debrid faz cache
+              infoHash: resolved.infoHash,
+              fileIdx: matchedFile?.idx,
+              sources: r.MagnetUri ? [r.MagnetUri] : [],
+              behaviorHints: {
+                filename:  matchedFile?.name,
+                videoSize: matchedFile?.size,
+                bingeGroup: parsed.isAnime
+                  ? `prowjack|anime|${displayTitle}`
+                  : `prowjack|${resolved.infoHash}`,
+                notWebReady: true,
+              },
+            };
           }
 
           const addonName = prefs.addonName || "ProwJack PRO";
@@ -1560,11 +1645,11 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           // Usa o nome do arquivo retornado pelo debridResult (mais preciso que matchedFile)
           const debridFilename = debridResult.filename || matchedFile?.name;
           return {
-            name: `${addonName}\n${resLabel}`,
+            name: `${addonName}\n⚡️ ${resLabel}`,
             description: [
               description,
               debridFilename ? `📂 ${debridFilename}` : "",
-              `${providerEmoji} ${debridResult.provider}`,
+              `${providerEmoji} ${debridResult.provider} ⚡️ Cache`,
             ].filter(Boolean).join("\n"),
             url: debridResult.url,
             // FIX: sem infoHash nem sources — stream é HTTP direto, não P2P
@@ -1603,7 +1688,9 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     const finalStreams = resolvedAll.filter(Boolean).slice(0, prefs.maxResults || 20);
 
     if (isDebridMode) {
-      console.log(`[DEBRID] Streams prontos: ${finalStreams.length} links diretos de ${candidates.length} candidatos`);
+      const cached  = finalStreams.filter(s => s.url).length;
+      const queued  = finalStreams.filter(s => !s.url).length;
+      console.log(`[DEBRID] Streams prontos: ${cached} ⚡️ cached + ${queued} ⬇️ em fila — de ${candidates.length} candidatos`);
     } else {
       console.log(`Magnets prontos: Enviando ${finalStreams.length} torrents!`);
     }
