@@ -91,6 +91,182 @@ async function setRateLimit(indexer, retryAfterHeader) {
   await rc.set(`rl:${indexer}`, "1", ttl);
 }
 // ─────────────────────────────────────────────────────────
+// DEBRID NATIVO — TorBox + Real-Debrid
+// ─────────────────────────────────────────────────────────
+
+// ── TorBox ────────────────────────────────────────────────
+// Docs: https://api.torbox.app/v1/api
+async function torboxRequestDL(infoHash, apiKey, fileIdx = null) {
+  try {
+    // 1. Verifica se o torrent já está cacheado (instant availability)
+    const checkRes = await axios.get(
+      `https://api.torbox.app/v1/api/torrents/checkcached`,
+      {
+        params: { hash: infoHash, format: "object", list_files: false },
+        headers: { Authorization: `Bearer ${apiKey}` },
+        timeout: 8000,
+      }
+    );
+    const cacheData = checkRes.data?.data;
+    const isCached  = cacheData && cacheData[infoHash.toLowerCase()]?.cached === true;
+    if (!isCached) {
+      console.log(`  [TorBox] ${infoHash.slice(0,8)}: não está em cache — pulando`);
+      return null;
+    }
+
+    // 2. Adiciona/encontra o torrent na conta
+    let torrentId = null;
+    try {
+      const addRes = await axios.post(
+        `https://api.torbox.app/v1/api/torrents/createtorrent`,
+        new URLSearchParams({ magnet: `magnet:?xt=urn:btih:${infoHash}`, seed: "1", allow_zip: "false" }),
+        {
+          headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/x-www-form-urlencoded" },
+          timeout: 12000,
+        }
+      );
+      torrentId = addRes.data?.data?.torrent_id;
+    } catch (e) {
+      if (e.response?.data?.error === "ACTIVE_LIMIT") {
+        // Torrent já existe — busca pelo hash
+        const listRes = await axios.get(
+          `https://api.torbox.app/v1/api/torrents/mylist`,
+          { headers: { Authorization: `Bearer ${apiKey}` }, timeout: 8000 }
+        );
+        const found = (listRes.data?.data || []).find(t =>
+          (t.hash || "").toLowerCase() === infoHash.toLowerCase()
+        );
+        torrentId = found?.id;
+      }
+    }
+    if (!torrentId) return null;
+
+    // 3. Gera link de download
+    const dlRes = await axios.get(
+      `https://api.torbox.app/v1/api/torrents/requestdl`,
+      {
+        params: { token: apiKey, torrent_id: torrentId, file_id: fileIdx ?? 0, zip_link: "false" },
+        headers: { Authorization: `Bearer ${apiKey}` },
+        timeout: 10000,
+      }
+    );
+    const url = dlRes.data?.data;
+    if (!url || typeof url !== "string") return null;
+    console.log(`  [TorBox] ${infoHash.slice(0,8)}: URL gerada ✓`);
+    return url;
+  } catch (err) {
+    console.log(`  [TorBox] Erro: ${err.message}`);
+    return null;
+  }
+}
+
+// ── Real-Debrid ────────────────────────────────────────────
+// Docs: https://api.real-debrid.com/
+async function rdRequestDL(infoHash, apiKey, fileIdx = null) {
+  try {
+    // 1. Verifica instant availability
+    const avRes = await axios.get(
+      `https://api.real-debrid.com/rest/1.0/torrents/instantAvailability/${infoHash}`,
+      {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        timeout: 8000,
+      }
+    );
+    const avData = avRes.data;
+    const cached = avData?.[infoHash.toLowerCase()];
+    const rdCached = cached?.rd && Array.isArray(cached.rd) && cached.rd.length > 0;
+    if (!rdCached) {
+      console.log(`  [RD] ${infoHash.slice(0,8)}: não está em cache — pulando`);
+      return null;
+    }
+
+    // 2. Adiciona magnet
+    const addRes = await axios.post(
+      `https://api.real-debrid.com/rest/1.0/torrents/addMagnet`,
+      new URLSearchParams({ magnet: `magnet:?xt=urn:btih:${infoHash}` }),
+      {
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/x-www-form-urlencoded" },
+        timeout: 12000,
+      }
+    );
+    const torrentId = addRes.data?.id;
+    if (!torrentId) return null;
+
+    // 3. Seleciona arquivo(s)
+    const fileToSelect = fileIdx != null ? String(fileIdx + 1) : "all";
+    await axios.post(
+      `https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${torrentId}`,
+      new URLSearchParams({ files: fileToSelect }),
+      {
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/x-www-form-urlencoded" },
+        timeout: 10000,
+      }
+    );
+
+    // 4. Espera ficar ready e pega links
+    let links = [];
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await new Promise(r => setTimeout(r, 1500));
+      const infoRes = await axios.get(
+        `https://api.real-debrid.com/rest/1.0/torrents/info/${torrentId}`,
+        { headers: { Authorization: `Bearer ${apiKey}` }, timeout: 8000 }
+      );
+      const status = infoRes.data?.status;
+      links = infoRes.data?.links || [];
+      if (status === "downloaded" && links.length > 0) break;
+      if (status === "error" || status === "dead") return null;
+    }
+    if (!links.length) return null;
+
+    // 5. Unrestrict o link
+    const link = links[fileIdx != null && fileIdx < links.length ? fileIdx : 0];
+    const unRes = await axios.post(
+      `https://api.real-debrid.com/rest/1.0/unrestrict/link`,
+      new URLSearchParams({ link }),
+      {
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/x-www-form-urlencoded" },
+        timeout: 10000,
+      }
+    );
+    const finalUrl = unRes.data?.download;
+    if (!finalUrl) return null;
+    console.log(`  [RD] ${infoHash.slice(0,8)}: URL gerada ✓`);
+    return finalUrl;
+  } catch (err) {
+    console.log(`  [RD] Erro: ${err.message}`);
+    return null;
+  }
+}
+
+// ── Dispatcher debrid nativo ───────────────────────────────
+// debridConfig: { mode: "torbox"|"realdebrid"|"dual", torboxKey: "", rdKey: "" }
+// Retorna { url, provider } ou null se não disponível
+async function resolveDebridUrl(infoHash, fileIdx, debridConfig) {
+  if (!debridConfig || !debridConfig.mode) return null;
+  const { mode, torboxKey, rdKey } = debridConfig;
+
+  if (mode === "torbox" && torboxKey) {
+    const url = await torboxRequestDL(infoHash, torboxKey, fileIdx);
+    if (url) return { url, provider: "TorBox" };
+  }
+  if (mode === "realdebrid" && rdKey) {
+    const url = await rdRequestDL(infoHash, rdKey, fileIdx);
+    if (url) return { url, provider: "RD" };
+  }
+  if (mode === "dual") {
+    // Tenta em paralelo — retorna o mais rápido disponível
+    const results = await Promise.allSettled([
+      torboxKey ? torboxRequestDL(infoHash, torboxKey, fileIdx).then(u => u ? { url: u, provider: "TorBox" } : null) : Promise.resolve(null),
+      rdKey     ? rdRequestDL(infoHash, rdKey, fileIdx).then(u => u ? { url: u, provider: "RD" } : null)            : Promise.resolve(null),
+    ]);
+    for (const r of results) {
+      if (r.status === "fulfilled" && r.value) return r.value;
+    }
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────
 // CONFIG (Base64URL)
 // ─────────────────────────────────────────────────────────
 function decodeUserCfg(str) {
@@ -121,6 +297,8 @@ function defaultPrefs() {
     // Usa priorityLang como referência, não mais PT-BR hardcoded.
     onlyDubbed:      false,
     debrid:          false,
+    // debridConfig: { mode: "torbox"|"realdebrid"|"dual", torboxKey: "", rdKey: "" }
+    debridConfig:    null,
   };
 }
 function resolvePrefs(encoded) {
@@ -989,9 +1167,12 @@ app.get("/:userConfig/manifest.json", (req, res) => {
   const name  = prefs.addonName || "ProwJack PRO";
   res.json({
     id: "org.prowjack.pro", version: "3.7.0", name,
-    description: `Jackett Otimizado · Prioridade PT-BR`,
+    const debridMode = prefs.debridConfig?.mode;
+    const debridLabel = debridMode === "torbox" ? " · TorBox" : debridMode === "realdebrid" ? " · Real-Debrid" : debridMode === "dual" ? " · TorBox+RD" : "";
+    const desc = `Jackett Otimizado · Prioridade PT-BR${debridLabel}`;
+        description: desc,
     resources: ["stream"], types, idPrefixes: ["tt", "kitsu:"], catalogs: [],
-    behaviorHints: { configurable: true, configurationRequired: false, p2p: !prefs.debrid },
+    behaviorHints: { configurable: true, configurationRequired: false, p2p: !(prefs.debrid || (prefs.debridConfig && prefs.debridConfig.mode)) },
   });
 });
 // ─────────────────────────────────────────────────────────
@@ -1168,6 +1349,29 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         const indexerName            = r.Tracker || r.TrackerId || "Unknown";
         const { name, description }  = formatStream(r, indexerName, parsed.isAnime, prefs);
         const sources                = r.MagnetUri ? [r.MagnetUri] : [];
+        // ── Debrid nativo (TorBox / Real-Debrid) ──────────────────────
+        const nativeDebrid = prefs.debridConfig && prefs.debridConfig.mode
+          ? await resolveDebridUrl(resolved.infoHash, matchedFile?.idx ?? null, prefs.debridConfig)
+          : null;
+
+        if (nativeDebrid) {
+          const providerTag = `[${nativeDebrid.provider}]`;
+          return {
+            name: `${name}\n${providerTag}`,
+            description: matchedFile?.name
+              ? `${description}\n📂 ${matchedFile.name}`
+              : description,
+            url: nativeDebrid.url,
+            behaviorHints: {
+              filename: matchedFile?.name,
+              videoSize: matchedFile?.size,
+              bingeGroup: parsed.isAnime
+                ? `prowjack|anime|${displayTitle}`
+                : `prowjack|${resolved.infoHash}`,
+            },
+          };
+        }
+
         return {
           name,
           description: matchedFile?.name
@@ -1199,7 +1403,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
   }
 });
 app.listen(ENV.port, () => {
-  console.log(`ProwJack PRO v3.7.0 -> http://localhost:${ENV.port}/configure`);
+  console.log(`ProwJack PRO v3.8.0 -> http://localhost:${ENV.port}/configure`);
   console.log(`   Jackett : ${ENV.jackettUrl}`);
   console.log(`   Redis   : ${ENV.redisUrl}`);
 });
