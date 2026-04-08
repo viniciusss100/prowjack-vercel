@@ -1262,8 +1262,27 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             };
           }
 
-          // debridResult === null: nenhum serviço ativo ou erro total
-          return null;
+          // ── FIX FALLBACK: Se deu erro na API do Debrid, devolve P2P normal
+          const addonNameFallback = prefs.addonName || "ProwJack PRO";
+          return {
+            name: `${addonNameFallback}\n⚠️ ${resLabel}`,
+            description: [
+              description,
+              matchedFile?.name ? `📂 ${matchedFile.name}` : "",
+              `⚠️ P2P (Fallback - Falha no Debrid)`,
+            ].filter(Boolean).join("\n"),
+            infoHash: resolved.infoHash,
+            fileIdx: matchedFile?.idx,
+            sources: r.MagnetUri ? [r.MagnetUri] : [],
+            behaviorHints: {
+              filename:  matchedFile?.name,
+              videoSize: matchedFile?.size,
+              bingeGroup: parsed.isAnime
+                ? `prowjack|anime|${displayTitle}`
+                : `prowjack|${resolved.infoHash}`,
+              notWebReady: true,
+            },
+          };
         }
 
         // ── MODO P2P (debrid desabilitado) ───────────────────────────────────
