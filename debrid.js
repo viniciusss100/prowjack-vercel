@@ -78,7 +78,11 @@ async function torboxBatchCheckCache(hashes, key) {
         validateStatus: s => s < 500,
       });
       if (res.data?.success && res.data?.data) {
-        Object.assign(resultMap, res.data.data);
+        // FIX: TorBox retorna chaves em MAIÚSCULAS; normaliza para minúsculas
+        // para que o lookup com infoHash (lowercase) funcione corretamente.
+        for (const [k, v] of Object.entries(res.data.data)) {
+          resultMap[k.toLowerCase()] = v;
+        }
       }
     } catch (err) {
       console.log(`  [TorBox Batch] Erro: ${err.message}`);
@@ -185,7 +189,10 @@ async function rdBatchCheckCache(hashes, key) {
         { headers, timeout: 10000, validateStatus: s => s < 500 }
       );
       if (res.status === 200 && res.data) {
-        Object.assign(resultMap, res.data);
+        // FIX: normaliza chaves para minúsculas (consistência com infoHash)
+        for (const [k, v] of Object.entries(res.data)) {
+          resultMap[k.toLowerCase()] = v;
+        }
       }
     } catch (err) {
       console.log(`  [RD Batch] Erro: ${err.message}`);
@@ -343,15 +350,23 @@ async function resolveDebridStream(infoHash, magnet, title, season, episode, isA
 async function _resolveTorbox(infoHash, magnet, season, episode, isAnime, key, torrentFiles, tbCacheEntry, torrentBuffer) {
   if (tbCacheEntry && typeof tbCacheEntry === 'object' && tbCacheEntry !== false) {
     const torrentId = tbCacheEntry.id ?? tbCacheEntry.torrent_id ?? null;
-    const cached = { ...tbCacheEntry, _torrentId: torrentId };
-    const files  = cached.files || torrentFiles || [];
+    const files  = tbCacheEntry.files || torrentFiles || [];
     const picked = torboxPickFile(files, season, episode, isAnime);
 
-    // Usa o buffer no HIT também, garante que a resolução saia perfeita para arquivos privados
+    // FIX: usa o torrent_id que já vem no próprio cache entry.
+    // Antes, o código chamava torboxAddTorrent() de novo para obter o ID,
+    // mas se a API retornava `true` (sucesso sem ID), o stream era descartado como MISS.
+    if (torrentId != null) {
+      const url = torboxBuildPermalink(torrentId, picked.fileId, key);
+      console.log(`  [TorBox] Cache HIT para ${infoHash}`);
+      return { url, provider: "TorBox", filename: picked.name || null };
+    }
+
+    // Fallback: ID não estava no cache entry, tenta adicionar para obter o ID
     const addedTorrentId = await torboxAddTorrent(magnet, key, true, torrentBuffer);
     if (addedTorrentId && addedTorrentId !== true) {
       const url = torboxBuildPermalink(addedTorrentId, picked.fileId, key);
-      console.log(`  [TorBox] Cache HIT para ${infoHash}`);
+      console.log(`  [TorBox] Cache HIT (via add fallback) para ${infoHash}`);
       return { url, provider: "TorBox", filename: picked.name || null };
     }
   }
