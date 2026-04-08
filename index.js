@@ -673,29 +673,47 @@ function torboxBuildPermalink(torrentId, fileId, key) {
 }
 
 /**
- * Encontra o índice do melhor arquivo no array de arquivos TorBox
- * para o episódio/filme solicitado.
+ * Encontra o melhor arquivo no array de arquivos TorBox para o episódio/filme.
+ * CORREÇÃO: retorna o campo `id` real do arquivo (não o índice do array).
+ * A API TorBox /requestdl espera file_id = arquivo.id, não o índice.
+ * Retorna { fileId, name } onde fileId é o id real do arquivo TorBox.
  */
-function torboxPickFileIdx(files, season, episode, isAnime) {
-  if (!Array.isArray(files) || !files.length) return 0;
+function torboxPickFile(files, season, episode, isAnime) {
+  // Sem lista de arquivos: file_id=0 faz o TorBox escolher o principal
+  if (!Array.isArray(files) || !files.length) return { fileId: 0, name: null };
+
+  const withMeta = files.map((f, idx) => ({
+    idx,
+    fileId: f.id ?? idx,          // campo `id` real da TorBox API
+    size:   f.size || 0,
+    name:   f.name || f.short_name || "",
+  }));
+
   // Filme ou sem episódio definido: maior arquivo de vídeo
   if (season == null && episode == null) {
-    const videoFiles = files
-      .map((f, idx) => ({ idx, size: f.size || 0, name: f.name || "" }))
-      .filter(f => /\.(mkv|mp4|avi|ts|m2ts|mov|wmv)$/i.test(f.name));
-    const pool = videoFiles.length ? videoFiles : files.map((f, idx) => ({ idx, size: f.size || 0 }));
-    return pool.reduce((a, b) => b.size > a.size ? b : a).idx;
+    const videoFiles = withMeta.filter(f => /\.(mkv|mp4|avi|ts|m2ts|mov|wmv)$/i.test(f.name));
+    const pool = videoFiles.length ? videoFiles : withMeta;
+    const best = pool.reduce((a, b) => b.size > a.size ? b : a);
+    return { fileId: best.fileId, name: best.name };
   }
+
   // Série/anime: match de episódio
-  const scored = files.map((f, idx) => ({
-    idx,
+  const scored = withMeta.map(f => ({
+    ...f,
     rank: isAnime
-      ? animeEpisodeMatchRank(f.name || "", episode)
-      : episodeMatchRank(f.name || "", season, episode),
-    size: f.size || 0,
+      ? animeEpisodeMatchRank(f.name, episode)
+      : episodeMatchRank(f.name, season, episode),
   })).filter(f => f.rank > 0);
-  if (!scored.length) return 0;
-  return scored.reduce((a, b) => b.rank > a.rank || (b.rank === a.rank && b.size > a.size) ? b : a).idx;
+
+  if (!scored.length) {
+    // fallback: maior arquivo de vídeo
+    const videoFiles = withMeta.filter(f => /\.(mkv|mp4|avi|ts|m2ts|mov|wmv)$/i.test(f.name));
+    const pool = videoFiles.length ? videoFiles : withMeta;
+    const best = pool.reduce((a, b) => b.size > a.size ? b : a);
+    return { fileId: best.fileId, name: best.name };
+  }
+  const best = scored.reduce((a, b) => b.rank > a.rank || (b.rank === a.rank && b.size > a.size) ? b : a);
+  return { fileId: best.fileId, name: best.name };
 }
 
 /**
@@ -778,9 +796,27 @@ function rdPickFileIds(cacheEntry, season, episode, isAnime) {
 }
 
 /**
+ * Deleta um torrent da conta Real-Debrid após uso.
+ * Evita acúmulo de torrents na conta do usuário.
+ */
+async function rdDeleteTorrent(torrentId, key) {
+  if (!torrentId) return;
+  try {
+    await axios.delete(
+      `https://api.real-debrid.com/rest/1.0/torrents/delete/${torrentId}`,
+      { headers: { Authorization: `Bearer ${key}` }, timeout: 6000 }
+    );
+    console.log(`  [Real-Debrid] Torrent ${torrentId} deletado da conta após uso.`);
+  } catch {
+    // não-crítico: falha silenciosa
+  }
+}
+
+/**
  * Obtém URL de stream direto do Real-Debrid para um torrent em cache.
  * Fluxo: addMagnet → selectFiles → poll info → unrestrict/link
- * Retorna URL direta ou null em caso de falha.
+ * Retorna { download, filename } ou null em caso de falha.
+ * NOTA: O torrent é deletado da conta após obter o link (não acumula lixo).
  */
 async function rdGetDirectLink(hash, magnet, fileIds, key) {
   const magnetUri = magnet || `magnet:?xt=urn:btih:${hash}&dn=${hash}`;
@@ -827,7 +863,11 @@ async function rdGetDirectLink(hash, magnet, fileIds, key) {
     if (["magnet_error", "error", "virus", "dead"].includes(info?.status)) break;
   }
 
-  if (!links?.length) return null;
+  if (!links?.length) {
+    // Cleanup: remove torrent que não ficou pronto
+    await rdDeleteTorrent(torrentId, key);
+    return null;
+  }
 
   // 4. Desrestringe o primeiro link (arquivo selecionado)
   const unresRes = await axios.post(
@@ -835,12 +875,20 @@ async function rdGetDirectLink(hash, magnet, fileIds, key) {
     `link=${encodeURIComponent(links[0])}`,
     { headers, timeout: 10000 }
   );
-  return unresRes.data?.download || null;
+  const downloadUrl = unresRes.data?.download || null;
+  const filename    = unresRes.data?.filename  || null;
+
+  // 5. Deleta o torrent da conta para não acumular lixo
+  // (o link já foi gerado e é permanente mesmo após deleção)
+  await rdDeleteTorrent(torrentId, key);
+
+  return downloadUrl ? { download: downloadUrl, filename } : null;
 }
 
 /**
  * Adiciona torrent ao Real-Debrid para download em background
- * (quando não está em cache). Retorna true em sucesso.
+ * (quando não está em cache). Seleciona todos os arquivos e mantém
+ * na conta para o RD iniciar o cache. Retorna true em sucesso.
  */
 async function rdAddTorrent(magnet, key) {
   const magnetUri = magnet || "";
@@ -856,12 +904,14 @@ async function rdAddTorrent(magnet, key) {
   );
   const torrentId = addRes.data?.id;
   if (!torrentId) return false;
-  // Seleciona todos os arquivos para iniciar o download
+  // Seleciona todos os arquivos para que o RD inicie o caching
   await axios.post(
     `https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${torrentId}`,
     "files=all",
     { headers, timeout: 10000, validateStatus: s => s < 500 }
   );
+  // Nota: NÃO deletamos aqui — o torrent precisa ficar na conta para o RD fazer cache.
+  // O usuário pode gerenciar manualmente pelo painel do RD.
   return true;
 }
 
@@ -891,11 +941,11 @@ async function resolveDebridStream(infoHash, magnet, season, episode, isAnime, c
     try {
       const cached = await torboxCheckCache(infoHash, torboxKey);
       if (cached) {
-        const files  = cached.files || torrentFiles || [];
-        const fileIdx = torboxPickFileIdx(files, season, episode, isAnime);
-        const url = torboxBuildPermalink(cached.id, fileIdx, torboxKey);
-        console.log(`  [TorBox] Cache HIT para ${infoHash} | torrent_id=${cached.id} file_idx=${fileIdx}`);
-        return { url, provider: "TorBox" };
+        const files   = cached.files || torrentFiles || [];
+        const picked  = torboxPickFile(files, season, episode, isAnime);
+        const url = torboxBuildPermalink(cached.id, picked.fileId, torboxKey);
+        console.log(`  [TorBox] Cache HIT para ${infoHash} | torrent_id=${cached.id} file_id=${picked.fileId}${picked.name ? ` (${picked.name})` : ""}`);
+        return { url, provider: "TorBox", filename: picked.name || null };
       } else {
         // Não está em cache — envia para download
         const magnetUri = magnet || `magnet:?xt=urn:btih:${infoHash}`;
@@ -914,10 +964,10 @@ async function resolveDebridStream(infoHash, magnet, season, episode, isAnime, c
       if (cacheEntry) {
         const fileIds = rdPickFileIds(cacheEntry, season, episode, isAnime);
         const magnetUri = magnet || `magnet:?xt=urn:btih:${infoHash}`;
-        const url = await rdGetDirectLink(infoHash, magnetUri, fileIds, rdKey);
-        if (url) {
-          console.log(`  [Real-Debrid] Cache HIT para ${infoHash}`);
-          return { url, provider: "Real-Debrid" };
+        const result = await rdGetDirectLink(infoHash, magnetUri, fileIds, rdKey);
+        if (result?.download) {
+          console.log(`  [Real-Debrid] Cache HIT para ${infoHash}${result.filename ? ` | ${result.filename}` : ""}`);
+          return { url: result.download, provider: "Real-Debrid", filename: result.filename || null };
         }
         console.log(`  [Real-Debrid] Cache HIT mas falha ao obter link para ${infoHash}`);
       } else {
@@ -1507,17 +1557,19 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
           const addonName = prefs.addonName || "ProwJack PRO";
           const providerEmoji = debridResult.provider === "TorBox" ? "🟠" : "🟣";
+          // Usa o nome do arquivo retornado pelo debridResult (mais preciso que matchedFile)
+          const debridFilename = debridResult.filename || matchedFile?.name;
           return {
             name: `${addonName}\n${resLabel}`,
             description: [
               description,
-              matchedFile?.name ? `📂 ${matchedFile.name}` : "",
+              debridFilename ? `📂 ${debridFilename}` : "",
               `${providerEmoji} ${debridResult.provider}`,
             ].filter(Boolean).join("\n"),
             url: debridResult.url,
             // FIX: sem infoHash nem sources — stream é HTTP direto, não P2P
             behaviorHints: {
-              filename:  matchedFile?.name,
+              filename:  debridFilename,
               videoSize: matchedFile?.size,
               bingeGroup: parsed.isAnime
                 ? `prowjack|anime|${displayTitle}`
