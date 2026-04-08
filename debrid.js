@@ -5,18 +5,13 @@
  *
  * FIXES aplicados neste arquivo:
  * 1. TorBox: checkcached retorna estrutura variável — normaliza corretamente
- * (torrent_id pode vir em diferentes campos: `id`, `hash`, etc.)
  * 2. TorBox: permalink agora usa torrent_id e file_id corretamente validados
  * 3. Real-Debrid: instantAvailability retorna 200 com corpo vazio em vez de 403
- * — o probe via addMagnet é acionado automaticamente nesses casos também
  * 4. Real-Debrid: rdGetDirectLink agora loga cada etapa para diagnóstico
- * 5. Real-Debrid: magnet enriquecido com trackers públicos para melhorar
- * desempenho em torrents que vieram apenas de .torrent (sem MagnetUri)
- * 6. resolveDebridStream: retorna provider correto no label de "em fila"
- * (dual mostra ambos; individual mostra o serviço específico)
- * 7. buildMagnet: trackers conhecidos são anexados ao magnet gerado
- * 8. [FIX VERCEL] TorBox: usa createtorrent com add_only_if_cached para pegar o torrent_id real
- * 9. [FIX VERCEL] Real-Debrid: removido probe (addMagnet) do checkCache para evitar Rate Limit e Timeouts
+ * 5. buildMagnet: trackers conhecidos são anexados ao magnet gerado
+ * 6. [FIX VERCEL] TorBox: usa createtorrent com add_only_if_cached para pegar o torrent_id real
+ * 7. [FIX ON-DEMAND] Cache MISS não enfileira mais o torrent automaticamente.
+ * Apenas retorna provider para o index.js gerar um link de ativação via clique.
  */
 
 const axios = require("axios");
@@ -34,13 +29,9 @@ const TRACKERS = [
 
 /**
  * Constrói um magnet URI com trackers populares.
- * Usa o MagnetUri original quando disponível (preserva trackers do indexer).
- * Quando só temos infoHash, adiciona trackers conhecidos para melhorar
- * a chance de iniciar download nos serviços debrid.
  */
 function buildMagnet(infoHash, existingMagnet, title) {
   if (existingMagnet && existingMagnet.startsWith("magnet:")) {
-    // Adiciona trackers ao magnet existente se não tiver nenhum
     if (!existingMagnet.includes("&tr=")) {
       return existingMagnet + TRACKERS;
     }
@@ -87,11 +78,6 @@ function episodeMatchRank(title, season, episode) {
 // TORBOX
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Verifica cache no TorBox.
- * A API retorna: { success, data: { [hash]: { id, name, size, hash, files: [...] } } }
- * FIX: normaliza torrent_id corretamente — pode vir como `id` ou `torrent_id`.
- */
 async function torboxCheckCache(hash, key) {
   const h = hash.toLowerCase();
   let res;
@@ -110,15 +96,10 @@ async function torboxCheckCache(hash, key) {
   const entry = res.data.data?.[h];
   if (!entry || entry === false || typeof entry !== "object") return null;
 
-  // FIX: normaliza o torrent_id — a API pode retornar como `id` ou `torrent_id`
   const torrentId = entry.id ?? entry.torrent_id ?? null;
   return { ...entry, _torrentId: torrentId };
 }
 
-/**
- * Gera URL de download TorBox (redirect direto para CDN).
- * FIX: valida torrent_id antes de construir a URL.
- */
 function torboxBuildPermalink(torrentId, fileId, key) {
   if (!torrentId && torrentId !== 0) {
     throw new Error(`TorBox: torrent_id inválido (${torrentId})`);
@@ -126,10 +107,6 @@ function torboxBuildPermalink(torrentId, fileId, key) {
   return `https://api.torbox.app/v1/api/torrents/requestdl?token=${encodeURIComponent(key)}&torrent_id=${torrentId}&file_id=${fileId}&redirect=true`;
 }
 
-/**
- * Seleciona o melhor arquivo na lista de arquivos TorBox.
- * Retorna { fileId, name } onde fileId é o campo `id` real do arquivo.
- */
 function torboxPickFile(files, season, episode, isAnime) {
   if (!Array.isArray(files) || !files.length) {
     return { fileId: 0, name: null };
@@ -142,7 +119,6 @@ function torboxPickFile(files, season, episode, isAnime) {
     name:   f.name || f.short_name || "",
   }));
 
-  // Filme ou sem episódio: maior arquivo de vídeo
   if (season == null && episode == null) {
     const videoFiles = withMeta.filter(f => /\.(mkv|mp4|avi|ts|m2ts|mov|wmv)$/i.test(f.name));
     const pool = videoFiles.length ? videoFiles : withMeta;
@@ -150,7 +126,6 @@ function torboxPickFile(files, season, episode, isAnime) {
     return { fileId: best.fileId, name: best.name };
   }
 
-  // Série/anime
   const scored = withMeta.map(f => ({
     ...f,
     rank: isAnime
@@ -170,10 +145,6 @@ function torboxPickFile(files, season, episode, isAnime) {
   return { fileId: best.fileId, name: best.name };
 }
 
-/**
- * Adiciona torrent ao TorBox para download em background.
- * [FIX]: Agora suporta addOnlyIfCached para pegar o torrent_id real da conta
- */
 async function torboxAddTorrent(magnet, key, addOnlyIfCached = false) {
   if (!magnet) return false;
   const params = { magnet, seed: "3", allow_zip: "false" };
@@ -194,7 +165,6 @@ async function torboxAddTorrent(magnet, key, addOnlyIfCached = false) {
       }
     );
     if (res.data?.success) {
-      // Pega o torrent_id real gerado pela adição
       const tId = res.data.data?.torrent_id ?? res.data.data?.id;
       if (tId !== undefined && tId !== null) return tId;
       return true;
@@ -209,11 +179,6 @@ async function torboxAddTorrent(magnet, key, addOnlyIfCached = false) {
 // REAL-DEBRID
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Verifica disponibilidade instantânea no Real-Debrid.
- * [FIX]: Removido o probe (addMagnet) para não estourar rate limit. 
- * Apenas verifica instantAvailability.
- */
 async function rdCheckCache(hash, key) {
   const h       = hash.toLowerCase();
   const headers = { Authorization: `Bearer ${key}` };
@@ -226,7 +191,6 @@ async function rdCheckCache(hash, key) {
 
     if (res.status === 200) {
       const entry = res.data?.[h];
-      // Caso positivo: rd é array com pelo menos um set de arquivos
       if (entry && Array.isArray(entry.rd) && entry.rd.length > 0) {
         return entry.rd[0];
       }
@@ -238,9 +202,6 @@ async function rdCheckCache(hash, key) {
   return null;
 }
 
-/**
- * Seleciona IDs de arquivo no cacheEntry do Real-Debrid.
- */
 function rdPickFileIds(cacheEntry, season, episode, isAnime) {
   const files = Object.entries(cacheEntry).map(([id, info]) => ({
     id,
@@ -272,9 +233,6 @@ function rdPickFileIds(cacheEntry, season, episode, isAnime) {
   ).id];
 }
 
-/**
- * Deleta torrent da conta Real-Debrid (cleanup após uso).
- */
 async function rdDeleteTorrent(torrentId, key) {
   if (!torrentId) return;
   try {
@@ -283,16 +241,9 @@ async function rdDeleteTorrent(torrentId, key) {
       { headers: { Authorization: `Bearer ${key}` }, timeout: 6000 }
     );
     console.log(`  [Real-Debrid] Torrent ${torrentId} deletado da conta após uso.`);
-  } catch {
-    // não-crítico
-  }
+  } catch {}
 }
 
-/**
- * Obtém URL de stream direto do Real-Debrid para torrent em cache.
- * FIX: logs detalhados em cada etapa para diagnóstico.
- * Retorna { download, filename } ou null.
- */
 async function rdGetDirectLink(hash, magnet, fileIds, key) {
   const magnetUri = magnet;
   const headers   = {
@@ -300,7 +251,6 @@ async function rdGetDirectLink(hash, magnet, fileIds, key) {
     "Content-Type": "application/x-www-form-urlencoded",
   };
 
-  // 1. Adiciona magnet
   let torrentId;
   try {
     const addRes = await axios.post(
@@ -309,17 +259,11 @@ async function rdGetDirectLink(hash, magnet, fileIds, key) {
       { headers, timeout: 12000, validateStatus: s => s < 500 }
     );
     torrentId = addRes.data?.id;
-    if (!torrentId) {
-      console.log(`  [Real-Debrid] addMagnet falhou — sem torrent_id (status ${addRes.status})`);
-      return null;
-    }
-    console.log(`  [Real-Debrid] addMagnet OK → torrent_id=${torrentId}`);
+    if (!torrentId) return null;
   } catch (err) {
-    console.log(`  [Real-Debrid] addMagnet erro: ${err.message}`);
     return null;
   }
 
-  // 2. Seleciona arquivos
   try {
     const filesParam = Array.isArray(fileIds) && fileIds.length && fileIds[0] !== "all"
       ? fileIds.join(",")
@@ -330,12 +274,10 @@ async function rdGetDirectLink(hash, magnet, fileIds, key) {
       { headers, timeout: 10000, validateStatus: s => s < 500 }
     );
   } catch (err) {
-    console.log(`  [Real-Debrid] selectFiles erro: ${err.message}`);
     await rdDeleteTorrent(torrentId, key);
     return null;
   }
 
-  // 3. Polling status
   let links = null;
   const delays = [600, 1000, 1000, 1200, 1200, 1500];
   for (let i = 0; i < delays.length; i++) {
@@ -346,18 +288,14 @@ async function rdGetDirectLink(hash, magnet, fileIds, key) {
         { headers: { Authorization: `Bearer ${key}` }, timeout: 10000 }
       );
       const info = infoRes.data;
-      console.log(`  [Real-Debrid] poll #${i + 1} status=${info?.status} links=${info?.links?.length || 0}`);
       if (info?.status === "downloaded" && info?.links?.length) {
         links = info.links;
         break;
       }
       if (["magnet_error", "error", "virus", "dead"].includes(info?.status)) {
-        console.log(`  [Real-Debrid] status de erro: ${info.status}`);
         break;
       }
-    } catch (err) {
-      console.log(`  [Real-Debrid] poll #${i + 1} erro: ${err.message}`);
-    }
+    } catch (err) {}
   }
 
   if (!links?.length) {
@@ -365,7 +303,6 @@ async function rdGetDirectLink(hash, magnet, fileIds, key) {
     return null;
   }
 
-  // 4. Desrestringe link
   let downloadUrl = null, filename = null;
   try {
     const unresRes = await axios.post(
@@ -375,23 +312,15 @@ async function rdGetDirectLink(hash, magnet, fileIds, key) {
     );
     downloadUrl = unresRes.data?.download || null;
     filename    = unresRes.data?.filename  || null;
-    console.log(`  [Real-Debrid] unrestrict OK → ${filename || downloadUrl?.slice(0, 60)}`);
   } catch (err) {
-    console.log(`  [Real-Debrid] unrestrict erro: ${err.message}`);
     await rdDeleteTorrent(torrentId, key);
     return null;
   }
 
-  // 5. Deleta torrent (link já gerado é permanente)
   await rdDeleteTorrent(torrentId, key);
-
   return downloadUrl ? { download: downloadUrl, filename } : null;
 }
 
-/**
- * Adiciona torrent ao Real-Debrid para download em background.
- * Mantém na conta para iniciar o cache.
- */
 async function rdAddTorrent(magnet, key) {
   if (!magnet) return false;
   const headers = {
@@ -411,7 +340,6 @@ async function rdAddTorrent(magnet, key) {
       "files=all",
       { headers, timeout: 10000, validateStatus: s => s < 500 }
     );
-    // NÃO deleta — precisa ficar para o RD fazer cache
     return true;
   } catch {
     return false;
@@ -422,19 +350,6 @@ async function rdAddTorrent(magnet, key) {
 // ORQUESTRADOR
 // ─────────────────────────────────────────────────────────
 
-/**
- * Resolve um stream via debrid.
- *
- * Retorna:
- * - { url, provider, filename }  — stream pronto (em cache)
- * - { queued: true, providers }  — enfileirado para download (MISS)
- * - null                         — nenhum serviço ativo
- *
- * FIXES:
- * - Modo "dual": tenta TorBox E Real-Debrid em paralelo
- * - Label "providers" no retorno queued indica quais serviços foram tentados
- * - buildMagnet garante trackers no magnet enviado para download
- */
 async function resolveDebridStream(infoHash, magnet, title, season, episode, isAnime, config, torrentFiles) {
   const { mode, torboxKey, rdKey } = config || {};
   const useTorbox = (mode === "torbox"     || mode === "dual") && !!torboxKey;
@@ -443,109 +358,80 @@ async function resolveDebridStream(infoHash, magnet, title, season, episode, isA
   if (!useTorbox && !useRD) return null;
 
   const enrichedMagnet = buildMagnet(infoHash, magnet, title);
-  const queuedProviders = [];
 
-  // ── Em modo dual: verifica os dois em paralelo para reduzir latência ─────
+  // MODO DUAL
   if (useTorbox && useRD) {
     const [tbResult, rdResult] = await Promise.allSettled([
       _resolveTorbox(infoHash, enrichedMagnet, season, episode, isAnime, torboxKey, torrentFiles),
       _resolveRD(infoHash, enrichedMagnet, season, episode, isAnime, rdKey),
     ]);
 
-    // Prefere TorBox (geralmente mais rápido), mas usa RD se TorBox não cachear
-    if (tbResult.status === "fulfilled" && tbResult.value?.url) {
-      // Se RD também retornou URL, deloga para informação
-      if (rdResult.status === "fulfilled" && rdResult.value?.url) {
-        console.log(`  [DUAL] Ambos em cache — usando TorBox`);
-      }
-      return tbResult.value;
-    }
-    if (rdResult.status === "fulfilled" && rdResult.value?.url) {
-      return rdResult.value;
-    }
+    if (tbResult.status === "fulfilled" && tbResult.value?.url) return tbResult.value;
+    if (rdResult.status === "fulfilled" && rdResult.value?.url) return rdResult.value;
 
-    // Nenhum em cache — registra quais foram enfileirados
-    if (tbResult.status === "fulfilled" && tbResult.value?.queued) queuedProviders.push("TorBox");
-    if (rdResult.status === "fulfilled" && rdResult.value?.queued) queuedProviders.push("Real-Debrid");
-    if (tbResult.status === "rejected") console.log(`  [TorBox] Erro: ${tbResult.reason?.message}`);
-    if (rdResult.status === "rejected") console.log(`  [Real-Debrid] Erro: ${rdResult.reason?.message}`);
-
-    return queuedProviders.length ? { queued: true, providers: queuedProviders } : null;
+    // Se ambos falharam, retorna o estado queued de um deles (o usuário selecionará no clique)
+    if (tbResult.status === "fulfilled" && tbResult.value?.queued) return tbResult.value;
+    if (rdResult.status === "fulfilled" && rdResult.value?.queued) return rdResult.value;
+    
+    return null;
   }
 
-  // ── Modo individual ───────────────────────────────────────────────────────
+  // MODO INDIVIDUAL
   if (useTorbox) {
     try {
       const result = await _resolveTorbox(infoHash, enrichedMagnet, season, episode, isAnime, torboxKey, torrentFiles);
-      if (result?.url)    return result;
-      if (result?.queued) return { queued: true, providers: ["TorBox"] };
-    } catch (e) {
-      console.log(`  [TorBox] Erro: ${e.message}`);
-    }
+      if (result) return result;
+    } catch (e) { console.log(`  [TorBox] Erro: ${e.message}`); }
   }
 
   if (useRD) {
     try {
       const result = await _resolveRD(infoHash, enrichedMagnet, season, episode, isAnime, rdKey);
-      if (result?.url)    return result;
-      if (result?.queued) return { queued: true, providers: ["Real-Debrid"] };
-    } catch (e) {
-      console.log(`  [Real-Debrid] Erro: ${e.message}`);
-    }
+      if (result) return result;
+    } catch (e) { console.log(`  [Real-Debrid] Erro: ${e.message}`); }
   }
 
   return null;
 }
 
-/** Resolve TorBox: verifica cache, retorna URL ou queued */
 async function _resolveTorbox(infoHash, magnet, season, episode, isAnime, key, torrentFiles) {
   const cached = await torboxCheckCache(infoHash, key);
   if (cached) {
     const files  = cached.files || torrentFiles || [];
     const picked = torboxPickFile(files, season, episode, isAnime);
 
-    // FIX: Para baixar no TorBox, o arquivo em cache DEVE ser adicionado à conta para gerar um torrent_id
     const addedTorrentId = await torboxAddTorrent(magnet, key, true);
     if (addedTorrentId && addedTorrentId !== true) {
       const url = torboxBuildPermalink(addedTorrentId, picked.fileId, key);
-      console.log(`  [TorBox] Cache HIT para ${infoHash} | torrent_id=${addedTorrentId} file_id=${picked.fileId}${picked.name ? ` (${picked.name})` : ""}`);
+      console.log(`  [TorBox] Cache HIT para ${infoHash}`);
       return { url, provider: "TorBox", filename: picked.name || null };
     }
-    
-    console.log(`  [TorBox] Cache HIT mas falha ao obter torrent_id na adição para ${infoHash}`);
     return null;
   }
-
-  // MISS — enfileira para download
-  const queuedId = await torboxAddTorrent(magnet, key, false);
-  console.log(`  [TorBox] Cache MISS para ${infoHash} — ${queuedId ? "enfileirado para download" : "falha ao enfileirar"}`);
-  return { queued: !!queuedId };
+  // [ON-DEMAND FIX]: Apenas marca como não cacheado e espera o clique no Stremio
+  console.log(`  [TorBox] Cache MISS para ${infoHash} — aguardando clique para enfileirar`);
+  return { queued: true, provider: "TorBox" };
 }
 
-/** Resolve Real-Debrid: verifica cache, retorna URL ou queued */
 async function _resolveRD(infoHash, magnet, season, episode, isAnime, key) {
   const cacheEntry = await rdCheckCache(infoHash, key);
   if (cacheEntry) {
     const fileIds = rdPickFileIds(cacheEntry, season, episode, isAnime);
     const result  = await rdGetDirectLink(infoHash, magnet, fileIds, key);
     if (result?.download) {
-      console.log(`  [Real-Debrid] Cache HIT para ${infoHash}${result.filename ? ` | ${result.filename}` : ""}`);
+      console.log(`  [Real-Debrid] Cache HIT para ${infoHash}`);
       return { url: result.download, provider: "Real-Debrid", filename: result.filename || null };
     }
-    console.log(`  [Real-Debrid] Cache HIT mas falha ao obter link direto para ${infoHash}`);
     return null;
   }
-
-  // MISS — enfileira para download
-  const queued = await rdAddTorrent(magnet, key);
-  console.log(`  [Real-Debrid] Cache MISS para ${infoHash} — ${queued ? "enfileirado para download" : "falha ao enfileirar"}`);
-  return { queued: true };
+  // [ON-DEMAND FIX]: Apenas marca como não cacheado e espera o clique no Stremio
+  console.log(`  [Real-Debrid] Cache MISS para ${infoHash} — aguardando clique para enfileirar`);
+  return { queued: true, provider: "Real-Debrid" };
 }
 
 module.exports = {
   buildMagnet,
   resolveDebridStream,
-  // Exportados para testes unitários
   torboxCheckCache,
   torboxPickFile,
   torboxAddTorrent,
