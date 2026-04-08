@@ -39,7 +39,7 @@ const rc = {
   async del(k)         { try { redis && await redis.del(k); } catch {} },
   async keys(p)        { try { return redis ? await redis.keys(p) : []; } catch { return []; } },
 };
-const CACHE_VERSION = "v8-debrid-batchfix";
+const CACHE_VERSION = "v9-debrid-privatefix";
 // ─────────────────────────────────────────────────────────
 // INDEXERS (ISOLAMENTO DE ANIME)
 // ─────────────────────────────────────────────────────────
@@ -388,8 +388,6 @@ function animeEpisodeMatches(title, ep) {
 // ─────────────────────────────────────────────────────────
 // DEDUPLICAÇÃO (ATUALIZADA)
 // ─────────────────────────────────────────────────────────
-// FIX: A deduplicação antiga removia grupos/encodes diferentes se o titulo fosse parecido.
-// Agora ela só deduplica se o HASH for exato ou se Título+Tamanho forem exatos.
 function dedupeResults(results) {
   const seenHash = new Set(), seenTitleSize = new Set(), deduped = [];
   for (const r of results) {
@@ -538,11 +536,12 @@ function relaxedTitleMatchScore(title, aliases = []) {
   return best;
 }
 
+// FIX IMPORTANTE: Salvando o buffer `.torrent` retornado pelo Jackett
 async function resolveInfoHash(r) {
-  if (r.InfoHash)  return { infoHash: r.InfoHash.toLowerCase(), files: null };
+  if (r.InfoHash)  return { infoHash: r.InfoHash.toLowerCase(), files: null, buffer: null };
   if (r.MagnetUri) {
     const h = extractInfoHash(r.MagnetUri);
-    if (h) return { infoHash: h, files: null };
+    if (h) return { infoHash: h, files: null, buffer: null };
   }
   if (!r.Link)     return null;
   try {
@@ -554,13 +553,13 @@ async function resolveInfoHash(r) {
     const finalUrl = res.request?.res?.responseUrl || "";
     if (finalUrl.startsWith("magnet:")) {
       const infoHash = extractInfoHash(finalUrl);
-      return infoHash ? { infoHash, files: null } : null;
+      return infoHash ? { infoHash, files: null, buffer: null } : null;
     }
     const buf     = Buffer.from(res.data);
     const bodyStr = buf.toString("utf8", 0, Math.min(buf.length, 200));
     if (bodyStr.trimStart().startsWith("magnet:")) {
       const infoHash = extractInfoHash(bodyStr.trim());
-      return infoHash ? { infoHash, files: null } : null;
+      return infoHash ? { infoHash, files: null, buffer: null } : null;
     }
     if (buf[0] === 0x64) {
       const infoBuf = extractInfoBuf(buf);
@@ -568,12 +567,14 @@ async function resolveInfoHash(r) {
         return {
           infoHash: crypto.createHash("sha1").update(infoBuf).digest("hex"),
           files: extractTorrentFiles(buf),
+          buffer: buf, // <----- MANTENDO O ARQUIVO .TORRENT AQUI
         };
       }
     }
   } catch {}
   return null;
 }
+
 function extractGroup(title) {
   const m = title.match(/[-.]([A-Z0-9]{2,12})(?:\[.+?\])?$/i);
   return m ? m[1].toUpperCase() : null;
@@ -591,6 +592,7 @@ function renameIndexer(name) {
     .replace(/🇧🇷\s*TorrentFilmes/gi, 'TorrentFilmes')
     .trim();
 }
+
 // ─────────────────────────────────────────────────────────
 // FORMATTER
 // ─────────────────────────────────────────────────────────
@@ -985,22 +987,42 @@ app.get("/:userConfig/manifest.json", (req, res) => {
   });
 });
 
+// ── ROTA DEBRID-ADD COM SUPORTE A BAIXAR .TORRENT ONDEMAND ───
 app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
   const { provider, infoHash } = req.params;
   const magnet = req.query.magnet;
+  const linkUrl = req.query.link;
   const prefs = resolvePrefs(req.params.userConfig);
   const config = prefs.debridConfig;
 
   console.log(`\n=========================================`);
   console.log(`[DEBRID ON-DEMAND] Usuário clicou no link! Enfileirando ${infoHash} no ${provider}...`);
 
-  if (config && magnet) {
+  if (config && (magnet || linkUrl)) {
     const { torboxAddTorrent, rdAddTorrent } = require("./debrid");
+    
+    let torrentBuffer = null;
+    // Se temos um link pro .torrent da private tracker, baixa ele para garantir adição!
+    if (linkUrl && linkUrl.startsWith("http")) {
+      try {
+        const dl = await axios.get(linkUrl, { 
+          responseType: "arraybuffer", 
+          timeout: 10000,
+          headers: { "User-Agent": "Mozilla/5.0" }
+        });
+        if (dl.data && Buffer.from(dl.data)[0] === 0x64) {
+          torrentBuffer = Buffer.from(dl.data);
+        }
+      } catch(e) {
+        console.log(`  [ON-DEMAND] Falha ao baixar .torrent do tracker: ${e.message}`);
+      }
+    }
+
     try {
       if (provider.toLowerCase() === "torbox") {
-        await torboxAddTorrent(magnet, config.torboxKey, false);
+        await torboxAddTorrent(magnet, config.torboxKey, false, torrentBuffer);
       } else {
-        await rdAddTorrent(magnet, config.rdKey);
+        await rdAddTorrent(magnet, config.rdKey, torrentBuffer);
       }
       console.log(`[DEBRID ON-DEMAND] Sucesso ao enviar para o Debrid! O download começou.`);
     } catch (e) {
@@ -1097,12 +1119,11 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           (a._titleMatchScore || 0) * 1000 + score(a, prefs.weights, parsed.isAnime, priorityLang))
       );
 
-    const maxProcess = (prefs.maxResults || 20) * 2; // Processa o dobro da meta para encontrar mais HITS de cache
+    const maxProcess = (prefs.maxResults || 20) * 2; 
     const topCandidates = candidates.slice(0, maxProcess);
 
     console.log(`Extraindo InfoHashes de ${topCandidates.length} candidatos promissores...`);
     
-    // FIX: Extração de InfoHashes em lotes controlados (concurrency)
     const withHashes = [];
     const concurrency = 10;
     for (let i = 0; i < topCandidates.length; i += concurrency) {
@@ -1117,7 +1138,6 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       withHashes.push(...resolvedChunk.filter(Boolean));
     }
 
-    // FIX: Batch Checking (Verificação em Lote dos caches no Debrid)
     let rdCacheMap = {};
     let tbCacheMap = {};
 
@@ -1156,8 +1176,9 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             parsed.isAnime,
             prefs.debridConfig,
             resolved.files,
-            rdCacheMap[resolved.infoHash], // Injetando o hit do cache batchado
-            tbCacheMap[resolved.infoHash]  // Injetando o hit do cache batchado
+            rdCacheMap[resolved.infoHash], 
+            tbCacheMap[resolved.infoHash],
+            resolved.buffer  // ENVIO DO .TORRENT PARA A MÁGICA ACONTECER
           );
 
           if (!debridData) return null;
@@ -1183,11 +1204,12 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
               };
             }
 
-            // Caso 2: Cache MISS (On-Demand)
+            // Caso 2: Cache MISS (On-Demand) - Inclui o link do .torrent original para enfileiramento sem falhas!
             if (resObj.queued) {
               const provider = resObj.provider || "Debrid";
               const hostUrl = `${req.headers['x-forwarded-proto'] || req.protocol}://${req.headers['x-forwarded-host'] || req.get('host')}`;
-              const addUrl = `${hostUrl}/${req.params.userConfig}/debrid-add/${provider}/${resolved.infoHash}?magnet=${encodeURIComponent(magnet)}`;
+              const linkParam = r.Link ? `&link=${encodeURIComponent(r.Link)}` : "";
+              const addUrl = `${hostUrl}/${req.params.userConfig}/debrid-add/${provider}/${resolved.infoHash}?magnet=${encodeURIComponent(magnet)}${linkParam}`;
 
               return {
                 name: `${addonName}\n⬇️ ${resLabelStr}`,
@@ -1216,7 +1238,6 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       })
     );
 
-    // Achata e fatia para o limite final pedido pelo usuário (ex: 20 links)
     const finalStreams = resolvedAll.flat().filter(Boolean).slice(0, prefs.maxResults || 20);
 
     if (isDebridMode) {
