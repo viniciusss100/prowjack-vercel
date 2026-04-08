@@ -39,7 +39,7 @@ const rc = {
   async del(k)         { try { redis && await redis.del(k); } catch {} },
   async keys(p)        { try { return redis ? await redis.keys(p) : []; } catch { return []; } },
 };
-const CACHE_VERSION = "v6-debrid-fix";
+const CACHE_VERSION = "v7-debrid-ondemand";
 // ─────────────────────────────────────────────────────────
 // INDEXERS (ISOLAMENTO DE ANIME)
 // ─────────────────────────────────────────────────────────
@@ -111,8 +111,6 @@ function defaultPrefs() {
     priorityLang:    "pt-br",
     onlyDubbed:      false,
     debrid:          false,
-    // debridConfig é preenchido pelo configure.html:
-    // { mode: 'torbox'|'realdebrid'|'dual', torboxKey: '', rdKey: '' }
     debridConfig:    null,
   };
 }
@@ -121,8 +119,6 @@ function resolvePrefs(encoded) {
   const m = { ...defaultPrefs(), ...u };
   if (!Array.isArray(m.indexers) || !m.indexers.length) m.indexers = ["all"];
   if (m.priorityLang === undefined) m.priorityLang = "pt-br";
-  // FIX: se debridConfig tiver chaves válidas, ativa debrid automaticamente
-  // e garante que o modo P2P fique desabilitado
   if (m.debridConfig && (m.debridConfig.torboxKey || m.debridConfig.rdKey)) {
     m.debrid = true;
   }
@@ -788,15 +784,20 @@ async function jackettSearch(plan, indexers, prefs) {
   const fastFlat    = (await Promise.all(indexers.map(indexer => jackettSearchOneIndexer(indexer, plan, FAST_TIMEOUT, FAST_TIMEOUT)))).flat();
   const fastDeduped = dedupeResults(fastFlat);
   console.log(`Conclusao da janela rapida: ${fastFlat.length} brutos -> ${fastDeduped.length} deduplicados`);
-  if (fastDeduped.length === 0) { await rc.set(cacheKey, JSON.stringify([]), 300); return []; }
+  
+  if (fastDeduped.length === 0) { 
+    // [FIX] Nunca salva no Redis arrays vazios!
+    return []; 
+  }
+  
   setImmediate(async () => {
     try {
       const slowDeduped = dedupeResults((await Promise.all(indexers.map(indexer => jackettSearchOneIndexer(indexer, plan, SLOW_TIMEOUT, FAST_TIMEOUT)))).flat());
       if (slowDeduped.length > fastDeduped.length) {
         console.log(`[Background] Cache atualizado: ${fastDeduped.length} -> ${slowDeduped.length}`);
-        await rc.set(cacheKey, JSON.stringify(slowDeduped), 1800);
+        if (slowDeduped.length > 0) await rc.set(cacheKey, JSON.stringify(slowDeduped), 1800);
       } else {
-        await rc.set(cacheKey, JSON.stringify(fastDeduped), 1800);
+        if (fastDeduped.length > 0) await rc.set(cacheKey, JSON.stringify(fastDeduped), 1800);
       }
     } catch {}
   });
@@ -997,8 +998,6 @@ app.get("/:userConfig/manifest.json", (req, res) => {
   const prefs = resolvePrefs(req.params.userConfig);
   const types = [...new Set((prefs.categories || ["movie","series"]).map(c => c==="movies"?"movie":c==="anime"?"series":c))];
   const name  = prefs.addonName || "ProwJack PRO";
-  // FIX: p2p=false quando debrid está ativo — informa ao Stremio que
-  // os streams são HTTP diretos, não P2P
   const isDebridActive = prefs.debrid && prefs.debridConfig &&
     (prefs.debridConfig.torboxKey || prefs.debridConfig.rdKey);
   res.json({
@@ -1008,6 +1007,40 @@ app.get("/:userConfig/manifest.json", (req, res) => {
     behaviorHints: { configurable: true, configurationRequired: false, p2p: !isDebridActive },
   });
 });
+
+// ─────────────────────────────────────────────────────────
+// ROTA ON-DEMAND (Ativa o download apenas no clique)
+// ─────────────────────────────────────────────────────────
+app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
+  const { provider, infoHash } = req.params;
+  const magnet = req.query.magnet;
+  const prefs = resolvePrefs(req.params.userConfig);
+  const config = prefs.debridConfig;
+
+  console.log(`\n=========================================`);
+  console.log(`[DEBRID ON-DEMAND] Usuário clicou no link! Enfileirando ${infoHash} no ${provider}...`);
+
+  if (config && magnet) {
+    const { torboxAddTorrent, rdAddTorrent } = require("./debrid");
+    try {
+      if (provider.toLowerCase() === "torbox") {
+        await torboxAddTorrent(magnet, config.torboxKey, false);
+      } else {
+        await rdAddTorrent(magnet, config.rdKey);
+      }
+      console.log(`[DEBRID ON-DEMAND] Sucesso ao enviar para o Debrid! O download começou.`);
+    } catch (e) {
+      console.log(`[DEBRID ON-DEMAND] Erro ao enfileirar: ${e.message}`);
+    }
+  }
+  console.log(`=========================================\n`);
+
+  // Retorna erro 404 propositalmente para o player do Stremio fechar. 
+  // O usuário verá uma mensagem padrão de stream incorreto, o que indica que 
+  // o download ainda está rolando no Debrid.
+  res.status(404).send("Stream is downloading on Debrid. Try again in a few minutes.");
+});
+
 // ─────────────────────────────────────────────────────────
 // STREAMS
 // ─────────────────────────────────────────────────────────
@@ -1019,7 +1052,6 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
   console.log(`NOVA BUSCA: [${type}] ${id}`);
 
   // ── Modo Debrid ativo? ────────────────────────────────────────────────────
-  // FIX: verifica se debridConfig tem chaves válidas para determinar modo
   const isDebridMode = prefs.debrid && prefs.debridConfig &&
     (prefs.debridConfig.torboxKey || prefs.debridConfig.rdKey);
 
@@ -1058,7 +1090,6 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     const { parsed, displayTitle, aliases = [], queries, episode, year, search } = await buildQueries(type, id);
     const requestedImdbId = normalizeImdbId(search?.imdbId || parsed?.metaId);
 
-    // Verificação de categorias habilitadas
     const enabledCats = Array.isArray(prefs.categories) && prefs.categories.length
       ? prefs.categories
       : ["movie", "series"];
@@ -1187,19 +1218,13 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         const matchedFile           = (type === "series" || parsed.isAnime)
           ? pickEpisodeFile(resolved.files, parsed.season, parsed.episode ?? episode, parsed.isAnime)
           : null;
-        // FIX: buildMagnet garante trackers no magnet enviado para debrid
         const magnet = buildMagnet(resolved.infoHash, r.MagnetUri, r.Title);
 
-        // ── MODO DEBRID: retorna URL HTTP direta, sem infoHash/P2P ──────────
-        // FIX PRINCIPAL: quando debridConfig está ativo, NUNCA retorna
-        // streams P2P. Verifica cache; se cachado retorna URL direta;
-        // se não cachado, envia para download no serviço debrid e omite
-        // este item dos resultados (retorna null).
         if (isDebridMode) {
           const debridResult = await resolveDebridStream(
             resolved.infoHash,
             magnet,
-            r.Title,                         // FIX: título para dn= no magnet
+            r.Title,
             parsed.season,
             parsed.episode ?? episode,
             parsed.isAnime,
@@ -1220,7 +1245,6 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
                 `${providerEmoji} ${debridResult.provider} ⚡️ Cache`,
               ].filter(Boolean).join("\n"),
               url: debridResult.url,
-              // Sem infoHash/sources — stream HTTP puro, não P2P
               behaviorHints: {
                 filename:  debridFilename,
                 videoSize: matchedFile?.size,
@@ -1232,37 +1256,28 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             };
           }
 
-          // ── Cache MISS: enfileirado, exibe como ⬇️ ───────────────────────
-          // FIX: label correto por provider (não mais "Debrid" genérico)
+          // ── [ON-DEMAND FIX] Cache MISS: exibe link dinâmico p/ download ───
           if (debridResult?.queued) {
             const addonName = prefs.addonName || "ProwJack PRO";
-            const { mode } = prefs.debridConfig;
-            const providers = debridResult.providers || [];
-            const providerLabel = providers.length === 2
-              ? "TorBox + Real-Debrid"
-              : providers[0] || (mode === "torbox" ? "TorBox" : mode === "realdebrid" ? "Real-Debrid" : "Debrid");
+            const provider = debridResult.provider || "Debrid";
+            const hostUrl = `${req.headers['x-forwarded-proto'] || req.protocol}://${req.headers['x-forwarded-host'] || req.get('host')}`;
+            const addUrl = `${hostUrl}/${req.params.userConfig}/debrid-add/${provider}/${resolved.infoHash}?magnet=${encodeURIComponent(magnet)}`;
+
             return {
               name: `${addonName}\n⬇️ ${resLabel}`,
               description: [
                 description,
-                `⬇️ ${providerLabel} — Aguardando cache`,
+                `⬇️ ${provider} — Clique para enfileirar/baixar`,
               ].filter(Boolean).join("\n"),
-              // Mantém P2P como fallback enquanto debrid processa
-              infoHash: resolved.infoHash,
-              fileIdx: matchedFile?.idx,
-              sources: r.MagnetUri ? [r.MagnetUri] : [],
+              // Aqui entra a mágica: passa a ser uma URL que só bate no server quando o usuário clica!
+              url: addUrl,
               behaviorHints: {
-                filename:  matchedFile?.name,
-                videoSize: matchedFile?.size,
-                bingeGroup: parsed.isAnime
-                  ? `prowjack|anime|${displayTitle}`
-                  : `prowjack|${resolved.infoHash}`,
                 notWebReady: true,
               },
             };
           }
 
-          // ── FIX FALLBACK: Se deu erro na API do Debrid, devolve P2P normal
+          // ── FIX FALLBACK: Falha no Debrid devolve P2P normal
           const addonNameFallback = prefs.addonName || "ProwJack PRO";
           return {
             name: `${addonNameFallback}\n⚠️ ${resLabel}`,
@@ -1309,9 +1324,9 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     const finalStreams = resolvedAll.filter(Boolean).slice(0, prefs.maxResults || 20);
 
     if (isDebridMode) {
-      const cached  = finalStreams.filter(s => s.url).length;
-      const queued  = finalStreams.filter(s => !s.url).length;
-      console.log(`[DEBRID] Streams prontos: ${cached} ⚡️ cached + ${queued} ⬇️ em fila — de ${candidates.length} candidatos`);
+      const cached  = finalStreams.filter(s => s.url && !s.url.includes('/debrid-add/')).length;
+      const queued  = finalStreams.filter(s => s.url && s.url.includes('/debrid-add/')).length;
+      console.log(`[DEBRID] Streams prontos: ${cached} ⚡️ cached + ${queued} ⬇️ p/ ativar — de ${candidates.length} candidatos`);
     } else {
       console.log(`Magnets prontos: Enviando ${finalStreams.length} torrents!`);
     }
@@ -1323,7 +1338,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
   }
 });
 app.listen(ENV.port, () => {
-  console.log(`ProwJack PRO v3.7.0 -> http://localhost:${ENV.port}/configure`);
+  console.log(`ProwJack PRO v3.8.0 -> http://localhost:${ENV.port}/configure`);
   console.log(`   Jackett : ${ENV.jackettUrl}`);
   console.log(`   Redis   : ${ENV.redisUrl}`);
 });
