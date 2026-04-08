@@ -556,29 +556,21 @@ async function testDebrid(provider) {
   statusEl.textContent = '⏳ Verificando…';
 
   try {
-    let url, headers;
-    if (provider === 'torbox') {
-      url = 'https://api.torbox.app/v1/api/user/me';
-      headers = { 'Authorization': 'Bearer ' + key };
-    } else {
-      url = 'https://api.real-debrid.com/rest/1.0/user';
-      headers = { 'Authorization': 'Bearer ' + key };
-    }
-    const res = await fetch(url, { headers });
-    if (res.ok) {
-      const data = await res.json();
-      const name = provider === 'torbox' ? (data?.data?.email || data?.data?.name) : data?.username;
-      const plan = provider === 'torbox' ? (data?.data?.plan || '') : (data?.type || '');
+    // Usa proxy local para evitar CORS — /api/debrid/test/:provider?key=...
+    const res  = await fetch(`/api/debrid/test/${provider}?key=${encodeURIComponent(key)}`);
+    const data = await res.json();
+    if (data.ok) {
+      const label = (data.name || 'Autenticado') + (data.plan ? ' · ' + data.plan : '');
       statusEl.className = 'debrid-status ok';
-      statusEl.textContent = '✔ ' + (name || 'Autenticado') + (plan ? ' · ' + plan : '');
-      toast('✔ ' + (provider === 'torbox' ? 'TorBox' : 'Real-Debrid') + ' conectado!');
+      statusEl.textContent = '✔ ' + label;
+      toast('✔ ' + (provider === 'torbox' ? 'TorBox' : 'Real-Debrid') + ' conectado! ' + (data.name || ''), 'ok');
     } else {
       statusEl.className = 'debrid-status err';
-      statusEl.textContent = '✗ Erro ' + res.status + (res.status === 401 ? ' (Key inválida)' : '');
+      statusEl.textContent = '✗ ' + (data.error || 'Erro desconhecido');
     }
-  } catch {
+  } catch (e) {
     statusEl.className = 'debrid-status err';
-    statusEl.textContent = '✗ Falha de conexão (CORS)';
+    statusEl.textContent = '✗ Falha: ' + e.message;
   }
 }
 
