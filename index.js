@@ -96,183 +96,239 @@ async function setRateLimit(indexer, retryAfterHeader) {
 
 // ── TorBox ────────────────────────────────────────────────
 // Docs: https://api.torbox.app/v1/api
-async function torboxRequestDL(infoHash, apiKey, fileIdx = null) {
+// ═══════════════════════════════════════════════════════════
+// DEBRID NATIVO — TorBox + Real-Debrid  (v2 — batch architecture)
+// ───────────────────────────────────────────────────────────────
+// Fluxo em 3 passos:
+//   1. Resolver infoHashes (paralelo, igual ao original)
+//   2. Checar cache em BATCH — 1 request por serviço para todos os hashes
+//   3. Gerar URL apenas para hashes que estão em cache
+// ═══════════════════════════════════════════════════════════
+
+// ── 1. BATCH CACHE CHECK ─────────────────────────────────────
+
+/** TorBox: checa N hashes numa única chamada. Retorna Map<hash_lower, bool> */
+async function tbBatchCache(hashes, apiKey) {
+  const result = new Map();
+  if (!hashes.length || !apiKey) return result;
+  const lows = hashes.map(h => h.toLowerCase());
+  try {
+    const res = await axios.get("https://api.torbox.app/v1/api/torrents/checkcached", {
+      params: { hash: lows.join(","), format: "object", list_files: false },
+      headers: { Authorization: `Bearer ${apiKey}` },
+      timeout: 12000,
+    });
+    const data = res.data?.data || {};
+    // O índice da resposta pode ter case diferente — usa lookup case-insensitive
+    const dataLow = Object.fromEntries(Object.entries(data).map(([k,v]) => [k.toLowerCase(), v]));
+    for (const h of lows) {
+      result.set(h, dataLow[h]?.cached === true);
+    }
+    const hits = [...result.values()].filter(Boolean).length;
+    console.log(`  [TorBox] Batch cache: ${hits}/${lows.length} em cache`);
+  } catch (err) {
+    const st = err.response?.status || err.message;
+    console.log(`  [TorBox] Batch cache ERRO (${st}) — tratado como não-cacheado`);
+    for (const h of lows) result.set(h, false);
+  }
+  return result;
+}
+
+/** Real-Debrid: checa N hashes numa única chamada (hashes na URL separados por /). Retorna Map<hash_lower, bool> */
+async function rdBatchCache(hashes, apiKey) {
+  const result = new Map();
+  if (!hashes.length || !apiKey) return result;
+  const lows = hashes.map(h => h.toLowerCase());
+  for (const h of lows) result.set(h, false);
+  try {
+    const url = `https://api.real-debrid.com/rest/1.0/torrents/instantAvailability/${lows.join("/")}`;
+    const res = await axios.get(url, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      timeout: 15000,
+    });
+    const data = res.data || {};
+    for (const [key, val] of Object.entries(data)) {
+      const h = key.toLowerCase();
+      // val pode ser [] (não cacheado) ou { rd: [...] }
+      const cached = Array.isArray(val?.rd) ? val.rd.length > 0 : false;
+      if (result.has(h)) result.set(h, cached);
+    }
+    const hits = [...result.values()].filter(Boolean).length;
+    console.log(`  [RD] Batch cache: ${hits}/${lows.length} em cache`);
+  } catch (err) {
+    const st = err.response?.status;
+    // 404 = hash desconhecido no RD, 429/403 = rate limit — ambos = não cacheado (sem erro grave)
+    const msg = st === 404 ? "não encontrado (404)"
+              : st === 429 ? "rate limit (429)"
+              : st === 403 ? "proibido (403)"
+              : err.message;
+    console.log(`  [RD] Batch cache ERRO: ${msg} — tratado como não-cacheado`);
+  }
+  return result;
+}
+
+/**
+ * Checa cache de todos os hashes em paralelo (TB + RD ao mesmo tempo).
+ * Retorna Map<hash_lower, { tb: bool, rd: bool }>
+ */
+async function batchDebridCacheCheck(hashes, config) {
+  const { mode, torboxKey, rdKey } = config;
+  const map = new Map();
+  for (const h of hashes) map.set(h.toLowerCase(), { tb: false, rd: false });
+
+  const jobs = [];
+  if ((mode === "torbox" || mode === "dual") && torboxKey)
+    jobs.push(tbBatchCache(hashes, torboxKey).then(m => ({ svc: "tb",  m })));
+  if ((mode === "realdebrid" || mode === "dual") && rdKey)
+    jobs.push(rdBatchCache(hashes, rdKey).then(m => ({ svc: "rd", m })));
+
+  const results = await Promise.allSettled(jobs);
+  for (const r of results) {
+    if (r.status !== "fulfilled") continue;
+    const { svc, m } = r.value;
+    for (const [h, cached] of m) {
+      const entry = map.get(h);
+      if (entry && cached) entry[svc] = true;
+    }
+  }
+  return map;
+}
+
+// ── 2. URL GENERATION (só chamado para hashes confirmados em cache) ──────
+
+/** TorBox: add torrent + requestdl (assume cache confirmado) */
+async function tbGenerateUrl(infoHash, apiKey, fileIdx) {
   const hashLow = infoHash.toLowerCase();
   try {
-    // 1. Verifica cache (hash sempre em lowercase na query e no lookup)
-    const checkRes = await axios.get(
-      `https://api.torbox.app/v1/api/torrents/checkcached`,
-      {
-        params: { hash: hashLow, format: "object", list_files: false },
-        headers: { Authorization: `Bearer ${apiKey}` },
-        timeout: 8000,
-      }
-    );
-    const cacheData = checkRes.data?.data || {};
-    // Lookup tolerante: tenta lowercase, original e qualquer chave presente
-    const cacheEntry = cacheData[hashLow]
-                    || cacheData[infoHash]
-                    || Object.values(cacheData)[0];
-    const isCached  = cacheEntry?.cached === true;
-    console.log(`  [TorBox] ${hashLow.slice(0,8)}: cache=${isCached} (success=${checkRes.data?.success})`);
-    if (!isCached) {
-      return null;
-    }
-
-    // 2. Adiciona/encontra o torrent na conta
     let torrentId = null;
+    // 2a. Tenta criar o torrent
     try {
       const addRes = await axios.post(
-        `https://api.torbox.app/v1/api/torrents/createtorrent`,
+        "https://api.torbox.app/v1/api/torrents/createtorrent",
         new URLSearchParams({ magnet: `magnet:?xt=urn:btih:${hashLow}`, seed: "1", allow_zip: "false" }),
-        {
-          headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/x-www-form-urlencoded" },
-          timeout: 12000,
-        }
+        { headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 15000 }
       );
       torrentId = addRes.data?.data?.torrent_id;
+      console.log(`  [TorBox] ${hashLow.slice(0,8)}: criado id=${torrentId}`);
     } catch (e) {
-      if (e.response?.data?.error === "ACTIVE_LIMIT") {
-        // Torrent já existe — busca pelo hash
-        const listRes = await axios.get(
-          `https://api.torbox.app/v1/api/torrents/mylist`,
-          { headers: { Authorization: `Bearer ${apiKey}` }, timeout: 8000 }
-        );
-        const found = (listRes.data?.data || []).find(t =>
-          (t.hash || "").toLowerCase() === hashLow
-        );
+      const errCode = e.response?.data?.error || e.response?.data?.detail || "";
+      // Torrent já existe na conta — busca pelo hash
+      if (e.response?.status === 409 || errCode.includes("ACTIVE_LIMIT") || errCode.includes("already")) {
+        console.log(`  [TorBox] ${hashLow.slice(0,8)}: já existe — buscando na lista...`);
+        const listRes = await axios.get("https://api.torbox.app/v1/api/torrents/mylist",
+          { headers: { Authorization: `Bearer ${apiKey}` }, timeout: 10000 });
+        const found = (listRes.data?.data || []).find(t => (t.hash || "").toLowerCase() === hashLow);
         torrentId = found?.id;
+        if (!torrentId) console.log(`  [TorBox] ${hashLow.slice(0,8)}: não encontrado na lista — hash=${hashLow}`);
+      } else {
+        console.log(`  [TorBox] ${hashLow.slice(0,8)}: createtorrent ERRO (${e.response?.status}) ${errCode}`);
+        return null;
       }
     }
     if (!torrentId) return null;
 
-    // 3. Gera link de download
-    const dlRes = await axios.get(
-      `https://api.torbox.app/v1/api/torrents/requestdl`,
-      {
-        params: { token: apiKey, torrent_id: torrentId, file_id: fileIdx ?? 0, zip_link: "false" },
-        headers: { Authorization: `Bearer ${apiKey}` },
-        timeout: 10000,
-      }
-    );
+    // 2b. Gera link de download direto
+    const dlRes = await axios.get("https://api.torbox.app/v1/api/torrents/requestdl", {
+      params: { token: apiKey, torrent_id: torrentId, file_id: fileIdx ?? 0, zip_link: "false" },
+      headers: { Authorization: `Bearer ${apiKey}` },
+      timeout: 12000,
+    });
     const url = dlRes.data?.data;
-    if (!url || typeof url !== "string") return null;
-    console.log(`  [TorBox] ${infoHash.slice(0,8)}: URL gerada ✓`);
+    if (!url || typeof url !== "string") {
+      console.log(`  [TorBox] ${hashLow.slice(0,8)}: requestdl sem URL — resp=${JSON.stringify(dlRes.data).slice(0,100)}`);
+      return null;
+    }
+    console.log(`  [TorBox] ${hashLow.slice(0,8)}: ✓ URL gerada`);
     return url;
   } catch (err) {
-    console.log(`  [TorBox] Erro: ${err.message}`);
+    console.log(`  [TorBox] ${hashLow.slice(0,8)}: ERRO gerar URL — ${err.response?.status || err.message}`);
     return null;
   }
 }
 
-// ── Real-Debrid ────────────────────────────────────────────
-// Docs: https://api.real-debrid.com/
-async function rdRequestDL(infoHash, apiKey, fileIdx = null) {
+/** Real-Debrid: addMagnet → selectFiles → poll → unrestrict (assume cache confirmado) */
+async function rdGenerateUrl(infoHash, apiKey, fileIdx) {
   const hashLow = infoHash.toLowerCase();
   try {
-    // 1. Verifica instant availability (hash lowercase na URL e no lookup)
-    const avRes = await axios.get(
-      `https://api.real-debrid.com/rest/1.0/torrents/instantAvailability/${hashLow}`,
-      {
-        headers: { Authorization: `Bearer ${apiKey}` },
-        timeout: 8000,
-      }
-    );
-    const avData = avRes.data || {};
-    // Lookup tolerante: lowercase, original, ou primeira chave da resposta
-    const cached   = avData[hashLow] || avData[infoHash] || Object.values(avData)[0];
-    const rdCached = cached?.rd && Array.isArray(cached.rd) && cached.rd.length > 0;
-    console.log(`  [RD] ${hashLow.slice(0,8)}: cache=${rdCached} (rd_variants=${cached?.rd?.length ?? 0})`);
-    if (!rdCached) {
-      return null;
-    }
-
-    // 2. Adiciona magnet
+    // 2a. Adiciona magnet
     const addRes = await axios.post(
-      `https://api.real-debrid.com/rest/1.0/torrents/addMagnet`,
+      "https://api.real-debrid.com/rest/1.0/torrents/addMagnet",
       new URLSearchParams({ magnet: `magnet:?xt=urn:btih:${hashLow}` }),
-      {
-        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/x-www-form-urlencoded" },
-        timeout: 12000,
-      }
+      { headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 15000 }
     );
     const torrentId = addRes.data?.id;
-    if (!torrentId) return null;
+    if (!torrentId) { console.log(`  [RD] ${hashLow.slice(0,8)}: addMagnet sem id`); return null; }
+    console.log(`  [RD] ${hashLow.slice(0,8)}: adicionado id=${torrentId}`);
 
-    // 3. Seleciona arquivo(s)
-    const fileToSelect = fileIdx != null ? String(fileIdx + 1) : "all";
+    // 2b. Seleciona arquivos
+    const fileParam = fileIdx != null ? String(fileIdx + 1) : "all";
     await axios.post(
       `https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${torrentId}`,
-      new URLSearchParams({ files: fileToSelect }),
-      {
-        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/x-www-form-urlencoded" },
-        timeout: 10000,
-      }
+      new URLSearchParams({ files: fileParam }),
+      { headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 10000 }
     );
 
-    // 4. Espera ficar ready e pega links
+    // 2c. Aguarda status "downloaded" (máx 6 tentativas × 2s = 12s)
     let links = [];
-    for (let attempt = 0; attempt < 5; attempt++) {
-      await new Promise(r => setTimeout(r, 1500));
+    for (let attempt = 0; attempt < 6; attempt++) {
+      await new Promise(r => setTimeout(r, 2000));
       const infoRes = await axios.get(
         `https://api.real-debrid.com/rest/1.0/torrents/info/${torrentId}`,
-        { headers: { Authorization: `Bearer ${apiKey}` }, timeout: 8000 }
+        { headers: { Authorization: `Bearer ${apiKey}` }, timeout: 10000 }
       );
       const status = infoRes.data?.status;
       links = infoRes.data?.links || [];
+      console.log(`  [RD] ${hashLow.slice(0,8)}: tentativa ${attempt+1}/6 status=${status} links=${links.length}`);
       if (status === "downloaded" && links.length > 0) break;
-      if (status === "error" || status === "dead") return null;
-    }
-    if (!links.length) return null;
-
-    // 5. Unrestrict o link
-    const link = links[fileIdx != null && fileIdx < links.length ? fileIdx : 0];
-    const unRes = await axios.post(
-      `https://api.real-debrid.com/rest/1.0/unrestrict/link`,
-      new URLSearchParams({ link }),
-      {
-        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/x-www-form-urlencoded" },
-        timeout: 10000,
+      if (status === "error" || status === "dead" || status === "magnet_error") {
+        console.log(`  [RD] ${hashLow.slice(0,8)}: status fatal=${status}`);
+        return null;
       }
+    }
+    if (!links.length) { console.log(`  [RD] ${hashLow.slice(0,8)}: nenhum link após polling`); return null; }
+
+    // 2d. Unrestrict o link correto
+    const linkIdx = fileIdx != null && fileIdx < links.length ? fileIdx : 0;
+    const unRes = await axios.post(
+      "https://api.real-debrid.com/rest/1.0/unrestrict/link",
+      new URLSearchParams({ link: links[linkIdx] }),
+      { headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 12000 }
     );
     const finalUrl = unRes.data?.download;
-    if (!finalUrl) return null;
-    console.log(`  [RD] ${infoHash.slice(0,8)}: URL gerada ✓`);
+    if (!finalUrl) { console.log(`  [RD] ${hashLow.slice(0,8)}: unrestrict sem URL`); return null; }
+    console.log(`  [RD] ${hashLow.slice(0,8)}: ✓ URL gerada`);
     return finalUrl;
   } catch (err) {
-    console.log(`  [RD] Erro: ${err.message}`);
+    console.log(`  [RD] ${hashLow.slice(0,8)}: ERRO gerar URL — ${err.response?.status || err.message}`);
     return null;
   }
 }
 
-// ── Dispatcher debrid nativo ───────────────────────────────
-// debridConfig: { mode: "torbox"|"realdebrid"|"dual", torboxKey: "", rdKey: "" }
-// Retorna { url, provider } ou null se não disponível
-async function resolveDebridUrl(infoHash, fileIdx, debridConfig) {
-  if (!debridConfig || !debridConfig.mode) return null;
-  const { mode, torboxKey, rdKey } = debridConfig;
+/**
+ * Gera URL para um hash JÁ CONFIRMADO em cache.
+ * cacheEntry = { tb: bool, rd: bool }
+ * Retorna { url, provider } ou null.
+ */
+async function generateDebridUrl(infoHash, fileIdx, config, cacheEntry) {
+  const { mode, torboxKey, rdKey } = config;
+  const hashLow = infoHash.toLowerCase();
 
-  if (mode === "torbox" && torboxKey) {
-    const url = await torboxRequestDL(infoHash, torboxKey, fileIdx);
+  // Tenta TorBox se disponível para este hash
+  if (cacheEntry.tb && torboxKey && (mode === "torbox" || mode === "dual")) {
+    const url = await tbGenerateUrl(hashLow, torboxKey, fileIdx);
     if (url) return { url, provider: "TorBox" };
+    console.log(`  [TorBox] ${hashLow.slice(0,8)}: falhou — tentando fallback`);
   }
-  if (mode === "realdebrid" && rdKey) {
-    const url = await rdRequestDL(infoHash, rdKey, fileIdx);
-    if (url) return { url, provider: "RD" };
-  }
-  if (mode === "dual") {
-    // Tenta em paralelo — retorna o mais rápido disponível
-    const results = await Promise.allSettled([
-      torboxKey ? torboxRequestDL(infoHash, torboxKey, fileIdx).then(u => u ? { url: u, provider: "TorBox" } : null) : Promise.resolve(null),
-      rdKey     ? rdRequestDL(infoHash, rdKey, fileIdx).then(u => u ? { url: u, provider: "RD" } : null)            : Promise.resolve(null),
-    ]);
-    for (const r of results) {
-      if (r.status === "fulfilled" && r.value) return r.value;
-    }
+  // Tenta RD se disponível para este hash
+  if (cacheEntry.rd && rdKey && (mode === "realdebrid" || mode === "dual")) {
+    const url = await rdGenerateUrl(hashLow, rdKey, fileIdx);
+    if (url) return { url, provider: "Real-Debrid" };
+    console.log(`  [RD] ${hashLow.slice(0,8)}: falhou`);
   }
   return null;
 }
 
+// ── Endpoint proxy: teste de credenciais (evita CORS no browser) ──────────
 // ─────────────────────────────────────────────────────────
 // CONFIG (Base64URL)
 // ─────────────────────────────────────────────────────────
@@ -1374,27 +1430,66 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     console.log(`${langLabel} | onlyDubbed: ${prefs.onlyDubbed}`);
     console.log(`Extraindo InfoHash de ${candidates.length} links promissores...`);
 
-    const resolvedAll = await Promise.all(
+    // ── PASSO 1: Resolve todos os infoHashes em paralelo ──────────────────
+    const resolvedHashData = await Promise.all(
       candidates.map(async r => {
         const resolved = await resolveInfoHash(r);
         if (!resolved?.infoHash) {
           console.log(`  Erro ou torrent vazio em "${(r.Title||"").slice(0,60)}"`);
           return null;
         }
+        return { r, resolved };
+      })
+    );
+    const validItems = resolvedHashData.filter(Boolean);
+
+    // ── PASSO 2: Checar cache em BATCH (1 request por serviço) ────────────
+    // Evita N requests paralelos que causam rate-limit (429/403) no RD e TorBox
+    let debridCacheMap = new Map(); // Map<hash_lower, { tb: bool, rd: bool }>
+    if (prefs.debridConfig?.mode) {
+      const allHashes = [...new Set(validItems.map(i => i.resolved.infoHash.toLowerCase()))];
+      console.log(`  [Debrid] Checando cache (batch) para ${allHashes.length} hashes...`);
+      debridCacheMap = await batchDebridCacheCheck(allHashes, prefs.debridConfig);
+      const totalCached = [...debridCacheMap.values()].filter(e => e.tb || e.rd).length;
+      // Detalha quais providers têm o quê
+      for (const [h, e] of debridCacheMap) {
+        if (e.tb || e.rd) {
+          const svcs = [e.tb ? "TorBox" : null, e.rd ? "RD" : null].filter(Boolean).join("+");
+          console.log(`  [Debrid] Cache HIT: ${h.slice(0,8)}... → ${svcs}`);
+        }
+      }
+      console.log(`  [Debrid] Total em cache: ${totalCached}/${allHashes.length}`);
+    }
+
+    // ── PASSO 3: Gera streams (URL debrid só para hashes em cache) ─────────
+    const resolvedAll = await Promise.all(
+      validItems.map(async ({ r, resolved }) => {
+        const hashLow     = resolved.infoHash.toLowerCase();
         const matchedFile = (type === "series" || parsed.isAnime)
           ? pickEpisodeFile(resolved.files, parsed.season, parsed.episode ?? episode, parsed.isAnime)
           : null;
-        const indexerName            = r.Tracker || r.TrackerId || "Unknown";
-        const { name, description }  = formatStream(r, indexerName, parsed.isAnime, prefs);
-        const sources                = r.MagnetUri ? [r.MagnetUri] : [];
-        // ── Debrid nativo (TorBox / Real-Debrid) ──────────────────────
-        const nativeDebrid = prefs.debridConfig && prefs.debridConfig.mode
-          ? await resolveDebridUrl(resolved.infoHash, matchedFile?.idx ?? null, prefs.debridConfig)
-          : null;
+        const indexerName           = r.Tracker || r.TrackerId || "Unknown";
+        const { name, description } = formatStream(r, indexerName, parsed.isAnime, prefs);
+        const sources               = r.MagnetUri ? [r.MagnetUri] : [];
+
+        // ── Debrid: gera URL apenas se o hash estava em cache no batch check ─
+        let nativeDebrid = null;
+        if (prefs.debridConfig?.mode) {
+          const cacheEntry = debridCacheMap.get(hashLow);
+          if (cacheEntry && (cacheEntry.tb || cacheEntry.rd)) {
+            console.log(`  [Debrid] ${hashLow.slice(0,8)}: gerando URL...`);
+            nativeDebrid = await generateDebridUrl(
+              resolved.infoHash,
+              matchedFile?.idx ?? null,
+              prefs.debridConfig,
+              cacheEntry
+            );
+          }
+        }
 
         if (nativeDebrid) {
-          // Provider aparece na linha 2 do nome (mesma linha da resolução)
-          // Ex: "ProwJack [TB+RD]\n1080p · TorBox" — visível no Stremio
+          // Provider aparece na linha 2 junto com a resolução, bem visível no Stremio
+          // Ex: "ProwJack [TB+RD]\n1080p · 🟠 TorBox"  ou  "...\n1080p · 🟣 Real-Debrid"
           const [nameLine1, nameLine2 = ""] = name.split("\n");
           const providerEmoji = nativeDebrid.provider === "TorBox" ? "🟠" : "🟣";
           return {
@@ -1413,6 +1508,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           };
         }
 
+        // Fallback P2P (torrent normal)
         return {
           name,
           description: matchedFile?.name
