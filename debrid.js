@@ -3,20 +3,13 @@
  * debrid.js — Módulo de integração com serviços Debrid
  * Suporta: TorBox, Real-Debrid (modo individual ou dual)
  *
- * FIXES aplicados neste arquivo:
- * 1. TorBox: checkcached retorna estrutura variável — normaliza corretamente
- * 2. TorBox: permalink agora usa torrent_id e file_id corretamente validados
- * 3. Real-Debrid: instantAvailability retorna 200 com corpo vazio em vez de 403
- * 4. Real-Debrid: rdGetDirectLink agora loga cada etapa para diagnóstico
- * 5. buildMagnet: trackers conhecidos são anexados ao magnet gerado
- * 6. [FIX VERCEL] TorBox: usa createtorrent com add_only_if_cached para pegar o torrent_id real
- * 7. [FIX ON-DEMAND] Cache MISS não enfileira mais o torrent automaticamente.
- * Apenas retorna provider para o index.js gerar um link de ativação via clique.
+ * FIX: Implementado "Batch Checking" (Verificação em Lote).
+ * Evita bloqueios por Rate Limit da API do Debrid e aumenta drasticamente 
+ * o índice de acerto do cache (HITs) em paridade com addons como Jackettio.
  */
 
 const axios = require("axios");
 
-// ─── Trackers populares para enriquecer magnets gerados ──────────────────────
 const TRACKERS = [
   "udp://tracker.opentrackr.org:1337/announce",
   "udp://tracker.openbittorrent.com:6969/announce",
@@ -27,9 +20,6 @@ const TRACKERS = [
   "https://tracker.nanoha.org/announce",
 ].map(t => `&tr=${encodeURIComponent(t)}`).join("");
 
-/**
- * Constrói um magnet URI com trackers populares.
- */
 function buildMagnet(infoHash, existingMagnet, title) {
   if (existingMagnet && existingMagnet.startsWith("magnet:")) {
     if (!existingMagnet.includes("&tr=")) {
@@ -42,7 +32,7 @@ function buildMagnet(infoHash, existingMagnet, title) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FUNÇÕES DE MATCH DE EPISÓDIO (importadas do index.js para uso interno)
+// MATCH DE EPISÓDIOS
 // ─────────────────────────────────────────────────────────────────────────────
 
 function animeEpisodeMatchRank(title, ep) {
@@ -78,26 +68,28 @@ function episodeMatchRank(title, season, episode) {
 // TORBOX
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function torboxCheckCache(hash, key) {
-  const h = hash.toLowerCase();
-  let res;
-  try {
-    res = await axios.get("https://api.torbox.app/v1/api/torrents/checkcached", {
-      params: { hash: h, format: "object", list_files: true },
-      headers: { Authorization: `Bearer ${key}` },
-      timeout: 8000,
-      validateStatus: s => s < 500,
-    });
-  } catch (err) {
-    throw new Error(`TorBox checkcached network error: ${err.message}`);
+async function torboxBatchCheckCache(hashes, key) {
+  if (!hashes || !hashes.length) return {};
+  const resultMap = {};
+
+  // Torbox aceita múltiplos hashes separados por vírgula. Agrupamos de 50 em 50.
+  for (let i = 0; i < hashes.length; i += 50) {
+    const chunk = hashes.slice(i, i + 50);
+    try {
+      const res = await axios.get("https://api.torbox.app/v1/api/torrents/checkcached", {
+        params: { hash: chunk.join(","), format: "object", list_files: true },
+        headers: { Authorization: `Bearer ${key}` },
+        timeout: 10000,
+        validateStatus: s => s < 500,
+      });
+      if (res.data?.success && res.data?.data) {
+        Object.assign(resultMap, res.data.data);
+      }
+    } catch (err) {
+      console.log(`  [TorBox Batch] Erro: ${err.message}`);
+    }
   }
-
-  if (!res.data?.success) return null;
-  const entry = res.data.data?.[h];
-  if (!entry || entry === false || typeof entry !== "object") return null;
-
-  const torrentId = entry.id ?? entry.torrent_id ?? null;
-  return { ...entry, _torrentId: torrentId };
+  return resultMap;
 }
 
 function torboxBuildPermalink(torrentId, fileId, key) {
@@ -108,15 +100,10 @@ function torboxBuildPermalink(torrentId, fileId, key) {
 }
 
 function torboxPickFile(files, season, episode, isAnime) {
-  if (!Array.isArray(files) || !files.length) {
-    return { fileId: 0, name: null };
-  }
+  if (!Array.isArray(files) || !files.length) return { fileId: 0, name: null };
 
   const withMeta = files.map((f, idx) => ({
-    idx,
-    fileId: f.id ?? idx,
-    size:   f.size || 0,
-    name:   f.name || f.short_name || "",
+    idx, fileId: f.id ?? idx, size: f.size || 0, name: f.name || f.short_name || "",
   }));
 
   if (season == null && episode == null) {
@@ -128,9 +115,7 @@ function torboxPickFile(files, season, episode, isAnime) {
 
   const scored = withMeta.map(f => ({
     ...f,
-    rank: isAnime
-      ? animeEpisodeMatchRank(f.name, episode)
-      : episodeMatchRank(f.name, season, episode),
+    rank: isAnime ? animeEpisodeMatchRank(f.name, episode) : episodeMatchRank(f.name, season, episode),
   })).filter(f => f.rank > 0);
 
   if (!scored.length) {
@@ -139,9 +124,7 @@ function torboxPickFile(files, season, episode, isAnime) {
     const best = pool.reduce((a, b) => b.size > a.size ? b : a);
     return { fileId: best.fileId, name: best.name };
   }
-  const best = scored.reduce((a, b) =>
-    b.rank > a.rank || (b.rank === a.rank && b.size > a.size) ? b : a
-  );
+  const best = scored.reduce((a, b) => b.rank > a.rank || (b.rank === a.rank && b.size > a.size) ? b : a);
   return { fileId: best.fileId, name: best.name };
 }
 
@@ -156,12 +139,8 @@ async function torboxAddTorrent(magnet, key, addOnlyIfCached = false) {
       "https://api.torbox.app/v1/api/torrents/createtorrent",
       body.toString(),
       {
-        headers: {
-          Authorization: `Bearer ${key}`,
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-        timeout: 12000,
-        validateStatus: s => s < 500,
+        headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/x-www-form-urlencoded" },
+        timeout: 12000, validateStatus: s => s < 500,
       }
     );
     if (res.data?.success) {
@@ -170,43 +149,39 @@ async function torboxAddTorrent(magnet, key, addOnlyIfCached = false) {
       return true;
     }
     return false;
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // REAL-DEBRID
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function rdCheckCache(hash, key) {
-  const h       = hash.toLowerCase();
+async function rdBatchCheckCache(hashes, key) {
+  if (!hashes || !hashes.length) return {};
   const headers = { Authorization: `Bearer ${key}` };
+  const resultMap = {};
 
-  try {
-    const res = await axios.get(
-      `https://api.real-debrid.com/rest/1.0/torrents/instantAvailability/${h}`,
-      { headers, timeout: 8000, validateStatus: s => s < 500 }
-    );
-
-    if (res.status === 200) {
-      const entry = res.data?.[h];
-      if (entry && Array.isArray(entry.rd) && entry.rd.length > 0) {
-        return entry.rd[0];
+  // RD aceita múltiplos hashes separados por barra (/).
+  for (let i = 0; i < hashes.length; i += 50) {
+    const chunk = hashes.slice(i, i + 50);
+    try {
+      const res = await axios.get(
+        `https://api.real-debrid.com/rest/1.0/torrents/instantAvailability/${chunk.join("/")}`,
+        { headers, timeout: 10000, validateStatus: s => s < 500 }
+      );
+      if (res.status === 200 && res.data) {
+        Object.assign(resultMap, res.data);
       }
-      return null;
+    } catch (err) {
+      console.log(`  [RD Batch] Erro: ${err.message}`);
     }
-  } catch {
-    return null;
   }
-  return null;
+  return resultMap;
 }
 
 function rdPickFileIds(cacheEntry, season, episode, isAnime) {
   const files = Object.entries(cacheEntry).map(([id, info]) => ({
-    id,
-    name: info.filename || "",
-    size: info.filesize || 0,
+    id, name: info.filename || "", size: info.filesize || 0,
   }));
   if (!files.length) return ["all"];
 
@@ -218,9 +193,7 @@ function rdPickFileIds(cacheEntry, season, episode, isAnime) {
 
   const scored = files.map(f => ({
     ...f,
-    rank: isAnime
-      ? animeEpisodeMatchRank(f.name, episode)
-      : episodeMatchRank(f.name, season, episode),
+    rank: isAnime ? animeEpisodeMatchRank(f.name, episode) : episodeMatchRank(f.name, season, episode),
   })).filter(f => f.rank > 0);
 
   if (!scored.length) {
@@ -228,54 +201,34 @@ function rdPickFileIds(cacheEntry, season, episode, isAnime) {
     const pool = videoFiles.length ? videoFiles : files;
     return [pool.reduce((a, b) => b.size > a.size ? b : a).id];
   }
-  return [scored.reduce((a, b) =>
-    b.rank > a.rank || (b.rank === a.rank && b.size > a.size) ? b : a
-  ).id];
+  return [scored.reduce((a, b) => b.rank > a.rank || (b.rank === a.rank && b.size > a.size) ? b : a).id];
 }
 
 async function rdDeleteTorrent(torrentId, key) {
   if (!torrentId) return;
   try {
-    await axios.delete(
-      `https://api.real-debrid.com/rest/1.0/torrents/delete/${torrentId}`,
-      { headers: { Authorization: `Bearer ${key}` }, timeout: 6000 }
-    );
+    await axios.delete(`https://api.real-debrid.com/rest/1.0/torrents/delete/${torrentId}`,
+      { headers: { Authorization: `Bearer ${key}` }, timeout: 6000 });
     console.log(`  [Real-Debrid] Torrent ${torrentId} deletado da conta após uso.`);
   } catch {}
 }
 
 async function rdGetDirectLink(hash, magnet, fileIds, key) {
-  const magnetUri = magnet;
-  const headers   = {
-    Authorization: `Bearer ${key}`,
-    "Content-Type": "application/x-www-form-urlencoded",
-  };
-
+  const headers = { Authorization: `Bearer ${key}`, "Content-Type": "application/x-www-form-urlencoded" };
   let torrentId;
   try {
-    const addRes = await axios.post(
-      "https://api.real-debrid.com/rest/1.0/torrents/addMagnet",
-      `magnet=${encodeURIComponent(magnetUri)}`,
-      { headers, timeout: 12000, validateStatus: s => s < 500 }
-    );
+    const addRes = await axios.post("https://api.real-debrid.com/rest/1.0/torrents/addMagnet",
+      `magnet=${encodeURIComponent(magnet)}`, { headers, timeout: 12000, validateStatus: s => s < 500 });
     torrentId = addRes.data?.id;
     if (!torrentId) return null;
-  } catch (err) {
-    return null;
-  }
+  } catch (err) { return null; }
 
   try {
-    const filesParam = Array.isArray(fileIds) && fileIds.length && fileIds[0] !== "all"
-      ? fileIds.join(",")
-      : "all";
-    await axios.post(
-      `https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${torrentId}`,
-      `files=${encodeURIComponent(filesParam)}`,
-      { headers, timeout: 10000, validateStatus: s => s < 500 }
-    );
+    const filesParam = Array.isArray(fileIds) && fileIds.length && fileIds[0] !== "all" ? fileIds.join(",") : "all";
+    await axios.post(`https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${torrentId}`,
+      `files=${encodeURIComponent(filesParam)}`, { headers, timeout: 10000, validateStatus: s => s < 500 });
   } catch (err) {
-    await rdDeleteTorrent(torrentId, key);
-    return null;
+    await rdDeleteTorrent(torrentId, key); return null;
   }
 
   let links = null;
@@ -283,38 +236,24 @@ async function rdGetDirectLink(hash, magnet, fileIds, key) {
   for (let i = 0; i < delays.length; i++) {
     await new Promise(r => setTimeout(r, delays[i]));
     try {
-      const infoRes = await axios.get(
-        `https://api.real-debrid.com/rest/1.0/torrents/info/${torrentId}`,
-        { headers: { Authorization: `Bearer ${key}` }, timeout: 10000 }
-      );
+      const infoRes = await axios.get(`https://api.real-debrid.com/rest/1.0/torrents/info/${torrentId}`,
+        { headers: { Authorization: `Bearer ${key}` }, timeout: 10000 });
       const info = infoRes.data;
-      if (info?.status === "downloaded" && info?.links?.length) {
-        links = info.links;
-        break;
-      }
-      if (["magnet_error", "error", "virus", "dead"].includes(info?.status)) {
-        break;
-      }
+      if (info?.status === "downloaded" && info?.links?.length) { links = info.links; break; }
+      if (["magnet_error", "error", "virus", "dead"].includes(info?.status)) break;
     } catch (err) {}
   }
 
-  if (!links?.length) {
-    await rdDeleteTorrent(torrentId, key);
-    return null;
-  }
+  if (!links?.length) { await rdDeleteTorrent(torrentId, key); return null; }
 
   let downloadUrl = null, filename = null;
   try {
-    const unresRes = await axios.post(
-      "https://api.real-debrid.com/rest/1.0/unrestrict/link",
-      `link=${encodeURIComponent(links[0])}`,
-      { headers, timeout: 12000 }
-    );
+    const unresRes = await axios.post("https://api.real-debrid.com/rest/1.0/unrestrict/link",
+      `link=${encodeURIComponent(links[0])}`, { headers, timeout: 12000 });
     downloadUrl = unresRes.data?.download || null;
     filename    = unresRes.data?.filename  || null;
   } catch (err) {
-    await rdDeleteTorrent(torrentId, key);
-    return null;
+    await rdDeleteTorrent(torrentId, key); return null;
   }
 
   await rdDeleteTorrent(torrentId, key);
@@ -323,34 +262,23 @@ async function rdGetDirectLink(hash, magnet, fileIds, key) {
 
 async function rdAddTorrent(magnet, key) {
   if (!magnet) return false;
-  const headers = {
-    Authorization: `Bearer ${key}`,
-    "Content-Type": "application/x-www-form-urlencoded",
-  };
+  const headers = { Authorization: `Bearer ${key}`, "Content-Type": "application/x-www-form-urlencoded" };
   try {
-    const addRes = await axios.post(
-      "https://api.real-debrid.com/rest/1.0/torrents/addMagnet",
-      `magnet=${encodeURIComponent(magnet)}`,
-      { headers, timeout: 12000, validateStatus: s => s < 500 }
-    );
+    const addRes = await axios.post("https://api.real-debrid.com/rest/1.0/torrents/addMagnet",
+      `magnet=${encodeURIComponent(magnet)}`, { headers, timeout: 12000, validateStatus: s => s < 500 });
     const torrentId = addRes.data?.id;
     if (!torrentId) return false;
-    await axios.post(
-      `https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${torrentId}`,
-      "files=all",
-      { headers, timeout: 10000, validateStatus: s => s < 500 }
-    );
+    await axios.post(`https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${torrentId}`,
+      "files=all", { headers, timeout: 10000, validateStatus: s => s < 500 });
     return true;
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ORQUESTRADOR
 // ─────────────────────────────────────────────────────────
 
-async function resolveDebridStream(infoHash, magnet, title, season, episode, isAnime, config, torrentFiles) {
+async function resolveDebridStream(infoHash, magnet, title, season, episode, isAnime, config, torrentFiles, rdCacheEntry, tbCacheEntry) {
   const { mode, torboxKey, rdKey } = config || {};
   const useTorbox = (mode === "torbox"     || mode === "dual") && !!torboxKey;
   const useRD     = (mode === "realdebrid" || mode === "dual") && !!rdKey;
@@ -359,44 +287,30 @@ async function resolveDebridStream(infoHash, magnet, title, season, episode, isA
 
   const enrichedMagnet = buildMagnet(infoHash, magnet, title);
 
-  // MODO DUAL
   if (useTorbox && useRD) {
     const [tbResult, rdResult] = await Promise.allSettled([
-      _resolveTorbox(infoHash, enrichedMagnet, season, episode, isAnime, torboxKey, torrentFiles),
-      _resolveRD(infoHash, enrichedMagnet, season, episode, isAnime, rdKey),
+      _resolveTorbox(infoHash, enrichedMagnet, season, episode, isAnime, torboxKey, torrentFiles, tbCacheEntry),
+      _resolveRD(infoHash, enrichedMagnet, season, episode, isAnime, rdKey, rdCacheEntry),
     ]);
 
-    if (tbResult.status === "fulfilled" && tbResult.value?.url) return tbResult.value;
-    if (rdResult.status === "fulfilled" && rdResult.value?.url) return rdResult.value;
+    const results = [];
+    if (tbResult.status === "fulfilled" && tbResult.value) results.push(tbResult.value);
+    if (rdResult.status === "fulfilled" && rdResult.value) results.push(rdResult.value);
 
-    // Se ambos falharam, retorna o estado queued de um deles (o usuário selecionará no clique)
-    if (tbResult.status === "fulfilled" && tbResult.value?.queued) return tbResult.value;
-    if (rdResult.status === "fulfilled" && rdResult.value?.queued) return rdResult.value;
-    
-    return null;
+    return results.length > 0 ? { multi: results } : null;
   }
 
-  // MODO INDIVIDUAL
-  if (useTorbox) {
-    try {
-      const result = await _resolveTorbox(infoHash, enrichedMagnet, season, episode, isAnime, torboxKey, torrentFiles);
-      if (result) return result;
-    } catch (e) { console.log(`  [TorBox] Erro: ${e.message}`); }
-  }
-
-  if (useRD) {
-    try {
-      const result = await _resolveRD(infoHash, enrichedMagnet, season, episode, isAnime, rdKey);
-      if (result) return result;
-    } catch (e) { console.log(`  [Real-Debrid] Erro: ${e.message}`); }
-  }
+  if (useTorbox) return _resolveTorbox(infoHash, enrichedMagnet, season, episode, isAnime, torboxKey, torrentFiles, tbCacheEntry);
+  if (useRD) return _resolveRD(infoHash, enrichedMagnet, season, episode, isAnime, rdKey, rdCacheEntry);
 
   return null;
 }
 
-async function _resolveTorbox(infoHash, magnet, season, episode, isAnime, key, torrentFiles) {
-  const cached = await torboxCheckCache(infoHash, key);
-  if (cached) {
+async function _resolveTorbox(infoHash, magnet, season, episode, isAnime, key, torrentFiles, tbCacheEntry) {
+  // Verifica se a entrada em cache previamente obtida no lote existe e não é falsa
+  if (tbCacheEntry && typeof tbCacheEntry === 'object' && tbCacheEntry !== false) {
+    const torrentId = tbCacheEntry.id ?? tbCacheEntry.torrent_id ?? null;
+    const cached = { ...tbCacheEntry, _torrentId: torrentId };
     const files  = cached.files || torrentFiles || [];
     const picked = torboxPickFile(files, season, episode, isAnime);
 
@@ -406,25 +320,22 @@ async function _resolveTorbox(infoHash, magnet, season, episode, isAnime, key, t
       console.log(`  [TorBox] Cache HIT para ${infoHash}`);
       return { url, provider: "TorBox", filename: picked.name || null };
     }
-    return null;
   }
-  // [ON-DEMAND FIX]: Apenas marca como não cacheado e espera o clique no Stremio
   console.log(`  [TorBox] Cache MISS para ${infoHash} — aguardando clique para enfileirar`);
   return { queued: true, provider: "TorBox" };
 }
 
-async function _resolveRD(infoHash, magnet, season, episode, isAnime, key) {
-  const cacheEntry = await rdCheckCache(infoHash, key);
-  if (cacheEntry) {
-    const fileIds = rdPickFileIds(cacheEntry, season, episode, isAnime);
+async function _resolveRD(infoHash, magnet, season, episode, isAnime, key, rdCacheEntry) {
+  // Verifica se a entrada em cache previamente obtida no lote existe e tem conteúdo válido
+  if (rdCacheEntry && Array.isArray(rdCacheEntry.rd) && rdCacheEntry.rd.length > 0) {
+    const entry = rdCacheEntry.rd[0];
+    const fileIds = rdPickFileIds(entry, season, episode, isAnime);
     const result  = await rdGetDirectLink(infoHash, magnet, fileIds, key);
     if (result?.download) {
       console.log(`  [Real-Debrid] Cache HIT para ${infoHash}`);
       return { url: result.download, provider: "Real-Debrid", filename: result.filename || null };
     }
-    return null;
   }
-  // [ON-DEMAND FIX]: Apenas marca como não cacheado e espera o clique no Stremio
   console.log(`  [Real-Debrid] Cache MISS para ${infoHash} — aguardando clique para enfileirar`);
   return { queued: true, provider: "Real-Debrid" };
 }
@@ -432,10 +343,10 @@ async function _resolveRD(infoHash, magnet, season, episode, isAnime, key) {
 module.exports = {
   buildMagnet,
   resolveDebridStream,
-  torboxCheckCache,
+  torboxBatchCheckCache,
   torboxPickFile,
   torboxAddTorrent,
-  rdCheckCache,
+  rdBatchCheckCache,
   rdPickFileIds,
   rdGetDirectLink,
   rdAddTorrent,
