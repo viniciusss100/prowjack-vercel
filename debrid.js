@@ -7,6 +7,7 @@
  */
 
 const axios = require("axios");
+const { injectTrackers } = require("./torrentEnrich");
 
 const TRACKERS = [
   "udp://tracker.opentrackr.org:1337/announce",
@@ -64,28 +65,43 @@ function episodeMatchRank(title, season, episode) {
 // TORBOX
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function torboxBatchCheckCache(hashes, key) {
+async function torboxBatchCheckCache(hashes, key, privateHashes = new Set()) {
   if (!hashes || !hashes.length) return {};
   const resultMap = {};
 
-  for (let i = 0; i < hashes.length; i += 50) {
-    const chunk = hashes.slice(i, i + 50);
-    try {
-      const res = await axios.get("https://api.torbox.app/v1/api/torrents/checkcached", {
+  // Torrents privados são excluídos: a API do TorBox pode adicioná-los
+  // automaticamente à conta ao processar o cache check, causando downloads indesejados.
+  const publicHashes = hashes.filter(h => !privateHashes.has(h));
+  if (!publicHashes.length) return resultMap;
+
+  const chunks = [];
+  for (let i = 0; i < publicHashes.length; i += 50) chunks.push(publicHashes.slice(i, i + 50));
+
+  const results = await Promise.allSettled(
+    chunks.map(chunk =>
+      axios.get("https://api.torbox.app/v1/api/torrents/checkcached", {
         params: { hash: chunk.join(","), format: "object", list_files: true },
         headers: { Authorization: `Bearer ${key}` },
         timeout: 10000,
         validateStatus: s => s < 500,
-      });
-      if (res.data?.success && res.data?.data) {
-        // FIX: TorBox retorna chaves em MAIÚSCULAS; normaliza para minúsculas
-        // para que o lookup com infoHash (lowercase) funcione corretamente.
-        for (const [k, v] of Object.entries(res.data.data)) {
-          resultMap[k.toLowerCase()] = v;
-        }
+      })
+    )
+  );
+
+  for (const r of results) {
+    if (r.status !== "fulfilled") { console.log(`  [TorBox Batch] Erro: ${r.reason?.message}`); continue; }
+    const data = r.value.data;
+    if (!data?.success || !data?.data) continue;
+    // Trata array (format:list) ou objeto (format:object)
+    if (Array.isArray(data.data)) {
+      for (const h of data.data) {
+        if (typeof h === "string") resultMap[h.toLowerCase()] = true;
+        else if (h?.hash) resultMap[h.hash.toLowerCase()] = h;
       }
-    } catch (err) {
-      console.log(`  [TorBox Batch] Erro: ${err.message}`);
+    } else {
+      for (const [k, v] of Object.entries(data.data)) {
+        if (v) resultMap[k.toLowerCase()] = v;
+      }
     }
   }
   return resultMap;
@@ -137,6 +153,7 @@ async function torboxAddTorrent(magnet, key, addOnlyIfCached = false, torrentBuf
 
     // Se temos o .torrent, enviamos fisicamente (imprescindível para trackers privados)
     if (torrentBuffer) {
+      const enriched = injectTrackers(torrentBuffer);
       const boundary = "----WebKitFormBoundary" + Math.random().toString(36).substring(2);
       const parts = [];
       parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="seed"\r\n\r\n3\r\n`));
@@ -145,7 +162,7 @@ async function torboxAddTorrent(magnet, key, addOnlyIfCached = false, torrentBuf
         parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="add_only_if_cached"\r\n\r\ntrue\r\n`));
       }
       parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="file.torrent"\r\nContent-Type: application/x-bittorrent\r\n\r\n`));
-      parts.push(torrentBuffer);
+      parts.push(enriched);
       parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
       
       data = Buffer.concat(parts);
@@ -176,28 +193,79 @@ async function torboxAddTorrent(magnet, key, addOnlyIfCached = false, torrentBuf
 // REAL-DEBRID
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function rdBatchCheckCache(hashes, key) {
+async function rdBatchCheckCache(hashes, key, bufferMap = {}) {
   if (!hashes || !hashes.length) return {};
-  const headers = { Authorization: `Bearer ${key}` };
   const resultMap = {};
 
-  for (let i = 0; i < hashes.length; i += 50) {
-    const chunk = hashes.slice(i, i + 50);
+  // instantAvailability está depreciado e retorna falsos negativos.
+  // Verificamos via add + selectFiles + status imediato (top 5 por performance).
+  const topHashes = hashes.slice(0, 5);
+  const headersAuth = { Authorization: `Bearer ${key}` };
+
+  await Promise.allSettled(topHashes.map(async hash => {
+    let torrentId;
     try {
-      const res = await axios.get(
-        `https://api.real-debrid.com/rest/1.0/torrents/instantAvailability/${chunk.join("/")}`,
-        { headers, timeout: 10000, validateStatus: s => s < 500 }
-      );
-      if (res.status === 200 && res.data) {
-        // FIX: normaliza chaves para minúsculas (consistência com infoHash)
-        for (const [k, v] of Object.entries(res.data)) {
-          resultMap[k.toLowerCase()] = v;
+      const buf = bufferMap[hash];
+      if (buf) {
+        // Tracker privado: usa upload do .torrent (addMagnet falha sem metadados DHT)
+        const enriched = injectTrackers(buf);
+        const addRes = await axios.put(
+          "https://api.real-debrid.com/rest/1.0/torrents/addTorrent", enriched,
+          { headers: { ...headersAuth, "Content-Type": "application/x-bittorrent" }, timeout: 12000, validateStatus: s => s < 500 }
+        );
+        torrentId = addRes.data?.id;
+      } else {
+        const magnet = `magnet:?xt=urn:btih:${hash}&tr=udp://tracker.opentrackr.org:1337/announce`;
+        const addRes = await axios.post(
+          "https://api.real-debrid.com/rest/1.0/torrents/addMagnet",
+          `magnet=${encodeURIComponent(magnet)}`,
+          { headers: { ...headersAuth, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 10000, validateStatus: s => s < 500 }
+        );
+        torrentId = addRes.data?.id;
+      }
+      if (!torrentId) return;
+
+      let info = await axios.get(`https://api.real-debrid.com/rest/1.0/torrents/info/${torrentId}`,
+        { headers: headersAuth, timeout: 8000 }).then(r => r.data);
+
+      if (info.status === "waiting_files_selection") {
+        await axios.post(`https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${torrentId}`,
+          "files=all", { headers: { ...headersAuth, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 8000, validateStatus: s => s < 500 });
+        await new Promise(r => setTimeout(r, 700));
+        info = await axios.get(`https://api.real-debrid.com/rest/1.0/torrents/info/${torrentId}`,
+          { headers: headersAuth, timeout: 8000 }).then(r => r.data);
+      }
+
+      if (info.status === "downloaded" || info.progress === 100) {
+        // Monta entrada compatível com o formato esperado pelo _resolveRD
+        const rdEntry = {};
+        for (const f of (info.files || [])) {
+          if (f.selected) rdEntry[f.id] = { filename: f.path?.split("/").pop() || "", filesize: f.bytes || 0 };
+        }
+        resultMap[hash] = { rd: [rdEntry], _torrentId: torrentId, _links: info.links };
+      } else {
+        // Polling extra rápido
+        await new Promise(r => setTimeout(r, 800));
+        const info2 = await axios.get(`https://api.real-debrid.com/rest/1.0/torrents/info/${torrentId}`,
+          { headers: headersAuth, timeout: 8000 }).then(r => r.data);
+        if (info2.status === "downloaded" || info2.progress === 100) {
+          const rdEntry = {};
+          for (const f of (info2.files || [])) {
+            if (f.selected) rdEntry[f.id] = { filename: f.path?.split("/").pop() || "", filesize: f.bytes || 0 };
+          }
+          resultMap[hash] = { rd: [rdEntry], _torrentId: torrentId, _links: info2.links };
+        } else {
+          await axios.delete(`https://api.real-debrid.com/rest/1.0/torrents/delete/${torrentId}`,
+            { headers: headersAuth, timeout: 6000 }).catch(() => {});
         }
       }
     } catch (err) {
-      console.log(`  [RD Batch] Erro: ${err.message}`);
+      console.log(`  [RD Batch] Erro para ${hash}: ${err.message}`);
+      if (torrentId) axios.delete(`https://api.real-debrid.com/rest/1.0/torrents/delete/${torrentId}`,
+        { headers: headersAuth, timeout: 6000 }).catch(() => {});
     }
-  }
+  }));
+
   return resultMap;
 }
 
@@ -235,36 +303,69 @@ async function rdDeleteTorrent(torrentId, key) {
   } catch {}
 }
 
-/**
- * Adiciona ao Real-Debrid e devolve link de cache (suporte a upload binário)
- */
-async function rdGetDirectLink(hash, magnet, fileIds, key, torrentBuffer = null) {
-  let torrentId;
+async function rdFindExistingTorrent(hash, key) {
   try {
-    // Se for Tracker Privado, prioriza a API Put /addTorrent com Buffer
-    if (torrentBuffer) {
-      const headers = { Authorization: `Bearer ${key}`, "Content-Type": "application/x-bittorrent" };
-      const addRes = await axios.put("https://api.real-debrid.com/rest/1.0/torrents/addTorrent", torrentBuffer, { headers, timeout: 12000, validateStatus: s => s < 500 });
-      torrentId = addRes.data?.id;
-    } else {
-      const headers = { Authorization: `Bearer ${key}`, "Content-Type": "application/x-www-form-urlencoded" };
-      const addRes = await axios.post("https://api.real-debrid.com/rest/1.0/torrents/addMagnet", `magnet=${encodeURIComponent(magnet)}`, { headers, timeout: 12000, validateStatus: s => s < 500 });
-      torrentId = addRes.data?.id;
-    }
-    if (!torrentId) return null;
-  } catch (err) { return null; }
+    const res = await axios.get("https://api.real-debrid.com/rest/1.0/torrents", {
+      headers: { Authorization: `Bearer ${key}` },
+      params: { limit: 100 },
+      timeout: 8000,
+      validateStatus: s => s < 500,
+    });
+    return res.data?.find(t => t.hash?.toLowerCase() === hash && t.status === "downloaded") || null;
+  } catch { return null; }
+}
 
-  try {
-    const headers = { Authorization: `Bearer ${key}`, "Content-Type": "application/x-www-form-urlencoded" };
-    const filesParam = Array.isArray(fileIds) && fileIds.length && fileIds[0] !== "all" ? fileIds.join(",") : "all";
-    await axios.post(`https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${torrentId}`,
-      `files=${encodeURIComponent(filesParam)}`, { headers, timeout: 10000, validateStatus: s => s < 500 });
-  } catch (err) {
-    await rdDeleteTorrent(torrentId, key); return null;
+async function rdGetDirectLink(hash, magnet, fileIds, key, torrentBuffer = null) {
+  const headersAuth = { Authorization: `Bearer ${key}` };
+  let torrentId;
+  let isExisting = false;
+
+  // Reutiliza torrent já existente na conta (evita re-add e polling desnecessário)
+  const existing = await rdFindExistingTorrent(hash, key);
+  if (existing) {
+    torrentId = existing.id;
+    isExisting = true;
+    console.log(`  [Real-Debrid] Reutilizando torrent existente ${torrentId} para ${hash}`);
+  } else {
+    try {
+      if (torrentBuffer) {
+        const enriched = injectTrackers(torrentBuffer);
+        const addRes = await axios.put("https://api.real-debrid.com/rest/1.0/torrents/addTorrent", enriched,
+          { headers: { ...headersAuth, "Content-Type": "application/x-bittorrent" }, timeout: 12000, validateStatus: s => s < 500 });
+        torrentId = addRes.data?.id;
+      } else {
+        const addRes = await axios.post("https://api.real-debrid.com/rest/1.0/torrents/addMagnet",
+          `magnet=${encodeURIComponent(magnet)}`,
+          { headers: { ...headersAuth, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 12000, validateStatus: s => s < 500 });
+        torrentId = addRes.data?.id;
+      }
+      if (!torrentId) return null;
+    } catch { return null; }
+
+    try {
+      const filesParam = Array.isArray(fileIds) && fileIds.length && fileIds[0] !== "all" ? fileIds.join(",") : "all";
+      await axios.post(`https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${torrentId}`,
+        `files=${encodeURIComponent(filesParam)}`,
+        { headers: { ...headersAuth, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 10000, validateStatus: s => s < 500 });
+    } catch {
+      await rdDeleteTorrent(torrentId, key); return null;
+    }
   }
 
+  // Se já existia e estava downloaded, tenta pegar links direto sem polling
+  if (isExisting && existing.links?.length) {
+    try {
+      const unresRes = await axios.post("https://api.real-debrid.com/rest/1.0/unrestrict/link",
+        `link=${encodeURIComponent(existing.links[0])}`,
+        { headers: { ...headersAuth, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 12000 });
+      const downloadUrl = unresRes.data?.download;
+      const filename    = unresRes.data?.filename || null;
+      if (downloadUrl) return { download: downloadUrl, filename };
+    } catch {}
+  }
+
+  // Polling para torrents recém-adicionados
   let links = null;
-  const headersAuth = { Authorization: `Bearer ${key}` };
   const delays = [600, 1000, 1000, 1200, 1200, 1500];
   for (let i = 0; i < delays.length; i++) {
     await new Promise(r => setTimeout(r, delays[i]));
@@ -274,22 +375,23 @@ async function rdGetDirectLink(hash, magnet, fileIds, key, torrentBuffer = null)
       const info = infoRes.data;
       if (info?.status === "downloaded" && info?.links?.length) { links = info.links; break; }
       if (["magnet_error", "error", "virus", "dead"].includes(info?.status)) break;
-    } catch (err) {}
+    } catch {}
   }
 
-  if (!links?.length) { await rdDeleteTorrent(torrentId, key); return null; }
+  if (!links?.length) { if (!isExisting) await rdDeleteTorrent(torrentId, key); return null; }
 
   let downloadUrl = null, filename = null;
   try {
     const unresRes = await axios.post("https://api.real-debrid.com/rest/1.0/unrestrict/link",
-      `link=${encodeURIComponent(links[0])}`, { headers: { ...headersAuth, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 12000 });
+      `link=${encodeURIComponent(links[0])}`,
+      { headers: { ...headersAuth, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 12000 });
     downloadUrl = unresRes.data?.download || null;
     filename    = unresRes.data?.filename  || null;
-  } catch (err) {
-    await rdDeleteTorrent(torrentId, key); return null;
+  } catch {
+    if (!isExisting) await rdDeleteTorrent(torrentId, key); return null;
   }
 
-  await rdDeleteTorrent(torrentId, key);
+  if (!isExisting) await rdDeleteTorrent(torrentId, key);
   return downloadUrl ? { download: downloadUrl, filename } : null;
 }
 
@@ -348,21 +450,22 @@ async function resolveDebridStream(infoHash, magnet, title, season, episode, isA
 }
 
 async function _resolveTorbox(infoHash, magnet, season, episode, isAnime, key, torrentFiles, tbCacheEntry, torrentBuffer) {
-  if (tbCacheEntry && typeof tbCacheEntry === 'object' && tbCacheEntry !== false) {
-    const torrentId = tbCacheEntry.id ?? tbCacheEntry.torrent_id ?? null;
-    const files  = tbCacheEntry.files || torrentFiles || [];
+  // tbCacheEntry pode ser `true` (cacheado mas sem metadados) ou um objeto completo
+  const hasCache = tbCacheEntry && (tbCacheEntry === true || (typeof tbCacheEntry === 'object' && tbCacheEntry !== false));
+
+  if (hasCache) {
+    const torrentId = (tbCacheEntry !== true) ? (tbCacheEntry.id ?? tbCacheEntry.torrent_id ?? null) : null;
+    const files  = (tbCacheEntry !== true && tbCacheEntry.files) ? tbCacheEntry.files : (torrentFiles || []);
     const picked = torboxPickFile(files, season, episode, isAnime);
 
-    // FIX: usa o torrent_id que já vem no próprio cache entry.
-    // Antes, o código chamava torboxAddTorrent() de novo para obter o ID,
-    // mas se a API retornava `true` (sucesso sem ID), o stream era descartado como MISS.
     if (torrentId != null) {
       const url = torboxBuildPermalink(torrentId, picked.fileId, key);
       console.log(`  [TorBox] Cache HIT para ${infoHash}`);
       return { url, provider: "TorBox", filename: picked.name || null };
     }
 
-    // Fallback: ID não estava no cache entry, tenta adicionar para obter o ID
+    // Fallback: sem ID no cache entry (ou entry === true), adiciona para obter o ID
+    console.log(`  [TorBox] Cache HIT (sem ID) para ${infoHash} — adicionando para obter ID`);
     const addedTorrentId = await torboxAddTorrent(magnet, key, true, torrentBuffer);
     if (addedTorrentId && addedTorrentId !== true) {
       const url = torboxBuildPermalink(addedTorrentId, picked.fileId, key);
@@ -378,9 +481,30 @@ async function _resolveRD(infoHash, magnet, season, episode, isAnime, key, rdCac
   if (rdCacheEntry && Array.isArray(rdCacheEntry.rd) && rdCacheEntry.rd.length > 0) {
     const entry = rdCacheEntry.rd[0];
     const fileIds = rdPickFileIds(entry, season, episode, isAnime);
-    
-    // Entrega o buffer (se existir), evitando falha de addMagnet em privados
-    const result  = await rdGetDirectLink(infoHash, magnet, fileIds, key, torrentBuffer);
+
+    // Se o batch check já deixou o torrent adicionado e com links prontos, usa direto
+    if (rdCacheEntry._torrentId && rdCacheEntry._links?.length) {
+      const headersAuth = { Authorization: `Bearer ${key}` };
+      const selectedFiles = Object.keys(entry);
+      const linkIndex = fileIds[0] !== "all"
+        ? Math.max(0, selectedFiles.indexOf(String(fileIds[0])))
+        : 0;
+      const link = rdCacheEntry._links[linkIndex] || rdCacheEntry._links[0];
+      try {
+        const unresRes = await axios.post("https://api.real-debrid.com/rest/1.0/unrestrict/link",
+          `link=${encodeURIComponent(link)}`,
+          { headers: { ...headersAuth, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 12000 });
+        const downloadUrl = unresRes.data?.download;
+        if (downloadUrl) {
+          console.log(`  [Real-Debrid] Cache HIT (reutilizando torrent do batch) para ${infoHash}`);
+          await axios.delete(`https://api.real-debrid.com/rest/1.0/torrents/delete/${rdCacheEntry._torrentId}`,
+            { headers: headersAuth, timeout: 6000 }).catch(() => {});
+          return { url: downloadUrl, provider: "Real-Debrid", filename: unresRes.data?.filename || null };
+        }
+      } catch {}
+    }
+
+    const result = await rdGetDirectLink(infoHash, magnet, fileIds, key, torrentBuffer);
     if (result?.download) {
       console.log(`  [Real-Debrid] Cache HIT para ${infoHash}`);
       return { url: result.download, provider: "Real-Debrid", filename: result.filename || null };
@@ -398,6 +522,7 @@ module.exports = {
   torboxAddTorrent,
   rdBatchCheckCache,
   rdPickFileIds,
+  rdFindExistingTorrent,
   rdGetDirectLink,
   rdAddTorrent,
 };
