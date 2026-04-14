@@ -378,7 +378,7 @@ async function rdGetDirectLink(hash, magnet, fileIds, key, torrentBuffer = null)
     } catch {}
   }
 
-  if (!links?.length) { if (!isExisting) await rdDeleteTorrent(torrentId, key); return null; }
+  if (!links?.length) return null;
 
   let downloadUrl = null, filename = null;
   try {
@@ -387,11 +387,8 @@ async function rdGetDirectLink(hash, magnet, fileIds, key, torrentBuffer = null)
       { headers: { ...headersAuth, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 12000 });
     downloadUrl = unresRes.data?.download || null;
     filename    = unresRes.data?.filename  || null;
-  } catch {
-    if (!isExisting) await rdDeleteTorrent(torrentId, key); return null;
-  }
+  } catch { return null; }
 
-  if (!isExisting) await rdDeleteTorrent(torrentId, key);
   return downloadUrl ? { download: downloadUrl, filename } : null;
 }
 
@@ -510,7 +507,16 @@ async function _resolveRD(infoHash, magnet, season, episode, isAnime, key, rdCac
       return { url: result.download, provider: "Real-Debrid", filename: result.filename || null };
     }
   }
-  console.log(`  [Real-Debrid] Cache MISS para ${infoHash} — aguardando clique para enfileirar`);
+  console.log(`  [Real-Debrid] Cache MISS para ${infoHash} — verificando se já está na conta...`);
+  // Torrent pode ter sido adicionado anteriormente (via on-demand ou batch); verifica antes de retornar queued
+  const existing = await rdFindExistingTorrent(infoHash, key);
+  if (existing?.links?.length) {
+    const result = await rdGetDirectLink(infoHash, magnet, ["all"], key, torrentBuffer);
+    if (result?.download) {
+      console.log(`  [Real-Debrid] Encontrado na conta (já baixado)! ${infoHash}`);
+      return { url: result.download, provider: "Real-Debrid", filename: result.filename || null };
+    }
+  }
   return { queued: true, provider: "Real-Debrid" };
 }
 
