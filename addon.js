@@ -6,6 +6,13 @@ const Redis   = require("ioredis");
 const path    = require("path");
 const fs      = require("fs");
 const { resolveDebridStream, buildMagnet } = require("./debrid");
+const {
+  isConfigured: isQbitConfigured,
+  ensureTorrentReady,
+  waitForBuffer: waitForQbitBuffer,
+  getPlayableLocalFile,
+  streamTorrentFile,
+} = require("./providers/qbittorrent");
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
@@ -30,22 +37,100 @@ const ENV = {
   zileanKey:      (process.env.ZILEAN_API_KEY || "").trim(),
   bitmagnetUrl:   (process.env.BITMAGNET_URL || "").trim(),
   bitmagnetKey:   (process.env.BITMAGNET_API_KEY || "").trim(),
+  addonPublicUrl: (process.env.ADDON_PUBLIC_URL || "").trim().replace(/\/+$/, ""),
 };
 // ─────────────────────────────────────────────────────────
 // REDIS
 // ─────────────────────────────────────────────────────────
 let redis = null;
+const memoryStore = new Map();
 try {
   redis = new Redis(ENV.redisUrl, { lazyConnect: true, enableOfflineQueue: false });
   redis.on("error", () => {});
 } catch {}
+
+function memoryGet(k) {
+  const entry = memoryStore.get(k);
+  if (!entry) return null;
+  if (entry.expiresAt && entry.expiresAt <= Date.now()) {
+    memoryStore.delete(k);
+    return null;
+  }
+  return entry.value;
+}
+
+function memorySet(k, v, ttl) {
+  memoryStore.set(k, { value: v, expiresAt: ttl ? Date.now() + ttl * 1000 : null });
+}
+
+function memoryDel(k) {
+  memoryStore.delete(k);
+}
+
 const rc = {
-  async get(k)         { try { return redis ? await redis.get(k) : null; } catch { return null; } },
-  async set(k, v, ttl) { try { redis && await redis.set(k, v, "EX", ttl); } catch {} },
-  async del(k)         { try { redis && await redis.del(k); } catch {} },
-  async keys(p)        { try { return redis ? await redis.keys(p) : []; } catch { return []; } },
+  async get(k) {
+    try {
+      if (redis) {
+        const value = await redis.get(k);
+        if (value != null) return value;
+      }
+    } catch {}
+    return memoryGet(k);
+  },
+  async set(k, v, ttl) {
+    memorySet(k, v, ttl);
+    try { if (redis) await redis.set(k, v, "EX", ttl); } catch {}
+  },
+  async del(k) {
+    memoryDel(k);
+    try { if (redis) await redis.del(k); } catch {}
+  },
+  async keys(p) {
+    const regex = new RegExp(`^${String(p).replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\\\*/g, ".*")}$`);
+    const memoryKeys = [...memoryStore.keys()].filter(key => regex.test(key));
+    try {
+      if (redis) {
+        const redisKeys = await redis.keys(p);
+        return [...new Set([...redisKeys, ...memoryKeys])];
+      }
+    } catch {}
+    return memoryKeys;
+  },
 };
-const CACHE_VERSION = "v10-debrid-masterfix";
+const CACHE_VERSION = "v11-stremthru-qbit";
+
+function getPublicBase(req) {
+  if (ENV.addonPublicUrl) return ENV.addonPublicUrl;
+  const protocol = req.headers["x-forwarded-proto"] || req.protocol;
+  const host = req.headers["x-forwarded-host"] || req.get("host");
+  return `${protocol}://${host}`;
+}
+
+async function saveQbitJob(payload, ttl = 6 * 3600) {
+  const token = crypto.randomBytes(18).toString("base64url");
+  await rc.set(`qbitjob:${token}`, JSON.stringify(payload), ttl);
+  return token;
+}
+
+async function loadQbitJob(token) {
+  const raw = await rc.get(`qbitjob:${token}`);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+function getStremThruBase() {
+  if (!ENV.stremthruUrl) return null;
+  const match = ENV.stremthruUrl.match(/^(https?:\/\/[^/]+)/);
+  return match ? match[1] : null;
+}
+
+const STREMTHRU_STORE_MAP = {
+  realdebrid: "realdebrid",
+  torbox: "torbox",
+  alldebrid: "alldebrid",
+  premiumize: "premiumize",
+  debridlink: "debridlink",
+};
 // ─────────────────────────────────────────────────────────
 // INDEXERS (ISOLAMENTO DE ANIME)
 // ─────────────────────────────────────────────────────────
@@ -522,19 +607,15 @@ function relaxedTitleMatchScore(title, aliases = []) {
 async function resolveInfoHash(r) {
   let fallbackHash = r.InfoHash ? r.InfoHash.toLowerCase() : null;
   let magnetHash   = r.MagnetUri ? extractInfoHash(r.MagnetUri) : null;
+  const httpLink   = (r.Link && !r.Link.startsWith("magnet:")) ? r.Link : null;
 
-  // Se temos magnet mas também temos Link (tracker privado expõe ambos),
-  // baixamos o .torrent para ter o buffer — essencial para upload no debrid.
-  // Trackers públicos só têm MagnetUri (sem Link), então o fast path se mantém.
-  if (r.MagnetUri && magnetHash && !r.Link) {
+  if (r.MagnetUri && magnetHash && !httpLink) {
     return { infoHash: magnetHash, files: null, buffer: null };
   }
 
-  // Se não temos magnet mas temos link, BAIXAMOS o .torrent 
-  // (Essencial para trackers privados ou links falsos do Jackett)
-  if (r.Link) {
+  if (httpLink) {
     try {
-      const res = await axios.get(r.Link, {
+      const res = await axios.get(httpLink, {
         timeout: 10000, maxRedirects: 10, responseType: "arraybuffer",
         maxContentLength: 8 * 1024 * 1024, validateStatus: s => s < 400,
         headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
@@ -612,12 +693,13 @@ function formatStream(r, indexerName, isAnime = false, prefs = {}) {
   else if (isMulti && !langs.some(l => l.code === "pt-br")) langDisplay.push("🎧 Multi");
   const clean    = t.replace(/\b\d{4}\b\.?/g, " ").replace(/\./g, " ").replace(/\s{2,}/g, " ").trim();
   const p2pLabel = prefs.debrid ? "" : "⚠️ P2P";
+  // Idioma ao lado do codec; grupo ao lado do indexador
+  const langStr  = langDisplay.join(" | ");
   const desc = [
     `🎬 ${clean}`,
-    [qual ? `🎥 ${qual.label}` : "", vis.length ? `📺 ${vis.map(v=>v.label).join(" | ")}` : "", codec ? `🎞️ ${codec.label}` : ""].filter(Boolean).join("  "),
-    [audios.length ? `🎧 ${audios.map(a=>a.label).join(" | ")}` : "", langDisplay.join(" | ")].filter(Boolean).join("  "),
-    [size ? `📦 ${size}` : "", seeds > 0 ? `🌱 ${seeds} seeds` : "", `📡 ${cleanIndexer}`].filter(Boolean).join("  "),
-    group   ? `🏷️ ${group}` : "",
+    [qual ? `🎥 ${qual.label}` : "", vis.length ? `📺 ${vis.map(v=>v.label).join(" | ")}` : "", codec ? `🎞️ ${codec.label}` : "", langStr].filter(Boolean).join("  "),
+    [audios.length ? `🎧 ${audios.map(a=>a.label).join(" | ")}` : ""].filter(Boolean).join("  "),
+    [size ? `📦 ${size}` : "", seeds > 0 ? `🌱 ${seeds} seeds` : "", `📡 ${cleanIndexer}`, group ? `🏷️ ${group}` : ""].filter(Boolean).join("  "),
     p2pLabel,
   ].filter(Boolean).join("\n");
   return { name: `${addonName}\n${resLabel}`, description: desc.trim(), resLabel };
@@ -703,6 +785,90 @@ async function searchCacheSources({ q, imdbId, type }) {
   return new Set(all);
 }
 
+async function checkCacheViaStremThru(hashes, store, apiKey) {
+  const base = getStremThruBase();
+  const storeName = STREMTHRU_STORE_MAP[store] || store;
+  if (!base || !storeName || !apiKey || !Array.isArray(hashes) || !hashes.length) return new Set();
+
+  const normalized = [...new Set(hashes.map(h => String(h || "").toLowerCase()).filter(h => /^[0-9a-f]{40}$/.test(h)))];
+  if (!normalized.length) return new Set();
+
+  const cachedHashes = new Set();
+  const pending = [];
+
+  for (const hash of normalized) {
+    const cached = await rc.get(`stremthru:${storeName}:${hash}`);
+    if (cached === "1") cachedHashes.add(hash);
+    else if (cached !== "0") pending.push(hash);
+  }
+
+  // Determina o header de autenticação correto:
+  // Se apiKey contém ":" é user:pass (Basic), senão é Bearer token
+  const authHeader = apiKey.includes(":")
+    ? `Basic ${Buffer.from(apiKey).toString("base64")}`
+    : `Bearer ${apiKey}`;
+
+  const CHUNK = 500;
+  for (let i = 0; i < pending.length; i += CHUNK) {
+    const chunk = pending.slice(i, i + CHUNK);
+    try {
+      const url = `${base}/v0/store/magnets/check`;
+      const body = JSON.stringify({ hashes: chunk });
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-StremThru-Store-Name": storeName,
+          "Authorization": authHeader,
+        },
+        body,
+        signal: AbortSignal.timeout(10000),
+      });
+
+      if (!res.ok) {
+        console.warn(`[StremThruCache] HTTP ${res.status} para store=${storeName}`);
+        // Tenta endpoint alternativo GET com query params
+        const urlAlt = `${base}/v0/store/magnets/check?magnet=${chunk.map(h => `magnet:?xt=urn:btih:${h}`).join("&magnet=")}`;
+        const res2 = await fetch(urlAlt, {
+          headers: {
+            "X-StremThru-Store-Name": storeName,
+            "Authorization": authHeader,
+          },
+          signal: AbortSignal.timeout(10000),
+        }).catch(() => null);
+        if (!res2?.ok) continue;
+        const data2 = await res2.json();
+        const chunkHits = new Set();
+        for (const item of (data2?.data?.items || [])) {
+          const h = String(item?.hash || "").toLowerCase();
+          if (item?.status === "cached" && /^[0-9a-f]{40}$/.test(h)) { chunkHits.add(h); cachedHashes.add(h); }
+        }
+        await Promise.allSettled(chunk.map(h => rc.set(`stremthru:${storeName}:${h}`, chunkHits.has(h) ? "1" : "0", 1800)));
+        continue;
+      }
+
+      const data = await res.json();
+      const chunkHits = new Set();
+      for (const item of (data?.data?.items || [])) {
+        const h = String(item?.hash || "").toLowerCase();
+        if (item?.status === "cached" && /^[0-9a-f]{40}$/.test(h)) {
+          chunkHits.add(h);
+          cachedHashes.add(h);
+        }
+      }
+
+      await Promise.allSettled(
+        chunk.map(h => rc.set(`stremthru:${storeName}:${h}`, chunkHits.has(h) ? "1" : "0", 1800))
+      );
+    } catch (err) {
+      console.warn(`[StremThruCache] Erro para store=${storeName}: ${err.message}`);
+    }
+  }
+
+  console.log(`[StremThruCache] store=${storeName} | ${cachedHashes.size} cached de ${normalized.length} hashes`);
+  return cachedHashes;
+}
+
 async function jackettFetchIndexers() {
   // Jackett: t=indexers retorna XML com lista de indexers sem executar busca
   try {
@@ -780,11 +946,52 @@ function parseTorznabResults(xml, indexer) {
   }).filter(r => r.Title && (r.Link || r.MagnetUri || r.Guid));
 }
 
+function normalizeProwlarrInfoHash(raw) {
+  const value = String(raw || "").trim().toLowerCase();
+  if (/^[0-9a-f]{40}$/.test(value)) return value;
+  if (/^[0-9a-f]{80}$/.test(value)) {
+    try {
+      const ascii = Buffer.from(value, "hex").toString("utf8").trim().toLowerCase();
+      if (/^[0-9a-f]{40}$/.test(ascii)) return ascii;
+    } catch {}
+  }
+  return null;
+}
+
+function parseProwlarrResults(items, indexer) {
+  return (Array.isArray(items) ? items : []).map(item => ({
+    Title: item.title || "",
+    Guid: item.guid || item.downloadUrl || item.magnetUrl || "",
+    Link: item.downloadUrl || item.magnetUrl || null,
+    MagnetUri: item.magnetUrl && item.magnetUrl.startsWith("magnet:") ? item.magnetUrl : null,
+    Size: Number(item.size) || 0,
+    Seeders: Number(item.seeders) || 0,
+    InfoHash: normalizeProwlarrInfoHash(item.infoHash),
+    Tracker: item.indexer || indexer,
+    TrackerId: String(item.indexerId || indexer || "").trim(),
+    ImdbId: normalizeImdbId(item.imdbId),
+    PublishDate: item.publishDate || null,
+    _structuredMatch: false,
+  })).filter(r => r.Title && (r.Link || r.MagnetUri || r.Guid));
+}
+
+async function prowlarrSearch(query, indexer, limit = 50) {
+  const res = await axios.get(`${ENV.jackettUrl}/api/v1/search`, {
+    params: { apikey: ENV.apiKey, query, type: "search", indexerIds: indexer, limit, offset: 0 },
+    timeout: 15000,
+    validateStatus: () => true,
+  });
+  if (res.status === 429) throw Object.assign(new Error("Rate limited"), { response: res });
+  if (res.status >= 400) throw new Error(`HTTP ${res.status}`);
+  return parseProwlarrResults(res.data, indexer);
+}
+
 async function jackettTextSearch(query, indexer, timeout) {
   const res = await axios.get(
     `${ENV.jackettUrl}/api/v2.0/indexers/${indexer}/results`,
     { params: qp({ Query: query }), timeout, validateStatus: () => true }
   );
+  if (res.status === 404) return prowlarrSearch(query, indexer);
   if (res.status === 429) throw Object.assign(new Error("Rate limited"), { response: res });
   if (res.status >= 400) throw new Error(`HTTP ${res.status}`);
   return (res.data?.Results || []).map(r => ({ ...r, _structuredMatch: false }));
@@ -801,6 +1008,7 @@ async function jackettStructuredSearch(search, indexer, timeout) {
     `${ENV.jackettUrl}/api/v2.0/indexers/${indexer}/results/torznab/api`,
     { params, timeout, responseType: "text", validateStatus: () => true }
   );
+  if (res.status === 404) return [];
   if (res.status === 429) throw Object.assign(new Error("Rate limited"), { response: res });
   if (res.status >= 400) throw new Error(`HTTP ${res.status}`);
   return parseTorznabResults(String(res.data || ""), indexer);
@@ -1028,7 +1236,7 @@ app.get("/api/debrid/test/:provider", async (req, res) => {
   }
 });
 
-app.get("/api/env",     (_, res) => res.json({ jackettUrl: ENV.jackettUrl, apiKeySet: !!ENV.apiKey, port: ENV.port, redisUrl: ENV.redisUrl }));
+app.get("/api/env",     (_, res) => res.json({ jackettUrl: ENV.jackettUrl, apiKeySet: !!ENV.apiKey, port: ENV.port, redisUrl: ENV.redisUrl, qbitEnabled: isQbitConfigured() }));
 app.get("/api/indexers", async (_, res) => {
   try   { const indexers = await jackettFetchIndexers(); res.json({ ok: true, count: indexers.length, indexers }); }
   catch (err) { res.json({ ok: false, error: err.message, indexers: [] }); }
@@ -1079,55 +1287,121 @@ app.get("/:userConfig/manifest.json", (req, res) => {
 // ── ROTA DEBRID-ADD COM TRAVA REDIS (ANTI-SPAM) E DOWNLOAD DE .TORRENT ───
 app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
   const { provider, infoHash } = req.params;
-  const magnet = req.query.magnet;
+  const magnet  = req.query.magnet;
   const linkUrl = req.query.link;
-  const prefs = resolvePrefs(req.params.userConfig);
-  const config = prefs.debridConfig;
+  const prefs   = resolvePrefs(req.params.userConfig);
+  const config  = prefs.debridConfig;
 
-  // FIX: Trava Redis para evitar que o Stremio envie a requisição 10 vezes seguidas ao falhar (404)
-  const lockKey = `addlock:${provider}:${infoHash}`;
+  const lockKey  = `addlock:${provider}:${infoHash}`;
   const isLocked = await rc.get(lockKey);
-  if (isLocked) {
-    console.log(`  [ON-DEMAND] Ignorando requisição duplicada do player para ${infoHash}`);
-    return res.status(404).send("Stream is downloading on Debrid. Try again in a few minutes.");
-  }
-  await rc.set(lockKey, "1", 30); // Trava o arquivo por 30 segundos
 
+  // Se já foi enfileirado, verifica se o RD terminou e redireciona
+  if (isLocked) {
+    if (provider.toLowerCase() === "realdebrid" && config?.rdKey) {
+      const { rdFindExistingTorrent } = require("./debrid");
+      const existing = await rdFindExistingTorrent(infoHash, config.rdKey);
+      if (existing?.links?.length) {
+        try {
+          const unresRes = await axios.post("https://api.real-debrid.com/rest/1.0/unrestrict/link",
+            `link=${encodeURIComponent(existing.links[0])}`,
+            { headers: { Authorization: `Bearer ${config.rdKey}`, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 12000 });
+          if (unresRes.data?.download) {
+            console.log(`  [ON-DEMAND] RD completo! Redirecionando ${infoHash}`);
+            await rc.del(lockKey);
+            return res.redirect(302, unresRes.data.download);
+          }
+        } catch {}
+      }
+    }
+    console.log(`  [ON-DEMAND] Ainda baixando ${infoHash}`);
+    return res.status(202).send("Download em andamento. Tente novamente em alguns minutos.");
+  }
+
+  await rc.set(lockKey, "1", 300); // trava por 5 min
   console.log(`\n=========================================`);
-  console.log(`[DEBRID ON-DEMAND] Usuário clicou no link! Enfileirando ${infoHash} no ${provider}...`);
+  console.log(`[DEBRID ON-DEMAND] Enfileirando ${infoHash} no ${provider}...`);
 
   if (config && (magnet || linkUrl)) {
-    const { torboxAddTorrent, rdAddTorrent } = require("./debrid");
-    
     let torrentBuffer = null;
-    if (linkUrl && linkUrl.startsWith("http")) {
+    if (linkUrl?.startsWith("http")) {
       try {
-        const dl = await axios.get(linkUrl, { 
-          responseType: "arraybuffer", 
-          timeout: 10000,
-          headers: { "User-Agent": "Mozilla/5.0" }
-        });
-        if (dl.data && Buffer.from(dl.data)[0] === 0x64) {
-          torrentBuffer = Buffer.from(dl.data);
-        }
-      } catch(e) {
-        console.log(`  [ON-DEMAND] Falha ao baixar .torrent do tracker: ${e.message}`);
-      }
+        const dl = await axios.get(linkUrl, { responseType: "arraybuffer", timeout: 10000, headers: { "User-Agent": "Mozilla/5.0" } });
+        if (dl.data && Buffer.from(dl.data)[0] === 0x64) torrentBuffer = Buffer.from(dl.data);
+      } catch(e) { console.log(`  [ON-DEMAND] Falha ao baixar .torrent: ${e.message}`); }
     }
-
     try {
       if (provider.toLowerCase() === "torbox") {
+        const { torboxAddTorrent } = require("./debrid");
         await torboxAddTorrent(magnet, config.torboxKey, false, torrentBuffer);
       } else {
+        const { rdAddTorrent } = require("./debrid");
         await rdAddTorrent(magnet, config.rdKey, torrentBuffer);
       }
-      console.log(`[DEBRID ON-DEMAND] Sucesso ao enviar para o Debrid! O download começou.`);
-    } catch (e) {
-      console.log(`[DEBRID ON-DEMAND] Erro ao enfileirar: ${e.message}`);
-    }
+      console.log(`[ON-DEMAND] Enfileirado com sucesso.`);
+    } catch (e) { console.log(`[ON-DEMAND] Erro: ${e.message}`); }
   }
   console.log(`=========================================\n`);
-  res.status(404).send("Stream is downloading on Debrid. Try again in a few minutes.");
+  return res.status(202).send("Download enfileirado. Aguarde o download completar e clique novamente.");
+});
+
+app.get("/:userConfig/qbit/:jobToken", async (req, res) => {
+  if (!isQbitConfigured()) return res.status(503).send("qBittorrent não configurado.");
+
+  const job = await loadQbitJob(req.params.jobToken);
+  if (!job?.infoHash) return res.status(404).send("Job expirado ou inválido.");
+
+  const lockKey = `qbitlock:${job.infoHash}`;
+  if (!(await rc.get(lockKey))) await rc.set(lockKey, "1", 90);
+
+  try {
+    const playable = await getPlayableLocalFile(job.infoHash, job.fileIdx, job.fileName);
+    if (playable) {
+      const publicBase = getPublicBase(req);
+      return res.redirect(302, `${publicBase}/qbit/stream/${encodeURIComponent(req.params.jobToken)}`);
+    }
+
+    let torrentBuffer = null;
+    if (job.link && !job.link.startsWith("magnet:")) {
+      try {
+        const dl = await axios.get(job.link, {
+          responseType: "arraybuffer",
+          timeout: 15000,
+          maxRedirects: 10,
+          maxContentLength: 8 * 1024 * 1024,
+          headers: { "User-Agent": "Mozilla/5.0" },
+          validateStatus: s => s < 400,
+        });
+        if (dl.data && Buffer.from(dl.data)[0] === 0x64) torrentBuffer = Buffer.from(dl.data);
+      } catch {}
+    }
+
+    await ensureTorrentReady(job.infoHash, {
+      torrentBuffer,
+      magnet: job.magnet,
+      fileIdx: job.fileIdx,
+      fileName: job.fileName,
+    });
+    await waitForQbitBuffer(job.infoHash, job.fileIdx, job.fileName);
+
+    const publicBase = getPublicBase(req);
+    return res.redirect(302, `${publicBase}/qbit/stream/${encodeURIComponent(req.params.jobToken)}`);
+  } catch (err) {
+    console.log(`[qBit] Falha ao preparar ${job.infoHash}: ${err.message}`);
+    return res.status(503).send(`qBittorrent não conseguiu preparar o stream: ${err.message}`);
+  }
+});
+
+app.get("/qbit/stream/:jobToken", async (req, res) => {
+  if (!isQbitConfigured()) return res.status(503).json({ error: "qBittorrent não configurado" });
+  const job = await loadQbitJob(req.params.jobToken);
+  if (!job?.infoHash) return res.status(404).json({ error: "Job expirado ou inválido" });
+
+  try {
+    await streamTorrentFile(req, res, job.infoHash, job.fileIdx, job.fileName);
+  } catch (err) {
+    console.error("[qBit stream]", err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
 });
 
 // ─────────────────────────────────────────────────────────
@@ -1148,8 +1422,8 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
   }
 
   if (prefs.stConfig) {
-    console.log(`[PROXY] Conversao Debrid Ativa...`);
-    const rawPrefs = { ...prefs }; delete rawPrefs.stConfig; rawPrefs.debrid = true;
+    console.log(`[PROXY] Conversao Debrid Ativa... stores=${JSON.stringify(prefs.stConfig.stores)}`);
+    const rawPrefs = { ...prefs }; delete rawPrefs.stConfig; delete rawPrefs.debrid; delete rawPrefs.debridConfig;
     const rawB64 = Buffer.from(JSON.stringify(rawPrefs), 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     const protocol    = req.headers['x-forwarded-proto'] || req.protocol;
     const host        = req.headers['x-forwarded-host']  || req.get('host');
@@ -1157,6 +1431,8 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     const wrapper     = { upstreams: [{ u: upstreamUrl }], stores: prefs.stConfig.stores };
     const b64Wrap     = Buffer.from(JSON.stringify(wrapper), 'utf8').toString('base64');
     const stUrl       = `${prefs.stConfig.url}/stremio/wrap/${encodeURIComponent(b64Wrap)}/stream/${type}/${id}.json`;
+    console.log(`[PROXY] upstreamUrl=${upstreamUrl}`);
+    console.log(`[PROXY] stUrl=${stUrl}`);
     try {
       const { data } = await axios.get(stUrl, { timeout: 60000, headers: { "User-Agent": "ProwJack/3.10" } });
       console.log(`[PROXY] Sucesso! ${data?.streams?.length || 0} links.`);
@@ -1276,8 +1552,27 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       rdCacheMap = rdResult;
       tbCacheMap = tbResult;
 
+      const nativeCached = new Set();
+      for (const hash of allHashes) {
+        if (rdCacheMap[hash]?.rd?.length > 0) nativeCached.add(hash);
+        if (tbCacheMap[hash] && typeof tbCacheMap[hash] === "object" && tbCacheMap[hash] !== false) nativeCached.add(hash);
+      }
+
+      const stremThruCandidates = allHashes.filter(hash => !privateHashes.has(hash) && !nativeCached.has(hash));
+      const stremThruChecks = [
+        (mode === "realdebrid" || mode === "dual") && rdKey
+          ? checkCacheViaStremThru(stremThruCandidates, "realdebrid", rdKey)
+          : Promise.resolve(new Set()),
+        (mode === "torbox" || mode === "dual") && torboxKey
+          ? checkCacheViaStremThru(stremThruCandidates, "torbox", torboxKey)
+          : Promise.resolve(new Set()),
+      ];
+      const [stremThruRd, stremThruTb] = await Promise.all(stremThruChecks);
+      const stremThruCached = new Set([...stremThruRd, ...stremThruTb]);
+
       const debridCached = new Set();
       const torznabCached = new Set();
+      const stremThruConfirmed = new Set();
 
       // FIX: Marcar os hashes cacheados e reordenar a lista para que eles subam ao topo (Boost)
       withHashes.forEach(r => {
@@ -1289,12 +1584,16 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         if ((mode === "torbox" || mode === "dual") && tbCacheMap[h] && typeof tbCacheMap[h] === 'object' && tbCacheMap[h] !== false) {
           r._isCached = true; debridCached.add(h);
         }
+        if (!r._isCached && stremThruCached.has(h)) {
+          r._isCached = true; stremThruConfirmed.add(h);
+        }
         if (!r._isCached && torznabHashes.has(h)) {
-          r._isCached = true; torznabCached.add(h);
+          r._cacheCandidate = true;
+          torznabCached.add(h);
         }
       });
 
-      console.log(`[DEBRID] cached=${debridCached.size + torznabCached.size} (debrid=${debridCached.size} torznab=${torznabCached.size}) uncached=${withHashes.filter(r => !r._isCached).length}`);
+      console.log(`[DEBRID] cached=${debridCached.size + stremThruConfirmed.size} (debrid=${debridCached.size} stremthru=${stremThruConfirmed.size} candidatos=${torznabCached.size}) uncached=${withHashes.filter(r => !r._isCached).length}`);
 
       // Ordenação: cache é prioridade máxima; dentro de cada grupo, ordena por idioma → resolução → qualidade → tamanho
       const sortMode = prefs.sortMode || "cache";
@@ -1343,6 +1642,39 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           ? pickEpisodeFile(resolved.files, parsed.season, parsed.episode ?? episode, parsed.isAnime)
           : null;
         const magnet = buildMagnet(resolved.infoHash, r.MagnetUri, r.Title);
+        const publicBase = getPublicBase(req);
+        const localPlayable = isQbitConfigured()
+          ? await getPlayableLocalFile(resolved.infoHash, matchedFile?.idx ?? null, matchedFile?.name || null)
+          : null;
+
+        const buildQbitStream = async (label) => {
+          const jobToken = await saveQbitJob({
+            infoHash: resolved.infoHash,
+            link: (r.Link && !r.Link.startsWith("magnet:")) ? r.Link : null,
+            magnet,
+            fileIdx: matchedFile?.idx ?? null,
+            fileName: matchedFile?.name || null,
+          });
+          const qbitName = localPlayable
+            ? `${prefs.addonName || "ProwJack PRO"}\n⚡️ ${resLabel || "Links"}`
+            : `QBittorrent\n${resLabel || "Links"}`;
+          return {
+            name: qbitName,
+            description: [
+              description,
+              matchedFile?.name ? `📂 ${matchedFile.name}` : "",
+              localPlayable ? "💾 Cache local via qBittorrent" : "⬇️ qBittorrent HTTP (fallback)",
+            ].filter(Boolean).join("\n"),
+            url: `${publicBase}/${req.params.userConfig}/qbit/${jobToken}`,
+            _cached: !!localPlayable,
+            behaviorHints: {
+              filename: matchedFile?.name,
+              videoSize: matchedFile?.size,
+              bingeGroup: `prowjack|qbit|${resolved.infoHash}`,
+              notWebReady: false,
+            },
+          };
+        };
 
         if (isDebridMode) {
           const debridData = await resolveDebridStream(
@@ -1362,7 +1694,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           if (!debridData) return null;
           const resultsArray = debridData.multi ? debridData.multi : [debridData];
           
-          return resultsArray.map(resObj => {
+          return Promise.all(resultsArray.map(async resObj => {
             const addonName = prefs.addonName || "ProwJack PRO";
             const resLabelStr = resLabel || "Links";
             
@@ -1388,7 +1720,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
               const linkParam = r.Link ? `&link=${encodeURIComponent(r.Link)}` : "";
               const addUrl = `${hostUrl}/${req.params.userConfig}/debrid-add/${provider}/${resolved.infoHash}?magnet=${encodeURIComponent(magnet)}${linkParam}`;
 
-              return {
+              const debridOption = {
                 name: `${addonName}\n⬇️ ${resLabelStr}`,
                 description: [
                   description, `⬇️ ${provider} — Clique para enfileirar/baixar`,
@@ -1397,12 +1729,24 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
                 _cached: false,
                 behaviorHints: { notWebReady: true },
               };
+
+              if (isQbitConfigured()) {
+                const qbitOption = await buildQbitStream(localPlayable ? "💾" : "HTTP");
+                return [debridOption, qbitOption];
+              }
+
+              return debridOption;
             }
             return null;
-          }).filter(Boolean);
+          })).then(items => items.filter(Boolean));
+        }
+
+        if (isQbitConfigured() && (localPlayable || r.Link || magnet)) {
+          return buildQbitStream(localPlayable ? "💾" : "HTTP");
         }
 
         const sources = r.MagnetUri ? [r.MagnetUri] : [];
+        if (!sources.length) return null;
         return {
           name,
           description: matchedFile?.name ? `${description}\n📂 ${matchedFile.name}` : description,
@@ -1415,7 +1759,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       })
     );
 
-    const allStreams = resolvedAll.flat().filter(Boolean);
+    const allStreams = resolvedAll.flat(2).filter(Boolean);
 
     // Garante cached primeiro mesmo após flat() misturar streams multi (TB+RD)
     if (isDebridMode) {
@@ -1445,4 +1789,5 @@ app.listen(ENV.port, () => {
   console.log(`ProwJack PRO v3.10.0 -> http://localhost:${ENV.port}/configure`);
   console.log(`   Jackett : ${ENV.jackettUrl}`);
   console.log(`   Redis   : ${ENV.redisUrl}`);
+  console.log(`   qBittorrent: ${isQbitConfigured() ? "ativo" : "desativado"}`);
 });
