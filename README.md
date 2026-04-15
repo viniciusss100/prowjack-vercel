@@ -98,7 +98,7 @@ JACKETT_API_KEY=sua_api_key_aqui
 REDIS_URL=redis://localhost:6379
 
 # Real-Debrid / TorBox (Opcional - configurado via interface)
-STREMTHRU_URL=https://st.omcx.ddns.net/v0/torznab/api
+STREMTHRU_URL=https://stremthru.13377001.xyz/v0/torznab/api
 STREMTHRU_API_KEY=sua_key_aqui
 
 # qBittorrent (Opcional - para torrents privados)
