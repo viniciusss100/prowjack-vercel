@@ -15,7 +15,7 @@ const QBIT_PASS = process.env.QBIT_PASS || "";
 const QBIT_SAVE_DIR = process.env.QBIT_SAVE_DIR || "/downloads/prowjack";
 const QBIT_CATEGORY = process.env.QBIT_CATEGORY || "prowjack-private";
 const MIN_PROGRESS = Math.min(1, Math.max(0.005, parseFloat(process.env.QBIT_MIN_PROGRESS || "0.02")));
-const BUFFER_TIMEOUT = parseInt(process.env.QBIT_BUFFER_TIMEOUT || "120", 10);
+const BUFFER_TIMEOUT = parseInt(process.env.QBIT_BUFFER_TIMEOUT || "180", 10);
 const POLL_INTERVAL = 3000;
 
 let sessionCookie = null;
@@ -218,7 +218,6 @@ async function waitForBuffer(infoHash, fileIdx, fileName) {
 
     const files = await getTorrentFiles(infoHash);
     const target = pickTargetFile(files, fileIdx, fileName);
-    // Sem arquivos ainda (metadados não chegaram) — aguarda
     if (!target) { await sleep(POLL_INTERVAL); continue; }
 
     const progress = Number(target.progress || 0);
@@ -228,7 +227,7 @@ async function waitForBuffer(infoHash, fileIdx, fileName) {
 
     await sleep(POLL_INTERVAL);
   }
-  // Timeout — retorna o que tiver sem lançar erro
+  
   const info = await getTorrentInfo(infoHash).catch(() => null);
   const files = info ? await getTorrentFiles(infoHash).catch(() => []) : [];
   return { info, file: files.length ? pickTargetFile(files, fileIdx, fileName) : null };
