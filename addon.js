@@ -1460,14 +1460,23 @@ app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
     try {
       const dl = await axios.get(linkUrl, { 
         responseType: "arraybuffer", 
-        timeout: 10000, 
-        headers: { "User-Agent": "Mozilla/5.0" } 
+        timeout: 10000,
+        maxRedirects: 5,
+        validateStatus: s => s < 400,
+        headers: { "User-Agent": "Mozilla/5.0" },
+        beforeRedirect: (options, { headers }) => {
+          if (options.href?.startsWith("magnet:")) {
+            throw new Error("Redirect para magnet detectado");
+          }
+        }
       });
       if (dl.data && Buffer.from(dl.data)[0] === 0x64) {
         torrentBuffer = Buffer.from(dl.data);
       }
     } catch(e) { 
-      console.log(`[ON-DEMAND] Falha ao baixar .torrent: ${e.message}`); 
+      if (!e.message.includes("magnet")) {
+        console.log(`[ON-DEMAND] Falha ao baixar .torrent: ${e.message}`);
+      }
     }
   }
 
@@ -1497,10 +1506,50 @@ app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
     }
   }
 
-  // TorBox: não faz polling bloqueante (download pode demorar horas)
+  // TorBox: faz polling como RD (aguarda até 180s)
   if (isTB) {
-    res.setHeader("Retry-After", "30");
-    return res.status(202).send("Torrent enfileirado no TorBox. Aguarde o download e clique novamente.");
+    const deadline = Date.now() + 180000;
+    const pollInterval = 3000;
+    console.log(`[ON-DEMAND] TorBox: aguardando download (até 180s)...`);
+
+    while (Date.now() < deadline) {
+      try {
+        const tbRes = await axios.get("https://api.torbox.app/v1/api/torrents/mylist", {
+          headers: { Authorization: `Bearer ${config.torboxKey}` },
+          timeout: 8000
+        });
+        
+        const torrent = tbRes.data?.data?.find(t => 
+          t.hash?.toLowerCase() === infoHash.toLowerCase()
+        );
+        
+        if (torrent?.download_finished) {
+          console.log(`[ON-DEMAND] TorBox pronto! Resolvendo stream...`);
+          const { resolveDebridStream } = require("./debrid");
+          const stream = await resolveDebridStream(
+            infoHash, magnet, "", null, null, false,
+            config, null, null, torrent, null
+          );
+          
+          if (stream?.url) {
+            await rc.del(lockKey);
+            return res.redirect(302, stream.url);
+          }
+        }
+      } catch (err) {
+        console.log(`[ON-DEMAND] TorBox polling erro: ${err.message}`);
+      }
+
+      if (Date.now() + pollInterval < deadline) {
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
+      } else {
+        break;
+      }
+    }
+
+    console.log(`[ON-DEMAND] TorBox timeout (180s) — ainda processando`);
+    res.setHeader("Retry-After", "10");
+    return res.status(202).send("Download em andamento no TorBox. O player tentará novamente automaticamente.");
   }
 
   // Polling: aguarda até 180s
@@ -1532,30 +1581,6 @@ app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
             console.log(`[ON-DEMAND] RD pronto! Redirecionando...`);
             await rc.del(lockKey);
             return res.redirect(302, unresRes.data.download);
-          }
-        }
-      } else if (isTB) {
-        // TorBox: verifica via API de listagem
-        const tbRes = await axios.get("https://api.torbox.app/v1/api/torrents/mylist", {
-          headers: { Authorization: `Bearer ${config.torboxKey}` },
-          timeout: 8000
-        });
-        
-        const torrent = tbRes.data?.data?.find(t => 
-          t.hash?.toLowerCase() === infoHash.toLowerCase()
-        );
-        
-        if (torrent?.download_finished) {
-          console.log(`[ON-DEMAND] TB pronto! Resolvendo stream...`);
-          const { resolveDebridStream } = require("./debrid");
-          const stream = await resolveDebridStream(
-            infoHash, magnet, "", null, null, false,
-            config, null, null, torrent, null
-          );
-          
-          if (stream?.url) {
-            await rc.del(lockKey);
-            return res.redirect(302, stream.url);
           }
         }
       }
@@ -1590,12 +1615,24 @@ app.get("/:userConfig/qbit/:jobToken", async (req, res) => {
       if (job.link && !job.link.startsWith("magnet:")) {
         try {
           const dl = await axios.get(job.link, {
-            responseType: "arraybuffer", timeout: 15000, maxRedirects: 10,
+            responseType: "arraybuffer", timeout: 15000, maxRedirects: 5,
             maxContentLength: 8 * 1024 * 1024, headers: { "User-Agent": "Mozilla/5.0" },
             validateStatus: s => s < 400,
+            beforeRedirect: (options, { headers }) => {
+              if (options.href?.startsWith("magnet:")) {
+                throw new Error("Redirect para magnet");
+              }
+            }
           });
-          if (dl.data && Buffer.from(dl.data)[0] === 0x64) torrentBuffer = Buffer.from(dl.data);
-        } catch {}
+          if (dl.data && Buffer.from(dl.data)[0] === 0x64) {
+            torrentBuffer = Buffer.from(dl.data);
+            console.log(`[qBit] .torrent baixado: ${torrentBuffer.length} bytes`);
+          }
+        } catch (e) {
+          if (!e.message.includes("magnet")) {
+            console.log(`[qBit] Falha ao baixar .torrent: ${e.message}`);
+          }
+        }
       }
       await ensureTorrentReady(job.infoHash, {
         torrentBuffer, magnet: job.magnet, fileIdx: job.fileIdx, fileName: job.fileName,
