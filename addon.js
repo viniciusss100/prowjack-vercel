@@ -706,11 +706,18 @@ async function resolveInfoHash(r) {
   }
 
   if (httpLink) {
+    let _magnetRedirect = null;
     try {
       const res = await axios.get(httpLink, {
         timeout: 10000, maxRedirects: 10, responseType: "arraybuffer",
         maxContentLength: 8 * 1024 * 1024, validateStatus: s => s < 400,
         headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+        beforeRedirect: (options) => {
+          if (options.href?.startsWith("magnet:")) {
+            _magnetRedirect = options.href;
+            throw Object.assign(new Error("magnet_redirect"), { isMagnetRedirect: true });
+          }
+        },
       });
       const finalUrl = res.request?.res?.responseUrl || "";
       if (finalUrl.startsWith("magnet:")) {
@@ -739,7 +746,13 @@ async function resolveInfoHash(r) {
         }
       }
     } catch (err) {
-      console.warn(`[WARN] Falha ao baixar torrent: ${err.message}`);
+      if (_magnetRedirect || err.isMagnetRedirect || err.cause?.isMagnetRedirect) {
+        const src = _magnetRedirect || err.cause?.magnetUrl;
+        const h = src ? extractInfoHash(src) : null;
+        if (h) return { infoHash: h, files: null, buffer: null };
+      } else {
+        console.warn(`[WARN] Falha ao baixar torrent: ${err.message}`);
+      }
     }
   }
 
@@ -869,9 +882,8 @@ async function searchCacheSources({ q, imdbId, type }, prefs) {
   const stUrl = prefs?.stremthru?.url || ENV.stremthruUrl;
   const stKey = prefs?.stremthru?.key || ENV.stremthruKey;
   const sources = [
-    { name: "stremthru", url: stUrl,           key: stKey            },
-    { name: "zilean",    url: ENV.zileanUrl,    key: ENV.zileanKey    },
-    { name: "bitmagnet", url: ENV.bitmagnetUrl, key: ENV.bitmagnetKey },
+    { name: "stremthru", url: stUrl,         key: stKey          },
+    { name: "zilean",    url: ENV.zileanUrl, key: ENV.zileanKey  },
   ].filter(s => s.url);
 
   if (!sources.length) return new Set();
@@ -896,9 +908,6 @@ async function searchCacheSources({ q, imdbId, type }, prefs) {
         if (isSeries) paramsList.push(new URLSearchParams({ t: "tvsearch", imdbid: cleanImdb, cat: "5000" }));
       }
       if (q) paramsList.push(new URLSearchParams({ t: "search", q }));
-    } else {
-      if (cleanImdb) paramsList.push(new URLSearchParams({ t: "search", imdbid: cleanImdb }));
-      if (q)         paramsList.push(new URLSearchParams({ t: "search", q }));
     }
 
     const t0 = Date.now();
@@ -1122,11 +1131,13 @@ async function prowlarrSearch(query, indexer, limit = 50, jUrl, jKey) {
 }
 
 async function jackettTextSearch(query, indexer, timeout, jUrl, jKey) {
+  const params = { Query: query };
+  if (jKey) params.apikey = jKey;
   const res = await axios.get(
     `${jUrl}/api/v2.0/indexers/${indexer}/results`,
-    { params: qp({ Query: query }), timeout, validateStatus: () => true }
+    { params, timeout, validateStatus: () => true }
   );
-  if (res.status === 404) return prowlarrSearch(query, indexer, 50, jUrl, jKey);
+  if (res.status === 404 || res.status === 401) return prowlarrSearch(query, indexer, 50, jUrl, jKey);
   if (res.status === 429) throw Object.assign(new Error("Rate limited"), { response: res });
   if (res.status >= 400) throw new Error(`HTTP ${res.status}`);
   return (res.data?.Results || []).map(r => ({ ...r, _structuredMatch: false }));
@@ -1154,18 +1165,26 @@ async function jackettSearchOneIndexer(indexer, plan, timeout, fastTimeout, jUrl
   const t0 = Date.now();
   try {
     let results = [];
-    if (plan.search && !plan.parsed?.isAnime) {
+    // Desabilita busca estruturada para séries (melhor compatibilidade)
+    const isSeries = plan.parsed?.type === 'series' || (plan.search?.season != null);
+    if (plan.search && !plan.parsed?.isAnime && !isSeries) {
       try {
         results = await jackettStructuredSearch(plan.search, indexer, timeout, jUrl, jKey);
       } catch (err) {
+        console.log(`  ${indexer}: erro na busca estruturada: ${err.message}`);
         if (err.response?.status === 429) throw err;
       }
     }
     if (results.length === 0) {
       for (const query of plan.queries) {
-        const textResults = await jackettTextSearch(query, indexer, timeout, jUrl, jKey);
-        results.push(...textResults);
-        if (results.length > 0) break;
+        try {
+          const textResults = await jackettTextSearch(query, indexer, timeout, jUrl, jKey);
+          results.push(...textResults);
+          if (results.length > 0) break;
+        } catch (err) {
+          console.log(`  ${indexer}: erro na busca por texto "${query}": ${err.message}`);
+          if (err.response?.status === 429) throw err;
+        }
       }
     }
     const ms = Date.now() - t0;
@@ -1175,6 +1194,7 @@ async function jackettSearchOneIndexer(indexer, plan, timeout, fastTimeout, jUrl
     return results;
   } catch (err) {
     const ms = Date.now() - t0;
+    console.log(`  ${indexer}: ERRO FATAL: ${err.message} (${ms}ms)`);
     if (err.response?.status === 429) await setRateLimit(indexer, err.response?.headers?.["retry-after"]);
     if (err.code === "ECONNABORTED" && timeout === fastTimeout)
       console.log(`  ${indexer}: timeout lento de ${ms}ms (indo para background)`);
@@ -1205,7 +1225,7 @@ async function jackettSearch(plan, indexers, prefs) {
     console.log(`Cache HIT para buscas: ${JSON.stringify(queryList)}`);
     return JSON.parse(cached);
   }
-  const FAST_TIMEOUT = (prefs?.slowThreshold > 0 ? prefs.slowThreshold : 12000);
+  const FAST_TIMEOUT = (prefs?.slowThreshold > 0 ? prefs.slowThreshold : 15000);
   const SLOW_TIMEOUT = 50000;
   console.log(`Jackett iniciando busca: "${queryList[0] || plan?.search?.title || "sem titulo"}" em [${indexers.length} indexers]`);
   console.log(`Fase rapida: aguardando respostas... (${FAST_TIMEOUT}ms max)`);
@@ -1214,7 +1234,7 @@ async function jackettSearch(plan, indexers, prefs) {
   const fastDeduped = dedupeResults(fastFlat);
   console.log(`Conclusao da janela rapida: ${fastFlat.length} brutos -> ${fastDeduped.length} deduplicados`);
   
-  if (fastDeduped.length === 0) return []; 
+  // Continua mesmo sem resultados na fase rápida (permite fase lenta e cache sources)
   
   setImmediate(async () => {
     try {
@@ -1772,6 +1792,17 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
     let rdCacheMap = {};
     let tbCacheMap = {};
+    let torznabHashes = new Set();
+
+    // Busca em cache sources (StremThru, Zilean, Bitmagnet) independentemente dos resultados do Jackett
+    const cacheQ = type === "series" && parsed.season != null && parsed.episode != null
+      ? `${displayTitle} S${String(parsed.season).padStart(2,"0")}E${String(parsed.episode ?? episode).padStart(2,"0")}`
+      : displayTitle;
+    
+    if (isDebridMode) {
+      console.log(`[CACHE] Buscando em fontes torznab (StremThru, Zilean, Bitmagnet)...`);
+      torznabHashes = await searchCacheSources({ q: cacheQ, imdbId: requestedImdbId, type }, prefs);
+    }
 
     if (isDebridMode && withHashes.length > 0) {
       const allHashes = [...new Set(withHashes.map(r => r._resolved.infoHash))];
@@ -1794,18 +1825,13 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         if (r._resolved?.buffer) bufferMap[r._resolved.infoHash] = r._resolved.buffer;
       }
 
-      const cacheQ = type === "series" && parsed.season != null && parsed.episode != null
-        ? `${displayTitle} S${String(parsed.season).padStart(2,"0")}E${String(parsed.episode ?? episode).padStart(2,"0")}`
-        : displayTitle;
-
-      const [rdResult, tbResult, torznabHashes] = await Promise.all([
+      const [rdResult, tbResult] = await Promise.all([
         (mode === "realdebrid" || mode === "dual") && rdKey
           ? rdBatchCheckCache(allHashes, rdKey, bufferMap)
           : Promise.resolve({}),
         (mode === "torbox" || mode === "dual") && torboxKey
           ? torboxBatchCheckCache(allHashes, torboxKey, privateHashes)
           : Promise.resolve({}),
-        searchCacheSources({ q: cacheQ, imdbId: requestedImdbId, type }, prefs),
       ]);
 
       rdCacheMap = rdResult;
@@ -1891,6 +1917,9 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         return (b._originalScore || 0) - (a._originalScore || 0);
       });
     }
+
+    // Streams sintéticos desabilitados: hashes torznab sem título não podem ser validados
+    // contra o conteúdo buscado, gerando resultados irrelevantes.
 
     // ── Resolução de streams finais ──────────────────────────────────────────
     const streamMeta = {
