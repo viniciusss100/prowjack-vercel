@@ -304,15 +304,6 @@ FLUSHDB
 
 ## 🔐 Segurança
 
-### Boas Práticas
-
-1. **Nunca commite o arquivo `.env`** com credenciais reais
-2. **Use HTTPS** em produção (reverse proxy com Nginx/Caddy)
-3. **Configure ALLOWED_ORIGINS** para restringir CORS
-4. **Mantenha o Redis protegido** (não exponha a porta 6379)
-5. **Use senhas fortes** para qBittorrent e Debrid
-6. **Atualize regularmente** as dependências: `npm audit fix`
-
 ### Proteções Implementadas
 
 - ✅ Rate limiting (100 req/min por IP)
