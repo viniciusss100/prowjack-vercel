@@ -8,33 +8,36 @@
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Barlow+Condensed:wght@300;500;700;900&display=swap" rel="stylesheet" />
 <style>
 :root{
-  --bg:#08090d;--sur:#0f1117;--bord:#1a1e2e;--bord2:#242840;
-  --accent:#6c8aff;--accent-dim:#2a3366;--accent-glow:rgba(108,138,255,.15);
-  --green:#3dd68c;--red:#f06060;--text:#d0d6f0;--dim:#4a5278;--muted:#2a2f4a;
-  --tb:#ff8c42;--tb-dim:#7a3b0e;--tb-bg:rgba(255,140,66,.07);
-  --rd:#b07aff;--rd-dim:#5a2e99;--rd-bg:rgba(176,122,255,.07);
-  --dual:#3dd68c;--dual-bg:rgba(61,214,140,.06);
+  --bg:#0a0e17;--sur:#12161f;--bord:#1e2433;--bord2:#2a3040;
+  --accent:#7c9aff;--accent-dim:#3a4a7a;--accent-glow:rgba(124,154,255,.18);
+  --green:#4ae89e;--red:#ff6b6b;--text:#e4e8f5;--dim:#5a6488;--muted:#1a1f2e;
+  --tb:#ff9d5c;--tb-dim:#8a4a1e;--tb-bg:rgba(255,157,92,.09);
+  --rd:#c88aff;--rd-dim:#6a3ea9;--rd-bg:rgba(200,138,255,.09);
+  --dual:#4ae89e;--dual-bg:rgba(74,232,158,.08);
   --mono:'Space Mono',monospace;--sans:'Barlow Condensed',sans-serif;
-  --radius:6px;
+  --radius:8px;--shadow:0 4px 20px rgba(0,0,0,.3);
 }
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--text);font-family:var(--mono);font-size:13px;min-height:100vh;display:flex;flex-direction:column;align-items:center}
+body{background:linear-gradient(135deg,#0a0e17 0%,#0d1220 100%);color:var(--text);font-family:var(--mono);font-size:13px;min-height:100vh;display:flex;flex-direction:column;align-items:center;position:relative}
+body::before{content:'';position:fixed;top:0;left:0;right:0;height:300px;background:radial-gradient(ellipse at top,rgba(124,154,255,.08),transparent);pointer-events:none;z-index:0}
 
-header{width:100%;max-width:900px;display:flex;align-items:center;justify-content:space-between;padding:20px 24px;border-bottom:1px solid var(--bord)}
-.logo-wrap{display:flex;flex-direction:column;gap:3px}
-.logo-name{font-family:var(--sans);font-weight:900;font-size:22px;letter-spacing:3px;color:#fff;text-transform:uppercase}
-.logo-v{font-size:9px;color:var(--accent);background:var(--accent-glow);border:1px solid var(--accent-dim);padding:2px 7px;border-radius:3px;margin-left:8px;vertical-align:middle}
-.logo-sub{font-family:var(--sans);font-size:11px;font-weight:300;color:var(--dim);letter-spacing:3px;text-transform:uppercase}
-.status-row{display:flex;align-items:center;gap:12px;font-size:11px;color:var(--dim)}
-.dot{width:6px;height:6px;border-radius:50%;background:var(--dim);display:inline-block;margin-right:5px;flex-shrink:0}
-.dot.ok{background:var(--green);box-shadow:0 0 5px var(--green)}
-.dot.err{background:var(--red);box-shadow:0 0 5px var(--red)}
-.dot.wait{background:var(--accent);box-shadow:0 0 5px var(--accent);animation:pulse 1.4s ease-in-out infinite}
+header{width:100%;max-width:900px;display:flex;align-items:center;justify-content:space-between;padding:24px 28px;border-bottom:1px solid var(--bord);backdrop-filter:blur(10px);background:rgba(18,22,31,.6);position:relative;z-index:1;margin-bottom:8px}
+.logo-wrap{display:flex;flex-direction:column;gap:4px}
+.logo-name{font-family:var(--sans);font-weight:900;font-size:24px;letter-spacing:4px;color:#fff;text-transform:uppercase;text-shadow:0 0 20px rgba(124,154,255,.4)}
+.logo-v{font-size:9px;color:var(--accent);background:var(--accent-glow);border:1px solid var(--accent-dim);padding:3px 8px;border-radius:4px;margin-left:10px;vertical-align:middle;font-weight:700;box-shadow:0 0 10px var(--accent-glow)}
+.logo-sub{font-family:var(--sans);font-size:11px;font-weight:300;color:var(--dim);letter-spacing:3px;text-transform:uppercase;opacity:.8}
+.status-row{display:flex;align-items:center;gap:14px;font-size:11px;color:var(--dim);background:var(--muted);padding:8px 14px;border-radius:var(--radius);border:1px solid var(--bord)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--dim);display:inline-block;margin-right:6px;flex-shrink:0;transition:.3s}
+.dot.ok{background:var(--green);box-shadow:0 0 8px var(--green),0 0 3px var(--green) inset}
+.dot.err{background:var(--red);box-shadow:0 0 8px var(--red),0 0 3px var(--red) inset}
+.dot.wait{background:var(--accent);box-shadow:0 0 8px var(--accent);animation:pulse 1.4s ease-in-out infinite}
 
-nav.tabs{width:100%;max-width:900px;display:flex;padding:0 24px;border-bottom:1px solid var(--bord)}
-.tab{padding:12px 16px;font-family:var(--sans);font-weight:700;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--dim);border:none;background:none;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:.2s}
-.tab:hover{color:var(--text)}
-.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+nav.tabs{width:100%;max-width:900px;display:flex;padding:0 28px;border-bottom:1px solid var(--bord);position:relative;z-index:1;background:rgba(18,22,31,.4);backdrop-filter:blur(8px)}
+.tab{padding:14px 20px;font-family:var(--sans);font-weight:700;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--dim);border:none;background:none;cursor:pointer;border-bottom:3px solid transparent;margin-bottom:-1px;transition:all .3s ease;position:relative}
+.tab::before{content:'';position:absolute;bottom:0;left:50%;transform:translateX(-50%) scaleX(0);width:80%;height:3px;background:linear-gradient(90deg,transparent,var(--accent),transparent);border-radius:2px 2px 0 0;transition:transform .3s ease;opacity:0}
+.tab:hover{color:var(--text);transform:translateY(-2px)}
+.tab.active{color:var(--accent)}
+.tab.active::before{transform:translateX(-50%) scaleX(1);opacity:1}
 
 .pane{display:none;padding:28px 24px;width:100%;max-width:900px}
 .pane.active{display:block}
@@ -165,7 +168,8 @@ hr{border:none;border-top:1px solid var(--bord);margin:16px 0}
     <span class="logo-sub">Jackett · Prowlarr · Stremio</span>
   </div>
   <div class="status-row">
-    <span><span class="dot wait" id="d-jackett"></span><span id="l-jackett">Jackett</span></span>
+    <span><span class="dot wait" id="d-jackett"></span><span id="l-jackett">Jackett / Prowlarr</span></span>
+    <span><span class="dot wait" id="d-redis"></span><span id="l-redis">Redis</span></span>
   </div>
 </header>
 
@@ -179,42 +183,62 @@ hr{border:none;border-top:1px solid var(--bord);margin:16px 0}
 <div class="g2">
 
   <div class="card">
-    <div class="ctitle">Conexão Jackett</div>
-    <div class="env-box">
-      <div class="env-row"><span class="env-key">URL</span><span class="env-val" id="ev-url">—</span></div>
-      <div class="env-row"><span class="env-key">API Key</span><span class="env-val" id="ev-key">—</span></div>
-    </div>
-    <button class="btn btn-p btn-sm" onclick="loadIndexers()">Conectar e Carregar Indexers</button>
+    <div class="ctitle">Conexão Jackett / Prowlarr</div>
+    <label>URL</label>
+    <input type="text" id="jackettUrl" placeholder="ex: http://prowlarr:9696" />
+    <label>API Key</label>
+    <input type="text" id="jackettKey" placeholder="API Key do Jackett/Prowlarr" />
+    <button class="btn btn-p btn-sm" style="margin-top:4px" onclick="loadIndexers()">Conectar e Carregar Indexers</button>
     <div id="test-log" class="mt8" style="display:none;font-size:11px;color:var(--dim)"></div>
   </div>
 
   <div class="card">
+    <div class="ctitle">StremThru <span style="font-size:9px;color:var(--dim);font-weight:400;letter-spacing:1px">Cache Torznab</span></div>
+    <label>URL</label>
+    <input type="text" id="stremthruUrl" placeholder="ex: https://stremthru.13377001.xyz/v0/torznab/api" />
+    <label>API Key <span style="color:var(--dim);font-weight:400;font-size:9px">(opcional)</span></label>
+    <input type="text" id="stremthruKey" placeholder="deixe em branco se não usar" />
+  </div>
+
+
+  <div class="card full">
     <div class="ctitle">Categorias &amp; Limites</div>
-    <div class="tg-group">
-      <button class="tg on" data-cat="movie">🎬 Filmes</button>
-      <button class="tg on" data-cat="series">📺 Séries</button>
-      <button class="tg" data-cat="anime">🎌 Anime</button>
-    </div>
-    <div class="anime-info" id="anime-hint" style="display:none">
-      Anime usa indexers especializados (Nyaa, AnimeTosho) e busca por episódio.
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+      <div>
+        <label>Categorias</label>
+        <div class="tg-group">
+          <button class="tg on" data-cat="movie">🎬 Filmes</button>
+          <button class="tg on" data-cat="series">📺 Séries</button>
+          <button class="tg" data-cat="anime">🎌 Anime</button>
+        </div>
+        <div class="anime-info" id="anime-hint" style="display:none">
+          Anime usa indexers especializados (Nyaa, AnimeTosho) e busca por episódio.
+        </div>
+      </div>
+      <div>
+        <label>Ordenação</label>
+        <div class="tg-group" id="sort-group">
+          <button class="tg on" data-sort="cache">Cache primeiro</button>
+          <button class="tg" data-sort="resolution">Resolução</button>
+          <button class="tg" data-sort="size">Tamanho</button>
+          <button class="tg" data-sort="seeders">Seeders</button>
+        </div>
+      </div>
     </div>
     <hr/>
-    <label>Máx Resultados</label>
-    <input type="number" id="maxResults" value="20" min="5" max="100" />
-    <label>Slow Threshold (ms)</label>
-    <input type="number" id="slowThreshold" value="8000" min="1000" max="30000" />
-    <hr/>
-    <label>Ordenação</label>
-    <div class="tg-group" id="sort-group">
-      <button class="tg on" data-sort="cache">Cache primeiro</button>
-      <button class="tg" data-sort="resolution">Resolução</button>
-      <button class="tg" data-sort="size">Tamanho</button>
-      <button class="tg" data-sort="seeders">Seeders</button>
-    </div>
-    <hr/>
-    <div class="row">
-      <button class="tg on" id="skipBadBtn">Skip CAM/TS</button>
-      <button class="tg on" id="onlyLangBtn">Apenas esse idioma</button>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;align-items:end">
+      <div>
+        <label>Máx Resultados</label>
+        <input type="number" id="maxResults" value="20" min="5" max="100" style="margin-bottom:0" />
+      </div>
+      <div>
+        <label>Slow Threshold (ms)</label>
+        <input type="number" id="slowThreshold" value="8000" min="1000" max="30000" style="margin-bottom:0" />
+      </div>
+      <div style="display:flex;gap:8px;padding-bottom:2px">
+        <button class="tg on" id="skipBadBtn">Skip CAM/TS</button>
+        <button class="tg on" id="onlyLangBtn">Apenas idioma</button>
+      </div>
     </div>
   </div>
 
@@ -329,56 +353,7 @@ hr{border:none;border-top:1px solid var(--bord);margin:16px 0}
   </div>
   <!-- ══ FIM DEBRID NATIVO ════════════════════════════════════════ -->
 
-  <!-- ══ STREMTHRU (mantido original) ════════════════════════════ -->
-  <div class="card full">
-    <div class="ctitle">🔌 StremThru Wrap (Debrid Proxy)</div>
-    <p class="info" style="margin-bottom:12px">Opcional: Suporta até 2 contas Debrid usando StremThru como proxy em background. O rótulo "P2P" sumirá e o addon se adaptará à sigla do seu serviço!</p>
-    
-    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--text);font-size:12px;">
-      <input type="checkbox" id="useStremThru" style="width:16px;height:16px;accent-color:var(--amber);" onchange="document.getElementById('stremThruConfig').style.display=this.checked?'block':'none'">
-      Ativar Proxy Debrid Oculto (StremThru)
-    </label>
 
-    <div id="stremThruConfig" style="display:none;background:rgba(245,166,35,.05);border:1px solid var(--adim);border-radius:3px;padding:14px;margin-top:14px;">
-      <div class="w-row" style="grid-template-columns:120px 1fr;gap:10px;">
-        <div class="w-label">StremThru URL</div>
-        <input type="text" id="stUrl" placeholder="ex: https://stremthru.13377001.xyz" value="https://stremthru.13377001.xyz" style="margin-bottom:0;">
-      </div>
-      <hr style="border-top:1px solid var(--bord2);margin:14px 0;">
-      <div class="w-row" style="grid-template-columns:120px 1fr;gap:10px;margin-bottom:10px;">
-        <div class="w-label">Serviço 1 (Store)</div>
-        <select id="stStore1" class="ix-select" style="margin-bottom:0;">
-          <option value="tb">TorBox</option>
-          <option value="rd">Real-Debrid</option>
-          <option value="ad">AllDebrid</option>
-          <option value="pm">Premiumize</option>
-          <option value="dl">Debrid-Link</option>
-          <option value="oc">Offcloud</option>
-        </select>
-      </div>
-      <div class="w-row" style="grid-template-columns:120px 1fr;gap:10px;">
-        <div class="w-label">API Token 1</div>
-        <input type="text" id="stToken1" placeholder="[OBRIGATÓRIO] API Token do Serviço 1" style="margin-bottom:0;">
-      </div>
-      <hr style="border-top:1px solid var(--bord2);margin:14px 0;">
-      <div class="w-row" style="grid-template-columns:120px 1fr;gap:10px;margin-bottom:10px;">
-        <div class="w-label" style="color:var(--dim)">Serviço 2 (Opcional)</div>
-        <select id="stStore2" class="ix-select" style="margin-bottom:0;">
-          <option value="">-- Nenhum --</option>
-          <option value="tb">TorBox</option>
-          <option value="rd">Real-Debrid</option>
-          <option value="ad">AllDebrid</option>
-          <option value="pm">Premiumize</option>
-          <option value="dl">Debrid-Link</option>
-          <option value="oc">Offcloud</option>
-        </select>
-      </div>
-      <div class="w-row" style="grid-template-columns:120px 1fr;gap:10px;">
-        <div class="w-label" style="color:var(--dim)">API Token 2</div>
-        <input type="text" id="stToken2" placeholder="[OPCIONAL] API Token do Serviço 2" style="margin-bottom:0;">
-      </div>
-    </div>
-  </div>
 
   <div class="card full">
     <div class="ctitle">URL de Instalação</div>
@@ -597,28 +572,30 @@ function getCats() { return [...document.querySelectorAll('.tg[data-cat].on')].m
 async function loadEnv() {
   try {
     const env = await fetch('/api/env').then(r => r.json());
-    document.getElementById('ev-url').textContent = env.jackettUrl;
-    document.getElementById('ev-url').className   = 'env-val';
-    document.getElementById('ev-key').textContent = env.apiKeySet ? 'configurada' : 'nao definida';
-    document.getElementById('ev-key').className   = 'env-val ' + (env.apiKeySet ? '' : 'err');
-  } catch {
-    document.getElementById('ev-url').textContent = 'Erro ao carregar';
-    document.getElementById('ev-url').className   = 'env-val err';
-  }
+    if (env.jackettUrl)   document.getElementById('jackettUrl').value   = env.jackettUrl;
+    if (env.jackettKey)   document.getElementById('jackettKey').value   = env.jackettKey;
+    if (env.stremthruUrl) document.getElementById('stremthruUrl').value = env.stremthruUrl;
+    if (env.stremthruKey) document.getElementById('stremthruKey').value = env.stremthruKey;
+    dot('redis', env.redisOk ? 'ok' : 'err');
+    label('redis', env.redisOk ? `Redis` : 'Redis (offline)');
+  } catch {}
 }
 
 async function loadIndexers() {
   const grid = document.getElementById('ix-grid');
   const count = document.getElementById('ix-count');
+  const jackettUrl = document.getElementById('jackettUrl').value.trim().replace(/\/+$/, '');
+  const jackettKey = document.getElementById('jackettKey').value.trim();
+  if (!jackettUrl) { toast('Insira a URL do Jackett/Prowlarr', 'err'); return; }
   grid.innerHTML = '<div class="ix-empty loading">Conectando ao Jackett...</div>';
   count.textContent = 'Carregando...';
-  dot('jackett','wait'); label('jackett','Jackett');
+  dot('jackett','wait'); label('jackett','Jackett / Prowlarr');
   try {
-    const data = await fetch('/api/indexers').then(r => r.json());
+    const data = await fetch(`/api/indexers?url=${encodeURIComponent(jackettUrl)}&key=${encodeURIComponent(jackettKey)}`).then(r => r.json());
     if (!data.ok) {
       grid.innerHTML = `<div class="ix-empty">${data.error || 'Falha'}</div>`;
       count.textContent = 'Falha ao carregar';
-      dot('jackett','err'); label('jackett','Jackett');
+      dot('jackett','err'); label('jackett','Jackett / Prowlarr');
       return;
     }
     state.allIndexers = (data.indexers||[]).map(ix => ({ id: ix.id||ix.ID||ix.name, name: ix.name||ix.id||ix.ID }));
@@ -627,12 +604,12 @@ async function loadIndexers() {
     renderIndexers(state.allIndexers);
     document.getElementById('allBtn').classList.add('on');
     count.textContent = `${state.allIndexers.length} indexers`;
-    dot('jackett','ok'); label('jackett',`Jackett (${state.allIndexers.length})`);
+    dot('jackett','ok'); label('jackett',`Jackett / Prowlarr (${state.allIndexers.length})`);
     toast(`${state.allIndexers.length} indexers carregados`, 'ok');
   } catch(e) {
     grid.innerHTML = `<div class="ix-empty">${e.message}</div>`;
     count.textContent = 'Falha';
-    dot('jackett','err'); label('jackett','Jackett');
+    dot('jackett','err'); label('jackett','Jackett / Prowlarr');
   }
 }
 
@@ -750,8 +727,12 @@ function encodeBaseURL(obj) {
 
 function buildPrefs() {
   const selected  = state.selectedIndexers.length ? state.selectedIndexers : ['all'];
-  const isStremThru = document.getElementById('useStremThru').checked;
-  const isNative    = document.getElementById('useNativeDebrid').checked;
+  const isNative  = document.getElementById('useNativeDebrid').checked;
+
+  const jackettUrl   = document.getElementById('jackettUrl').value.trim().replace(/\/+$/, '');
+  const jackettKey   = document.getElementById('jackettKey').value.trim();
+  const stremthruUrl = document.getElementById('stremthruUrl').value.trim().replace(/\/+$/, '');
+  const stremthruKey = document.getElementById('stremthruKey').value.trim();
 
   const prefs = {
     indexers:        state.useAll ? ['all'] : selected,
@@ -763,8 +744,11 @@ function buildPrefs() {
     priorityLang:    state.priorityLang,
     onlyDubbed:      document.getElementById('onlyLangBtn').classList.contains('on'),
     sortMode:        state.sortMode,
-    debrid:          isStremThru || isNative,
+    debrid:          isNative,
   };
+
+  if (jackettUrl) prefs.jackett = { url: jackettUrl, key: jackettKey };
+  if (stremthruUrl) prefs.stremthru = { url: stremthruUrl, key: stremthruKey };
 
   // ── Debrid Nativo ──────────────────────────────────────
   if (isNative) {
@@ -778,25 +762,11 @@ function buildPrefs() {
 
     prefs.debridConfig = { mode, torboxKey: tbKey || '', rdKey: rdKey || '' };
 
-    const nameMap = { torbox: 'ProwJack [TB]', realdebrid: 'ProwJack [RD]', dual: 'ProwJack [TB+RD]' };
+    const nameMap = { torbox: 'ProwJack [TB]', realdebrid: 'ProwJack [RD]', dual: 'ProwJack PRO' };
     prefs.addonName = nameMap[mode] || 'ProwJack PRO';
   }
 
-  // ── StremThru ───────────────────────────────────────────
-  if (isStremThru) {
-    const stUrl    = document.getElementById('stUrl').value.trim().replace(/\/$/,'');
-    const stStore1 = document.getElementById('stStore1').value;
-    const stToken1 = document.getElementById('stToken1').value.trim();
-    const stStore2 = document.getElementById('stStore2').value;
-    const stToken2 = document.getElementById('stToken2').value.trim();
-    if (!stToken1) throw new Error('stToken1_missing');
-    const storesArray = [{ c: stStore1, t: stToken1 }];
-    if (stStore2 && stToken2) storesArray.push({ c: stStore2, t: stToken2 });
-    prefs.stConfig  = { url: stUrl, stores: storesArray };
-    if (!isNative) prefs.addonName = `ProwJack [${stStore1.toUpperCase()}]`;
-  }
-
-  if (!isNative && !isStremThru) prefs.addonName = 'ProwJack PRO';
+  if (!isNative) prefs.addonName = 'ProwJack PRO';
 
   return prefs;
 }
@@ -826,18 +796,16 @@ function generate() {
 
     const debridLabel = prefs.debridConfig
       ? ` · Debrid: ${prefs.debridConfig.mode.toUpperCase()}`
-      : prefs.stConfig ? ' · StremThru' : '';
+      : '';
 
     toast(`✔ URL gerada! ${langLabel}${debridLabel}`, 'ok');
   } catch(err) {
     const msgs = {
-      stToken1_missing: 'ERRO: Token do Serviço 1 (StremThru) é obrigatório!',
       tb_key_missing:   'ERRO: API Key do TorBox é obrigatória!',
       rd_key_missing:   'ERRO: API Key do Real-Debrid é obrigatória!',
       dual_key_missing: 'ERRO: Insira ao menos uma API Key (TorBox ou Real-Debrid)!',
     };
     toast(msgs[err.message] || 'Erro desconhecido', 'err');
-    if (err.message === 'stToken1_missing') document.getElementById('stToken1').focus();
     if (err.message === 'tb_key_missing')   document.getElementById('tbKey').focus();
     if (err.message === 'rd_key_missing')   document.getElementById('rdKey').focus();
   }
@@ -864,3 +832,4 @@ window.addEventListener('load', async () => {
 </script>
 </body>
 </html>
+
