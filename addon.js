@@ -17,8 +17,27 @@ const {
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
-app.use((_, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+
+// Rate limiting simples
+const requestCounts = new Map();
+setInterval(() => requestCounts.clear(), 60000);
+
+app.use((req, res, next) => {
+  const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
+  const count = requestCounts.get(ip) || 0;
+  if (count > 100) {
+    return res.status(429).json({ error: "Rate limit excedido" });
+  }
+  requestCounts.set(ip, count + 1);
+  next();
+});
+
+app.use((req, res, next) => {
+  const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(",") || ["*"];
+  const origin = req.headers.origin;
+  if (allowedOrigins.includes("*") || (origin && allowedOrigins.includes(origin))) {
+    res.setHeader("Access-Control-Allow-Origin", origin || "*");
+  }
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
   next();
@@ -72,6 +91,17 @@ function memorySet(k, v, ttl) {
 function memoryDel(k) {
   memoryStore.delete(k);
 }
+
+function cleanExpiredMemory() {
+  const now = Date.now();
+  for (const [key, entry] of memoryStore.entries()) {
+    if (entry.expiresAt && entry.expiresAt <= now) {
+      memoryStore.delete(key);
+    }
+  }
+}
+
+setInterval(cleanExpiredMemory, 60000);
 
 const rc = {
   async get(k) {
@@ -198,8 +228,11 @@ async function setRateLimit(indexer, retryAfterHeader) {
 // ─────────────────────────────────────────────────────────
 function decodeUserCfg(str) {
   try {
+    if (!str || typeof str !== "string" || str.length > 10000) return null;
     const b64 = str.replace(/-/g, '+').replace(/_/g, '/');
-    return JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
+    const decoded = JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
+    if (typeof decoded !== "object" || Array.isArray(decoded)) return null;
+    return decoded;
   } catch { return null; }
 }
 function defaultPrefs() {
@@ -283,8 +316,14 @@ const LANG = [
   { re: /(espa[nñ]ol|spanish|\besp\b)/i,                           code: "es",    emoji: "🇪🇸", label: "ES"    },
   { re: /(fran[cç]ais|french|\bfre\b)/i,                           code: "fr",    emoji: "🇫🇷", label: "FR"    },
 ];
-const first    = (map, t) => map.find(e => e.re.test(t));
-const matchAll = (map, t) => map.filter(e => e.re.test(t));
+const first    = (map, t) => {
+  if (!Array.isArray(map) || !t) return null;
+  return map.find(e => e?.re?.test(t));
+};
+const matchAll = (map, t) => {
+  if (!Array.isArray(map) || !t) return [];
+  return map.filter(e => e?.re?.test(t));
+};
 const uniq     = arr => [...new Set(arr.filter(Boolean))];
 const normTitle = s => (s || "").replace(/[._]+/g, " ").replace(/\s+/g, " ").trim();
 function qp(extra = {}) {
@@ -538,12 +577,16 @@ function extractInfoHash(magnet) {
   return null;
 }
 function extractInfoBuf(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length === 0 || buf.length > 10 * 1024 * 1024) return null;
   const s   = buf.toString("latin1");
   const pos = s.indexOf("4:info");
   if (pos === -1) return null;
   let i = pos + 6, depth = 0;
   const start = i;
-  while (i < s.length) {
+  const maxIterations = 1000000;
+  let iterations = 0;
+  while (i < s.length && iterations < maxIterations) {
+    iterations++;
     const c = s[i];
     if      (c === "d" || c === "l") { depth++; i++; }
     else if (c === "e")              { depth--; i++; if (depth === 0) break; }
@@ -551,8 +594,14 @@ function extractInfoBuf(buf) {
     else if (c >= "0" && c <= "9")  {
       const colon = s.indexOf(":", i);
       if (colon === -1) break;
-      i = colon + 1 + parseInt(s.slice(i, colon), 10);
+      const len = parseInt(s.slice(i, colon), 10);
+      if (!Number.isFinite(len) || len < 0 || len > buf.length) break;
+      i = colon + 1 + len;
     } else i++;
+  }
+  if (iterations >= maxIterations) {
+    console.warn("[SECURITY] extractInfoBuf: loop excessivo detectado");
+    return null;
   }
   return depth === 0 ? buf.slice(start, i) : null;
 }
@@ -669,26 +718,31 @@ async function resolveInfoHash(r) {
         return h ? { infoHash: h, files: null, buffer: null } : null;
       }
       const buf = Buffer.from(res.data);
+      if (buf.length > 8 * 1024 * 1024) {
+        console.warn(`[SECURITY] Torrent muito grande: ${buf.length} bytes`);
+        return null;
+      }
       const bodyStr = buf.toString("utf8", 0, Math.min(buf.length, 200));
       if (bodyStr.trimStart().startsWith("magnet:")) {
         const h = extractInfoHash(bodyStr.trim());
         return h ? { infoHash: h, files: null, buffer: null } : null;
       }
-      if (buf[0] === 0x64) { // Assinatura de um dicionário bencode (d)
+      if (buf[0] === 0x64) {
         const infoBuf = extractInfoBuf(buf);
         if (infoBuf) {
           const realHash = crypto.createHash("sha1").update(infoBuf).digest("hex");
           return {
-            infoHash: realHash, // Hash verdadeiro!
+            infoHash: realHash,
             files: extractTorrentFiles(buf),
-            buffer: buf, // Arquivo guardado para upload no Debrid
+            buffer: buf,
           };
         }
       }
-    } catch {}
+    } catch (err) {
+      console.warn(`[WARN] Falha ao baixar torrent: ${err.message}`);
+    }
   }
 
-  // Fallback para o InfoHash do Jackett se o download falhar
   if (fallbackHash) return { infoHash: fallbackHash, files: null, buffer: null };
   return null;
 }
@@ -717,9 +771,18 @@ function renameIndexer(name) {
 function matchesKeywordBoost(title, boostFilter) {
   if (!boostFilter || !boostFilter.trim()) return false;
   const pattern = boostFilter.trim();
+  if (pattern.length > 200) return false;
   try {
     const regex = new RegExp(pattern, "i");
-    return regex.test(title || "");
+    const testStr = String(title || "").slice(0, 500);
+    const timeoutMs = 100;
+    const start = Date.now();
+    const result = regex.test(testStr);
+    if (Date.now() - start > timeoutMs) {
+      console.warn(`[SECURITY] Regex timeout detectado: ${pattern}`);
+      return false;
+    }
+    return result;
   } catch {
     return title.toLowerCase().includes(pattern.toLowerCase());
   }
@@ -1215,20 +1278,32 @@ async function getKitsuMeta(kitsuId) {
   }
 }
 function parseStreamId(type, id) {
+  if (!id || typeof id !== "string") return { source: "imdb", isAnime: false, metaId: "unknown", season: null, episode: null, type };
   if (id.startsWith("kitsu:")) {
     const parts = id.split(":");
+    const season = parts[2] ? parseInt(parts[2], 10) : null;
+    const episode = parts[3] ? parseInt(parts[3], 10) : null;
     return {
       source : "kitsu",
       isAnime: true,
-      kitsuId: parts[1],
-      season : parts[2] ? parseInt(parts[2], 10) : null,
-      episode: parts[3] ? parseInt(parts[3], 10) : null,
+      kitsuId: parts[1] || "unknown",
+      season : Number.isFinite(season) ? season : null,
+      episode: Number.isFinite(episode) ? episode : null,
       type,
     };
   }
   if (type === "series" && id.includes(":")) {
     const [metaId, s, e] = id.split(":");
-    return { source: "imdb", isAnime: false, metaId, season: parseInt(s, 10), episode: parseInt(e, 10), type };
+    const season = parseInt(s, 10);
+    const episode = parseInt(e, 10);
+    return { 
+      source: "imdb", 
+      isAnime: false, 
+      metaId: metaId || "unknown", 
+      season: Number.isFinite(season) ? season : null, 
+      episode: Number.isFinite(episode) ? episode : null, 
+      type 
+    };
   }
   return { source: "imdb", isAnime: false, metaId: id, season: null, episode: null, type };
 }
