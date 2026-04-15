@@ -185,6 +185,7 @@ async function torboxAddTorrent(magnet, key, addOnlyIfCached = false, torrentBuf
       if (tId !== undefined && tId !== null) return tId;
       return true;
     }
+    console.log(`[TorBox] createtorrent falhou: HTTP ${res.status} — ${JSON.stringify(res.data)}`);
     return false;
   } catch { return false; }
 }
