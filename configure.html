@@ -226,19 +226,29 @@ hr{border:none;border-top:1px solid var(--bord);margin:16px 0}
       </div>
     </div>
     <hr/>
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;align-items:end">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
       <div>
-        <label>Máx Resultados</label>
-        <input type="number" id="maxResults" value="20" min="5" max="100" style="margin-bottom:0" />
+        <label>⭐ Boost por Keywords (Regex)</label>
+        <input type="text" id="keywordBoost" placeholder="ex: (brremux|freddiegellar|dual-bioma)" style="margin-bottom:8px;font-size:11px" />
+        <div class="info" style="font-size:10px;margin-top:4px">
+          Prioriza releases que contenham estes termos <strong>além</strong> dos filtros de idioma/qualidade já aplicados.
+        </div>
       </div>
-      <div>
-        <label>Slow Threshold (ms)</label>
-        <input type="number" id="slowThreshold" value="8000" min="1000" max="30000" style="margin-bottom:0" />
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:end">
+        <div>
+          <label>Máx Resultados</label>
+          <input type="number" id="maxResults" value="20" min="5" max="100" style="margin-bottom:0" />
+        </div>
+        <div>
+          <label>Slow Threshold (ms)</label>
+          <input type="number" id="slowThreshold" value="8000" min="1000" max="30000" style="margin-bottom:0" />
+        </div>
       </div>
-      <div style="display:flex;gap:8px;padding-bottom:2px">
-        <button class="tg on" id="skipBadBtn">Skip CAM/TS</button>
-        <button class="tg on" id="onlyLangBtn">Apenas idioma</button>
-      </div>
+    </div>
+    <hr/>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button class="tg on" id="skipBadBtn">Skip CAM/TS</button>
+      <button class="tg on" id="onlyLangBtn">Apenas idioma</button>
     </div>
   </div>
 
@@ -745,6 +755,7 @@ function buildPrefs() {
     onlyDubbed:      document.getElementById('onlyLangBtn').classList.contains('on'),
     sortMode:        state.sortMode,
     debrid:          isNative,
+    keywordBoost:    document.getElementById('keywordBoost').value.trim(),
   };
 
   if (jackettUrl) prefs.jackett = { url: jackettUrl, key: jackettKey };
@@ -832,4 +843,3 @@ window.addEventListener('load', async () => {
 </script>
 </body>
 </html>
-
