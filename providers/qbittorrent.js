@@ -19,15 +19,32 @@ const BUFFER_TIMEOUT = parseInt(process.env.QBIT_BUFFER_TIMEOUT || "120", 10);
 const POLL_INTERVAL = 3000;
 
 let sessionCookie = null;
+let _dynUrl  = "";
+let _dynUser = "";
+let _dynPass = "";
+
+function setCredentials(url, user, pass) {
+  const newUrl = (url || "").replace(/\/+$/, "");
+  if (newUrl !== _dynUrl || user !== _dynUser || pass !== _dynPass) {
+    sessionCookie = null; // força novo login se credenciais mudaram
+  }
+  _dynUrl  = newUrl;
+  _dynUser = user || "";
+  _dynPass = pass || "";
+}
+
+function _url()  { return _dynUrl  || QBIT_URL; }
+function _user() { return _dynUser || QBIT_USER; }
+function _pass() { return _dynPass || QBIT_PASS; }
 
 function isConfigured() {
-  return !!(QBIT_URL && QBIT_USER && QBIT_PASS);
+  return !!(_url() && _user() && _pass());
 }
 
 async function qbitFetch(endpoint, options = {}) {
   if (!isConfigured()) throw new Error("qBittorrent não configurado");
 
-  const url = `${QBIT_URL}${endpoint}`;
+  const url = `${_url()}${endpoint}`;
   const headers = { ...(options.headers || {}) };
   if (sessionCookie) headers.Cookie = sessionCookie;
 
@@ -39,7 +56,7 @@ async function qbitFetch(endpoint, options = {}) {
 
 async function login(force = false) {
   if (!force && sessionCookie) return;
-  const body = new URLSearchParams({ username: QBIT_USER, password: QBIT_PASS });
+  const body = new URLSearchParams({ username: _user(), password: _pass() });
   const res = await qbitFetch("/api/v2/auth/login", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -158,7 +175,7 @@ async function setFilePriority(infoHash, fileId, priority) {
 async function prioritizeMainFile(infoHash, fileIdx, fileName) {
   const files = await getTorrentFiles(infoHash);
   const target = pickTargetFile(files, fileIdx, fileName);
-  if (!target) throw new Error("Arquivo alvo não encontrado no torrent");
+  if (!target) return null; // metadados ainda não chegaram — sem erro
 
   await Promise.allSettled(
     files.map(file => setFilePriority(infoHash, file.index, file.index === target.index ? 7 : 0))
@@ -193,30 +210,28 @@ async function waitForBuffer(infoHash, fileIdx, fileName) {
 
   while (Date.now() < deadline) {
     const info = await getTorrentInfo(infoHash);
-    if (!info) {
-      await sleep(POLL_INTERVAL);
-      continue;
-    }
-
-    const files = await getTorrentFiles(infoHash);
-    const target = pickTargetFile(files, fileIdx, fileName);
-    if (!target) throw new Error("Arquivo alvo não encontrado no qBittorrent");
-
-    const progress = Number(target.progress || 0);
-    console.log(`[qBit] ${infoHash} | arquivo=${target.name} | ${(progress * 100).toFixed(1)}% | estado=${info.state}`);
-
-    if (progress >= MIN_PROGRESS) {
-      return { info, file: target };
-    }
+    if (!info) { await sleep(POLL_INTERVAL); continue; }
 
     if (["error", "missingFiles", "unknown"].includes(info.state)) {
       throw new Error(`qBittorrent erro no torrent: estado "${info.state}"`);
     }
 
+    const files = await getTorrentFiles(infoHash);
+    const target = pickTargetFile(files, fileIdx, fileName);
+    // Sem arquivos ainda (metadados não chegaram) — aguarda
+    if (!target) { await sleep(POLL_INTERVAL); continue; }
+
+    const progress = Number(target.progress || 0);
+    console.log(`[qBit] ${infoHash} | arquivo=${target.name} | ${(progress * 100).toFixed(1)}% | estado=${info.state}`);
+
+    if (progress >= MIN_PROGRESS) return { info, file: target };
+
     await sleep(POLL_INTERVAL);
   }
-
-  throw new Error(`Timeout: buffer não atingiu ${(MIN_PROGRESS * 100).toFixed(1)}% em ${BUFFER_TIMEOUT}s`);
+  // Timeout — retorna o que tiver sem lançar erro
+  const info = await getTorrentInfo(infoHash).catch(() => null);
+  const files = info ? await getTorrentFiles(infoHash).catch(() => []) : [];
+  return { info, file: files.length ? pickTargetFile(files, fileIdx, fileName) : null };
 }
 
 async function getPlayableLocalFile(infoHash, fileIdx, fileName) {
@@ -238,9 +253,13 @@ async function getPlayableLocalFile(infoHash, fileIdx, fileName) {
 }
 
 function resolveFilePath(info, file) {
+  const relative = String(file.name || "").replace(/^\/+/, "");
+  // content_path pode ser caminho do host (fora do container) — sempre reconstruir via QBIT_SAVE_DIR
+  const byDir = path.join(QBIT_SAVE_DIR, relative);
+  if (fs.existsSync(byDir)) return byDir;
+  // Fallback: content_path (funciona se addon roda no host)
   const root = info.content_path || path.join(QBIT_SAVE_DIR, info.name || "");
   const normalizedRoot = path.normalize(root);
-  const relative = String(file.name || "").replace(/^\/+/, "");
   if (normalizedRoot.endsWith(path.normalize(relative))) return normalizedRoot;
   return path.join(normalizedRoot, relative);
 }
@@ -259,8 +278,8 @@ async function streamTorrentFile(req, res, infoHash, fileIdx, fileName) {
   }
 
   const stat = fs.statSync(filePath);
-  const fileSize = stat.size;
-  const availableBytes = Math.max(1, Math.floor((file.progress || 0) * (file.size || fileSize || 1)));
+  const fileSize = file.size || stat.size;
+  const availableBytes = Math.max(1, Math.floor((file.progress || 0) * fileSize));
   const range = req.headers.range;
   const mimeType = getMimeType(filePath);
 
@@ -330,6 +349,7 @@ function getMimeType(filePath) {
 
 module.exports = {
   isConfigured,
+  setCredentials,
   ensureTorrentReady,
   waitForBuffer,
   getPlayableLocalFile,
