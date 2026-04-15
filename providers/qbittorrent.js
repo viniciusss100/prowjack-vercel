@@ -252,15 +252,29 @@ async function getPlayableLocalFile(infoHash, fileIdx, fileName) {
 }
 
 function resolveFilePath(info, file) {
-  const relative = String(file.name || "").replace(/^\/+/, "");
-  // content_path pode ser caminho do host (fora do container) — sempre reconstruir via QBIT_SAVE_DIR
+  const relative = String(file.name || "").replace(/^\/+/, "").replace(/\.\./g, "");
+  if (!relative || relative.includes("..")) {
+    throw new Error("Path traversal detectado");
+  }
   const byDir = path.join(QBIT_SAVE_DIR, relative);
-  if (fs.existsSync(byDir)) return byDir;
-  // Fallback: content_path (funciona se addon roda no host)
+  if (fs.existsSync(byDir)) {
+    const resolved = path.resolve(byDir);
+    const base = path.resolve(QBIT_SAVE_DIR);
+    if (!resolved.startsWith(base)) {
+      throw new Error("Path fora do diretório permitido");
+    }
+    return byDir;
+  }
   const root = info.content_path || path.join(QBIT_SAVE_DIR, info.name || "");
   const normalizedRoot = path.normalize(root);
   if (normalizedRoot.endsWith(path.normalize(relative))) return normalizedRoot;
-  return path.join(normalizedRoot, relative);
+  const finalPath = path.join(normalizedRoot, relative);
+  const resolvedFinal = path.resolve(finalPath);
+  const baseResolved = path.resolve(QBIT_SAVE_DIR);
+  if (!resolvedFinal.startsWith(baseResolved)) {
+    throw new Error("Path fora do diretório permitido");
+  }
+  return finalPath;
 }
 
 async function streamTorrentFile(req, res, infoHash, fileIdx, fileName) {
