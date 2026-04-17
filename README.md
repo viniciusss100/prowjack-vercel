@@ -98,7 +98,7 @@ JACKETT_API_KEY=sua_api_key_aqui
 REDIS_URL=redis://localhost:6379
 
 # Real-Debrid / TorBox (Opcional - configurado via interface)
-STREMTHRU_URL=https://stremthru.13377001.xyz/v0/torznab/api
+STREMTHRU_URL=https://st.omcx.ddns.net/v0/torznab/api
 STREMTHRU_API_KEY=sua_key_aqui
 
 # qBittorrent (Opcional - para torrents privados)
@@ -303,6 +303,15 @@ FLUSHDB
 ---
 
 ## 🔐 Segurança
+
+### Boas Práticas
+
+1. **Nunca commite o arquivo `.env`** com credenciais reais
+2. **Use HTTPS** em produção (reverse proxy com Nginx/Caddy)
+3. **Configure ALLOWED_ORIGINS** para restringir CORS
+4. **Mantenha o Redis protegido** (não exponha a porta 6379)
+5. **Use senhas fortes** para qBittorrent e Debrid
+6. **Atualize regularmente** as dependências: `npm audit fix`
 
 ### Proteções Implementadas
 

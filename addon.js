@@ -51,12 +51,6 @@ const ENV = {
   apiKey:         (process.env.JACKETT_API_KEY || "").trim(),
   port:           process.env.PORT || 7014,
   redisUrl:       process.env.REDIS_URL || "redis://localhost:6379",
-  stremthruUrl:   (process.env.STREMTHRU_URL  || "").trim(),
-  stremthruKey:   (process.env.STREMTHRU_API_KEY || "").trim(),
-  zileanUrl:      (process.env.ZILEAN_URL || "").trim(),
-  zileanKey:      (process.env.ZILEAN_API_KEY || "").trim(),
-  bitmagnetUrl:   (process.env.BITMAGNET_URL || "").trim(),
-  bitmagnetKey:   (process.env.BITMAGNET_API_KEY || "").trim(),
   addonPublicUrl: (process.env.ADDON_PUBLIC_URL || "").trim().replace(/\/+$/, ""),
 };
 // ─────────────────────────────────────────────────────────
@@ -67,7 +61,6 @@ const memoryStore = new Map();
 try {
   redis = new Redis(ENV.redisUrl, { lazyConnect: true, enableOfflineQueue: false });
   redis.on("connect", () => console.log(`✅ Redis conectado: ${ENV.redisUrl}`));
-  redis.on("ready", () => console.log(`✅ Redis pronto para uso`));
   redis.on("error", (err) => console.log(`❌ Redis erro: ${err.message}`));
   redis.on("close", () => console.log(`⚠️ Redis desconectado`));
 } catch (err) {
@@ -133,7 +126,7 @@ const rc = {
     return memoryKeys;
   },
 };
-const CACHE_VERSION = "v11-stremthru-qbit";
+const CACHE_VERSION = "v12-native-debrid";
 
 function getPublicBase(req) {
   if (ENV.addonPublicUrl) return ENV.addonPublicUrl;
@@ -154,20 +147,7 @@ async function loadQbitJob(token) {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
-function getStremThruBase(url) {
-  const u = url || ENV.stremthruUrl;
-  if (!u) return null;
-  const match = u.match(/^(https?:\/\/[^/]+)/);
-  return match ? match[1] : null;
-}
 
-const STREMTHRU_STORE_MAP = {
-  realdebrid: "realdebrid",
-  torbox: "torbox",
-  alldebrid: "alldebrid",
-  premiumize: "premiumize",
-  debridlink: "debridlink",
-};
 // ─────────────────────────────────────────────────────────
 // INDEXERS (ISOLAMENTO DE ANIME)
 // ─────────────────────────────────────────────────────────
@@ -245,9 +225,11 @@ function defaultPrefs() {
     skipBadReleases: true,
     priorityLang:    "pt-br",
     onlyDubbed:      false,
+    dedupe:          true,
     debrid:          false,
     debridConfig:    null,
-    keywordBoost:    "",
+    keywordBoost:           "",
+    maxResultsPerIndexer:   0,
   };
 }
 function resolvePrefs(encoded) {
@@ -259,7 +241,7 @@ function resolvePrefs(encoded) {
     m.debrid = true;
   }
   // Migração: normalizar addonName — remover PRO e tags de serviço (ficam no name do stream)
-  if (m.addonName) m.addonName = m.addonName.replace(/\s*\[(TB\+RD|TB|RD|QB|PRO)\]/gi, "").replace(/\bPRO\b/g, "").trim();
+  if (m.addonName) m.addonName = m.addonName.replace(/\s*\[(TB\+RD|TB|RD|QB|PRO|ST)\]/gi, "").replace(/\bPRO\b/g, "").trim();
   if (!m.addonName) m.addonName = "ProwJack";
   return m;
 }
@@ -520,7 +502,6 @@ function dedupeResults(results) {
   for (const r of results) {
     const hash = r.InfoHash ? r.InfoHash.toLowerCase() : null;
     
-    // Prioridade 1: InfoHash
     if (hash) {
       if (seenHash.has(hash)) continue;
       seenHash.add(hash);
@@ -528,16 +509,14 @@ function dedupeResults(results) {
       continue;
     }
 
-    // Prioridade 2: Título normalizado + tamanho aproximado
     const normalized = normalizeForDedupe(r.Title || "");
     if (!normalized) continue;
 
-    const sizeGB = Math.round((r.Size || 0) / 1e8) / 10; // Arredonda para 0.1 GB
+    const sizeGB = Math.round((r.Size || 0) / 1e8) / 10;
     const key = `${normalized}|${sizeGB}`;
 
     const existing = seenNormalized.get(key);
     if (existing) {
-      // Mantém o que tiver mais seeders ou InfoHash
       if ((r.Seeders || 0) > (existing.Seeders || 0) || (r.InfoHash && !existing.InfoHash)) {
         const idx = deduped.indexOf(existing);
         if (idx !== -1) deduped[idx] = r;
@@ -608,7 +587,10 @@ function extractInfoBuf(buf) {
 
 function decodeBencode(buf) {
   let i = 0;
+  let depth = 0;
+  const maxDepth = 100;
   const parse = () => {
+    if (depth > maxDepth) throw new Error("Max depth exceeded");
     const c = String.fromCharCode(buf[i]);
     if (c === "i") {
       const end = buf.indexOf(0x65, i + 1);
@@ -617,20 +599,20 @@ function decodeBencode(buf) {
       return num;
     }
     if (c === "l") {
-      i++;
+      i++; depth++;
       const out = [];
       while (buf[i] !== 0x65) out.push(parse());
-      i++;
+      i++; depth--;
       return out;
     }
     if (c === "d") {
-      i++;
+      i++; depth++;
       const out = {};
       while (buf[i] !== 0x65) {
         const key = parse();
         out[String(key)] = parse();
       }
-      i++;
+      i++; depth--;
       return out;
     }
     let colon = i;
@@ -660,7 +642,9 @@ function extractTorrentFiles(buf) {
     if (info.name) {
       return [{ idx: 0, name: String(info.name), size: Number(info.length) || 0 }];
     }
-  } catch {}
+  } catch (err) {
+    console.warn(`[WARN] Falha ao extrair arquivos do torrent: ${err.message}`);
+  }
   return [];
 }
 
@@ -784,7 +768,7 @@ function renameIndexer(name) {
 function matchesKeywordBoost(title, boostFilter) {
   if (!boostFilter || !boostFilter.trim()) return false;
   const pattern = boostFilter.trim();
-  if (pattern.length > 200) return false;
+  if (pattern.length > 500) return false;
   try {
     const regex = new RegExp(pattern, "i");
     const testStr = String(title || "").slice(0, 500);
@@ -811,7 +795,7 @@ function formatStream(r, indexerName, isAnime = false, prefs = {}, showSeeds = t
   const langs  = getLangs(t, isAnime);
   const group  = extractGroup(t);
   const size   = fmtBytes(r.Size);
-  const seeds  = r.Seeders || 0;
+  const seeds  = r._displaySeeds ?? r.Seeders ?? 0;
   const cleanIndexer = renameIndexer(indexerName);
   const addonName    = prefs.addonName || "ProwJack PRO";
   const resLabel     = res ? res.label : "Desconhecida";
@@ -835,7 +819,7 @@ function formatStream(r, indexerName, isAnime = false, prefs = {}, showSeeds = t
     titleLine,
     [qual ? `🎥 ${qual.label}` : "", vis.length ? `📺 ${vis.map(v=>v.label).join(" | ")}` : "", codec ? `🎞️ ${codec.label}` : "", langStr].filter(Boolean).join("  "),
     [audios.length ? `🎧 ${audios.map(a=>a.label).join(" | ")}` : ""].filter(Boolean).join("  "),
-    [size ? `📦 ${size}` : "", showSeeds && seeds > 0 ? `🌱 ${seeds} seeds` : ""].filter(Boolean).join("  "),
+    [size ? `📦 ${size}` : "", showSeeds ? `🌱 ${seeds} seeds` : ""].filter(Boolean).join("  "),
     [`📡 ${cleanIndexer}`, group ? `🏷️ ${group}` : ""].filter(Boolean).join("  "),
     p2pLabel,
   ].filter(Boolean).join("\n");
@@ -844,170 +828,6 @@ function formatStream(r, indexerName, isAnime = false, prefs = {}, showSeeds = t
 // ─────────────────────────────────────────────────────────
 // JACKETT + SEARCH
 // ─────────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────────────────────
-// TORZNAB CACHE SOURCES (StremThru, Zilean, Bitmagnet)
-// Fontes externas que indexam conteúdo já cacheado nos debrids.
-// Hashes encontrados aqui são marcados como cached mesmo sem confirmação da API do debrid.
-// ─────────────────────────────────────────────────────────────────────────────
-
-function normalizeTorznabHash(raw) {
-  if (!raw) return null;
-  const s = raw.trim().toLowerCase();
-  if (/^[0-9a-f]{40}$/.test(s)) return s;
-  if (/^[a-z2-7]{32}$/.test(s)) return base32ToHex(s) || null;
-  return null;
-}
-
-async function fetchTorznabHashes(url, apiKey, paramsList) {
-  const allHashes = new Set();
-  for (const params of paramsList) {
-    if (apiKey) params.set("apikey", apiKey);
-    try {
-      const res = await axios.get(`${url}?${params.toString()}`, { timeout: 8000, validateStatus: s => s < 500 });
-      if (res.status >= 500) break;
-      if (!res.data) continue;
-      const xml = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
-      for (const m of xml.matchAll(/name="infohash"\s+value="([^"]+)"/gi)) {
-        const h = normalizeTorznabHash(m[1]); if (h) allHashes.add(h);
-      }
-      for (const m of xml.matchAll(/xt=urn:btih:([a-zA-Z0-9]{32,40})/gi)) {
-        const h = normalizeTorznabHash(m[1]); if (h) allHashes.add(h);
-      }
-    } catch {}
-  }
-  return [...allHashes];
-}
-
-async function searchCacheSources({ q, imdbId, type }, prefs) {
-  const stUrl = prefs?.stremthru?.url || ENV.stremthruUrl;
-  const stKey = prefs?.stremthru?.key || ENV.stremthruKey;
-  const sources = [
-    { name: "stremthru", url: stUrl,         key: stKey          },
-    { name: "zilean",    url: ENV.zileanUrl, key: ENV.zileanKey  },
-  ].filter(s => s.url);
-
-  if (!sources.length) return new Set();
-
-  const isMovie  = !type || type === "movie";
-  const isSeries = type === "series";
-
-  const results = await Promise.allSettled(sources.map(async ({ name, url, key }) => {
-    const paramsList = [];
-    const cleanImdb = imdbId ? imdbId.replace("tt", "") : null;
-
-    if (name === "zilean") {
-      if (cleanImdb) {
-        if (isMovie)  paramsList.push(new URLSearchParams({ t: "movie",    imdbid: cleanImdb }));
-        if (isSeries) paramsList.push(new URLSearchParams({ t: "tvsearch", imdbid: cleanImdb }));
-        paramsList.push(new URLSearchParams({ t: "search", imdbid: cleanImdb }));
-      }
-      if (q) paramsList.push(new URLSearchParams({ t: "search", q }));
-    } else if (name === "stremthru") {
-      if (cleanImdb) {
-        if (isMovie)  paramsList.push(new URLSearchParams({ t: "movie",    imdbid: cleanImdb, cat: "2000" }));
-        if (isSeries) paramsList.push(new URLSearchParams({ t: "tvsearch", imdbid: cleanImdb, cat: "5000" }));
-      }
-      if (q) paramsList.push(new URLSearchParams({ t: "search", q }));
-    }
-
-    const t0 = Date.now();
-    const hashes = await fetchTorznabHashes(url, key, paramsList);
-    console.log(`[TORZNAB:${name.toUpperCase()}] ${Date.now() - t0}ms | hashes=${hashes.length}`);
-    return hashes;
-  }));
-
-  const all = results.flatMap(r => r.status === "fulfilled" ? r.value : []);
-  return new Set(all);
-}
-
-async function checkCacheViaStremThru(hashes, store, apiKey, stremthruUrl) {
-  const base = getStremThruBase(stremthruUrl);
-  const storeName = STREMTHRU_STORE_MAP[store] || store;
-  if (!base || !storeName || !apiKey || !Array.isArray(hashes) || !hashes.length) return new Set();
-
-  const normalized = [...new Set(hashes.map(h => String(h || "").toLowerCase()).filter(h => /^[0-9a-f]{40}$/.test(h)))];
-  if (!normalized.length) return new Set();
-
-  const cachedHashes = new Set();
-  const pending = [];
-
-  for (const hash of normalized) {
-    const cached = await rc.get(`stremthru:${storeName}:${hash}`);
-    if (cached === "1") cachedHashes.add(hash);
-    else if (cached !== "0") pending.push(hash);
-  }
-
-  // Determina o header de autenticação correto:
-  // Se apiKey contém ":" é user:pass (Basic), senão é Bearer token
-  const authHeader = apiKey.includes(":")
-    ? `Basic ${Buffer.from(apiKey).toString("base64")}`
-    : `Bearer ${apiKey}`;
-
-  const CHUNK = 500;
-  for (let i = 0; i < pending.length; i += CHUNK) {
-    const chunk = pending.slice(i, i + CHUNK);
-    try {
-      const url = `${base}/v0/store/magnets/check`;
-      const body = JSON.stringify({ hashes: chunk });
-      let res = null;
-      try {
-        res = await fetch(url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-StremThru-Store-Name": storeName,
-            "Authorization": authHeader,
-          },
-          body,
-          signal: AbortSignal.timeout(10000),
-        });
-      } catch { continue; }
-
-      if (!res.ok) {
-        // Tenta endpoint alternativo GET com query params
-        const urlAlt = `${base}/v0/store/magnets/check?magnet=${chunk.map(h => `magnet:?xt=urn:btih:${h}`).join("&magnet=")}`;
-        let res2 = null;
-        try {
-          res2 = await fetch(urlAlt, {
-            headers: {
-              "X-StremThru-Store-Name": storeName,
-              "Authorization": authHeader,
-            },
-            signal: AbortSignal.timeout(10000),
-          });
-        } catch { continue; }
-        if (!res2?.ok) continue;
-        const data2 = await res2.json().catch(() => null);
-        if (!data2) continue;
-        const chunkHits = new Set();
-        for (const item of (data2?.data?.items || [])) {
-          const h = String(item?.hash || "").toLowerCase();
-          if (item?.status === "cached" && /^[0-9a-f]{40}$/.test(h)) { chunkHits.add(h); cachedHashes.add(h); }
-        }
-        await Promise.allSettled(chunk.map(h => rc.set(`stremthru:${storeName}:${h}`, chunkHits.has(h) ? "1" : "0", 1800)));
-        continue;
-      }
-
-      const data = await res.json().catch(() => null);
-      if (!data) continue;
-      const chunkHits = new Set();
-      for (const item of (data?.data?.items || [])) {
-        const h = String(item?.hash || "").toLowerCase();
-        if (item?.status === "cached" && /^[0-9a-f]{40}$/.test(h)) {
-          chunkHits.add(h);
-          cachedHashes.add(h);
-        }
-      }
-
-      await Promise.allSettled(
-        chunk.map(h => rc.set(`stremthru:${storeName}:${h}`, chunkHits.has(h) ? "1" : "0", 1800))
-      );
-    } catch { /* silencioso */ }
-  }
-
-  console.log(`[StremThruCache] store=${storeName} | ${cachedHashes.size} cached de ${normalized.length} hashes`);
-  return cachedHashes;
-}
 
 async function jackettFetchIndexers(url, key) {
   const jUrl = (url || ENV.jackettUrl).replace(/\/+$/, "");
@@ -1064,14 +884,15 @@ function parseTorznabResults(xml, indexer) {
   const items = xml.match(/<item\b[\s\S]*?<\/item>/gi) || [];
   return items.map(item => {
     const attrs = {};
-    for (const m of item.matchAll(/<(?:torznab:)?attr\s+name="([^"]+)"\s+value="([^"]*)"\s*\/?/gi))
-      attrs[m[1].toLowerCase()] = decodeXmlEntities(m[2]);
+    const matches = item.matchAll(/<(?:torznab:)?attr\s+name="([^"]+)"\s+value="([^"]*)"\s*\/?/gi);
+    for (const m of matches) attrs[m[1].toLowerCase()] = decodeXmlEntities(m[2]);
 
     const enclosure = item.match(/<enclosure\b[^>]*url="([^"]+)"[^>]*length="([^"]*)"/i);
     const magnetUri = attrs.magneturl || null;
     const link = magnetUri ? magnetUri : (xmlTagValue(item, "link") || enclosure?.[1] || null);
     const size = attrs.size ? parseInt(attrs.size, 10) : (enclosure?.[2] ? parseInt(enclosure[2], 10) : 0);
-    const seeders = attrs.seeders ? parseInt(attrs.seeders, 10) : 0;
+    const seedersRaw = attrs.seeders ? parseInt(attrs.seeders, 10) : null;
+    const seeders = seedersRaw ?? 1;
 
     return {
       Title: xmlTagValue(item, "title") || "",
@@ -1079,7 +900,8 @@ function parseTorznabResults(xml, indexer) {
       Link: link,
       MagnetUri: magnetUri,
       Size: Number.isFinite(size) ? size : 0,
-      Seeders: Number.isFinite(seeders) ? seeders : 0,
+      Seeders: Number.isFinite(seeders) ? seeders : 1,
+      _displaySeeds: seedersRaw ?? 0,
       InfoHash: attrs.infohash ? attrs.infohash.toLowerCase() : null,
       Tracker: indexer,
       TrackerId: indexer,
@@ -1103,20 +925,24 @@ function normalizeProwlarrInfoHash(raw) {
 }
 
 function parseProwlarrResults(items, indexer) {
-  return (Array.isArray(items) ? items : []).map(item => ({
+  return (Array.isArray(items) ? items : []).map(item => {
+    const seedersRaw = Number(item.seeders) || null;
+    return {
     Title: item.title || "",
     Guid: item.guid || item.downloadUrl || item.magnetUrl || "",
     Link: item.downloadUrl || item.magnetUrl || (item.guid?.startsWith("http") ? item.guid : null) || null,
     MagnetUri: item.magnetUrl && item.magnetUrl.startsWith("magnet:") ? item.magnetUrl : null,
     Size: Number(item.size) || 0,
-    Seeders: Number(item.seeders) || 0,
+    Seeders: seedersRaw ?? 1,
+    _displaySeeds: seedersRaw ?? 0,
     InfoHash: normalizeProwlarrInfoHash(item.infoHash),
     Tracker: item.indexer || indexer,
     TrackerId: String(item.indexerId || indexer || "").trim(),
     ImdbId: normalizeImdbId(item.imdbId),
     PublishDate: item.publishDate || null,
     _structuredMatch: false,
-  })).filter(r => r.Title && (r.Link || r.MagnetUri || r.Guid));
+  };
+  }).filter(r => r.Title && (r.Link || r.MagnetUri || r.Guid));
 }
 
 async function prowlarrSearch(query, indexer, limit = 50, jUrl, jKey) {
@@ -1225,20 +1051,21 @@ async function jackettSearch(plan, indexers, prefs) {
     console.log(`Cache HIT para buscas: ${JSON.stringify(queryList)}`);
     return JSON.parse(cached);
   }
-  const FAST_TIMEOUT = (prefs?.slowThreshold > 0 ? prefs.slowThreshold : 15000);
+  const FAST_TIMEOUT = (prefs?.slowThreshold > 0 ? prefs.slowThreshold : 8000);
   const SLOW_TIMEOUT = 50000;
   console.log(`Jackett iniciando busca: "${queryList[0] || plan?.search?.title || "sem titulo"}" em [${indexers.length} indexers]`);
   console.log(`Fase rapida: aguardando respostas... (${FAST_TIMEOUT}ms max)`);
-  
+
   const fastFlat    = (await Promise.all(indexers.map(indexer => jackettSearchOneIndexer(indexer, plan, FAST_TIMEOUT, FAST_TIMEOUT, jUrl, jKey)))).flat();
-  const fastDeduped = dedupeResults(fastFlat);
-  console.log(`Conclusao da janela rapida: ${fastFlat.length} brutos -> ${fastDeduped.length} deduplicados`);
+  const fastDeduped = prefs.dedupe !== false ? dedupeResults(fastFlat) : fastFlat;
+  console.log(`Conclusao da janela rapida: ${fastFlat.length} brutos -> ${fastDeduped.length} ${prefs.dedupe !== false ? 'deduplicados' : 'resultados'}`);
   
   // Continua mesmo sem resultados na fase rápida (permite fase lenta e cache sources)
   
   setImmediate(async () => {
     try {
-      const slowDeduped = dedupeResults((await Promise.all(indexers.map(indexer => jackettSearchOneIndexer(indexer, plan, SLOW_TIMEOUT, FAST_TIMEOUT, jUrl, jKey)))).flat());
+      const slowFlat = (await Promise.all(indexers.map(indexer => jackettSearchOneIndexer(indexer, plan, SLOW_TIMEOUT, FAST_TIMEOUT, jUrl, jKey)))).flat();
+      const slowDeduped = prefs.dedupe !== false ? dedupeResults(slowFlat) : slowFlat;
       if (slowDeduped.length > fastDeduped.length) {
         console.log(`[Background] Cache atualizado: ${fastDeduped.length} -> ${slowDeduped.length}`);
         if (slowDeduped.length > 0) await rc.set(cacheKey, JSON.stringify(slowDeduped), 1800);
@@ -1398,6 +1225,11 @@ app.get("/api/debrid/test/:provider", async (req, res) => {
         { headers: { Authorization: `Bearer ${key}` }, timeout: 8000 });
       return res.json({ ok: true, name: r.data?.username || "Usuário", plan: r.data?.type || "" });
     }
+    if (provider === "stremthru") {
+      const r = await axios.get("https://stremthru.13377001.xyz/api/v1/user",
+        { headers: { Authorization: `Bearer ${key}` }, timeout: 8000 });
+      return res.json({ ok: true, name: r.data?.email || "Usuário", plan: r.data?.subscription || "" });
+    }
     return res.json({ ok: false, error: "Provider desconhecido" });
   } catch (err) {
     const s = err.response?.status;
@@ -1408,7 +1240,7 @@ app.get("/api/debrid/test/:provider", async (req, res) => {
 app.get("/api/env",     async (_, res) => {
   let redisOk = false;
   try { await rc.ping(); redisOk = true; } catch {}
-  res.json({ jackettUrl: ENV.jackettUrl, jackettKey: ENV.apiKey, qbitUrl: (process.env.QBIT_URL||"").replace(/\/+$/,""), qbitUser: process.env.QBIT_USER||"", stremthruUrl: ENV.stremthruUrl, stremthruKey: ENV.stremthruKey, redisUrl: ENV.redisUrl, redisOk, port: ENV.port, qbitEnabled: isQbitConfigured() });
+  res.json({ jackettUrl: ENV.jackettUrl, jackettKey: ENV.apiKey, qbitUrl: (process.env.QBIT_URL||"").replace(/\/+$/,""), qbitUser: process.env.QBIT_USER||"", redisUrl: ENV.redisUrl, redisOk, port: ENV.port, qbitEnabled: isQbitConfigured() });
 });
 app.get("/api/indexers", async (req, res) => {
   const url = (req.query.url || "").trim().replace(/\/+$/, "") || ENV.jackettUrl;
@@ -1707,7 +1539,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     if (type === "movie" && !enabledCats.includes("movie")) return res.json({ streams: [] });
 
     const indexers = await resolveSearchIndexers(prefs, parsed.isAnime);
-    const results  = await jackettSearch({ parsed, queries, search }, indexers, prefs);
+    const results = await jackettSearch({ parsed, queries, search }, indexers, prefs);
     const priorityLang = prefs.priorityLang ?? "pt-br";
 
     console.log(`Filtros ativos: onlyDubbed=${prefs.onlyDubbed}, priorityLang=${priorityLang}, keywordBoost=${prefs.keywordBoost ? 'SIM' : 'NÃO'}`);
@@ -1722,47 +1554,52 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         return true;
       })
       .filter(r => {
-        if (!prefs.onlyDubbed) return true;
-        if (!priorityLang) return true;
-        
-        // Passa se: tem idioma prioritário OU tem keywords
-        const langs = getLangs(r.Title || "", parsed.isAnime);
-        const hasLang = langs.some(l => l.code === priorityLang);
-        const hasKeyword = prefs.keywordBoost && matchesKeywordBoost(r.Title || "", prefs.keywordBoost);
-        
-        if ((!hasLang && !hasKeyword) && results.indexOf(r) < 3) {
-          console.log(`  [FILTRO] "${r.Title}" → langs=[${langs.map(l=>l.code).join(',')}] keyword=${hasKeyword} → BLOQUEADO`);
+        // Keyword match: passa sempre (independente de onlyDubbed ou titleMatchScore)
+        if (prefs.keywordBoost && matchesKeywordBoost(r.Title || "", prefs.keywordBoost)) {
+          r._titleMatchScore = 1; r._keywordMatch = true; return true;
         }
-        
-        return hasLang || hasKeyword;
+        if (!prefs.onlyDubbed) return true;
+        const langs = getLangs(r.Title || "", parsed.isAnime);
+        const hasLang = priorityLang ? langs.some(l => l.code === priorityLang) : false;
+        if (!priorityLang) return true;
+        return hasLang;
       })
       .filter(r => {
+        if (r._keywordMatch || r._metaIdMatch) return true;
         const resultImdbId = getResultImdbId(r);
         if (requestedImdbId && resultImdbId && resultImdbId === requestedImdbId) {
           r._titleMatchScore = Math.max(r._titleMatchScore || 0, 1);
           r._metaIdMatch = true; return true;
         }
-        const sc = titleMatchScore(r.Title || "", [displayTitle, ...aliases]);
-        const relaxedScore = relaxedTitleMatchScore(r.Title || "", [displayTitle, ...aliases]);
-        const episodeRank = parsed.isAnime ? animeEpisodeMatchRank(r.Title || "", episode) : episodeMatchRank(r.Title || "", parsed.season, parsed.episode);
-        const minScore = parsed.isAnime ? 0.34 : (type === "series" && episodeRank >= 2 ? 0.2 : 0.45);
-        const finalScore = Math.max(sc, type === "series" ? relaxedScore * 0.8 : 0);
-        r._titleMatchScore = finalScore;
-        return finalScore >= minScore;
+        const langs = getLangs(r.Title || "", parsed.isAnime);
+        const hasLang = priorityLang ? langs.some(l => l.code === priorityLang) : false;
+        if (hasLang) { r._titleMatchScore = 1; return true; }
+        if (!priorityLang) {
+          const sc = titleMatchScore(r.Title || "", [displayTitle, ...aliases]);
+          const relaxedScore = relaxedTitleMatchScore(r.Title || "", [displayTitle, ...aliases]);
+          const episodeRank = parsed.isAnime ? animeEpisodeMatchRank(r.Title || "", episode) : episodeMatchRank(r.Title || "", parsed.season, parsed.episode);
+          const minScore = parsed.isAnime ? 0.34 : (type === "series" && episodeRank >= 2 ? 0.2 : 0.45);
+          const finalScore = Math.max(sc, type === "series" ? relaxedScore * 0.8 : 0);
+          r._titleMatchScore = finalScore;
+          return finalScore >= minScore;
+        }
+        return false;
       })
       .filter(r => { if (type !== "movie" || !year) return true; const ry = extractReleaseYear(r.Title || ""); return !ry || Math.abs(ry - year) <= 1; })
       .map(r => {
-        // Salva o score original puro antes de sofrer boost pelo cache
-        const keywordBoost = prefs.keywordBoost && matchesKeywordBoost(r.Title || "", prefs.keywordBoost) ? 50000 : 0;
-        r._originalScore = (keywordBoost + ((r._metaIdMatch ? 1 : 0) * 40000) + ((r._structuredMatch ? 1 : 0) * 20000) +
+        const t = r.Title || "";
+        const langs = getLangs(t, parsed.isAnime);
+        const hasLang = priorityLang ? langs.some(l => l.code === priorityLang) : false;
+        const isMulti = /(multi)[-.\\s]?(audio)?/i.test(t);
+        // Prioridade: lang prioritário (3) > keywordBoost (2) > multi (1)
+        const langPriority = hasLang ? 3 : (prefs.keywordBoost && matchesKeywordBoost(t, prefs.keywordBoost) ? 2 : (isMulti ? 1 : 0));
+        r._originalScore = (langPriority * 100000) +
+          ((r._metaIdMatch ? 1 : 0) * 40000) + ((r._structuredMatch ? 1 : 0) * 20000) +
           (parsed.isAnime ? animeEpisodeMatchRank(r.Title || "", episode) : episodeMatchRank(r.Title || "", parsed.season, parsed.episode)) * 10000 +
-          (r._titleMatchScore || 0) * 1000 + score(r, prefs.weights, parsed.isAnime, priorityLang));
+          (r._titleMatchScore || 0) * 1000 + score(r, prefs.weights, parsed.isAnime, priorityLang);
         return r;
       })
-      .sort((a, b) => {
-        if (!isDebridMode) return (b.Seeders || 0) - (a.Seeders || 0);
-        return b._originalScore - a._originalScore;
-      });
+      .sort((a, b) => b._originalScore - a._originalScore);
 
     console.log(`Resultados: ${results.length} brutos → ${candidates.length} após filtros (idioma, título, ano)`);
     if (prefs.keywordBoost) {
@@ -1770,56 +1607,42 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       console.log(`Keywords: ${withKeywords.length}/${candidates.length} releases com boost`);
     }
 
-    // FIX: Ampliando o leque de busca para garantir que links do final da lista sejam checados e empurrados para cima
-    const maxProcess = (prefs.maxResults || 20) * 3; 
-    const topCandidates = candidates.slice(0, maxProcess);
-
-    console.log(`Extraindo InfoHashes de ${topCandidates.length} candidatos promissores...`);
-    
-    const withHashes = [];
-    const concurrency = 10;
-    for (let i = 0; i < topCandidates.length; i += concurrency) {
-      const chunk = topCandidates.slice(i, i + concurrency);
-      const resolvedChunk = await Promise.all(
-        chunk.map(async r => {
-          const resolved = await resolveInfoHash(r);
-          if (resolved?.infoHash) return { ...r, _resolved: resolved };
-          return null;
-        })
-      );
-      withHashes.push(...resolvedChunk.filter(Boolean));
+    // Aplica limite por indexer APÓS filtros (idioma/keyword já preservados)
+    let filteredCandidates = candidates;
+    if (prefs.maxResultsPerIndexer > 0) {
+      const countByIndexer = new Map();
+      filteredCandidates = candidates.filter(r => {
+        if (r._keywordMatch) return true; // keywords sempre passam
+        const key = r.TrackerId || r.Tracker || "unknown";
+        const n = (countByIndexer.get(key) || 0) + 1;
+        countByIndexer.set(key, n);
+        return n <= prefs.maxResultsPerIndexer;
+      });
     }
+
+    const maxOut = prefs.maxResults || 20;
+    const topCandidates = filteredCandidates.slice(0, maxOut);
+    console.log(`Extraindo InfoHashes de ${topCandidates.length} candidatos...`);
+    
+    const withHashes = (await Promise.all(
+      topCandidates.map(async r => {
+        const resolved = await resolveInfoHash(r);
+        return resolved?.infoHash ? { ...r, _resolved: resolved } : null;
+      })
+    )).filter(Boolean);
 
     let rdCacheMap = {};
     let tbCacheMap = {};
-    let torznabHashes = new Set();
 
-    // Busca em cache sources (StremThru, Zilean, Bitmagnet) independentemente dos resultados do Jackett
-    const cacheQ = type === "series" && parsed.season != null && parsed.episode != null
-      ? `${displayTitle} S${String(parsed.season).padStart(2,"0")}E${String(parsed.episode ?? episode).padStart(2,"0")}`
-      : displayTitle;
-    
-    if (isDebridMode) {
-      console.log(`[CACHE] Buscando em fontes torznab (StremThru, Zilean, Bitmagnet)...`);
-      torznabHashes = await searchCacheSources({ q: cacheQ, imdbId: requestedImdbId, type }, prefs);
-    }
-
-    if (isDebridMode && withHashes.length > 0) {
+    // Stremthru: não faz cache check, deixa o proxy resolver
+    if (isDebridMode && !prefs.stConfig && withHashes.length > 0) {
       const allHashes = [...new Set(withHashes.map(r => r._resolved.infoHash))];
-      console.log(`[DEBRID] Verificando cache em lote para ${allHashes.length} hashes únicos...`);
       const { mode, torboxKey, rdKey } = prefs.debridConfig;
       const { rdBatchCheckCache, torboxBatchCheckCache } = require("./debrid");
 
-      // Hashes de torrents privados (sem MagnetUri = tracker privado).
-      // O TorBox pode adicioná-los automaticamente ao processar o checkcached.
       const privateHashes = new Set(
-        withHashes
-          .filter(r => !r.MagnetUri && r._resolved?.buffer)
-          .map(r => r._resolved.infoHash)
+        withHashes.filter(r => !r.MagnetUri && r._resolved?.buffer).map(r => r._resolved.infoHash)
       );
-      if (privateHashes.size) console.log(`[DEBRID] ${privateHashes.size} hashes privados excluídos do TB checkcached`);
-
-      // Mapa hash → buffer para torrents privados (usados no RD batch via PUT /addTorrent)
       const bufferMap = {};
       for (const r of withHashes) {
         if (r._resolved?.buffer) bufferMap[r._resolved.infoHash] = r._resolved.buffer;
@@ -1827,95 +1650,27 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
       const [rdResult, tbResult] = await Promise.all([
         (mode === "realdebrid" || mode === "dual") && rdKey
-          ? rdBatchCheckCache(allHashes, rdKey, bufferMap)
-          : Promise.resolve({}),
+          ? rdBatchCheckCache(allHashes, rdKey, bufferMap) : Promise.resolve({}),
         (mode === "torbox" || mode === "dual") && torboxKey
-          ? torboxBatchCheckCache(allHashes, torboxKey, privateHashes)
-          : Promise.resolve({}),
+          ? torboxBatchCheckCache(allHashes, torboxKey, privateHashes) : Promise.resolve({}),
       ]);
-
       rdCacheMap = rdResult;
       tbCacheMap = tbResult;
 
-      const nativeCached = new Set();
-      for (const hash of allHashes) {
-        if (rdCacheMap[hash]?.rd?.length > 0) nativeCached.add(hash);
-        if (tbCacheMap[hash] && typeof tbCacheMap[hash] === "object" && tbCacheMap[hash] !== false) nativeCached.add(hash);
-      }
-
-      const stremThruCandidates = allHashes.filter(hash => !privateHashes.has(hash) && !nativeCached.has(hash));
-      const stUrl = prefs?.stremthru?.url || ENV.stremthruUrl;
-      const stremThruChecks = [
-        (mode === "realdebrid" || mode === "dual") && rdKey
-          ? checkCacheViaStremThru(stremThruCandidates, "realdebrid", rdKey, stUrl)
-          : Promise.resolve(new Set()),
-        (mode === "torbox" || mode === "dual") && torboxKey
-          ? checkCacheViaStremThru(stremThruCandidates, "torbox", torboxKey, stUrl)
-          : Promise.resolve(new Set()),
-      ];
-      const [stremThruRd, stremThruTb] = await Promise.all(stremThruChecks);
-      const stremThruCached = new Set([...stremThruRd, ...stremThruTb]);
-
       const debridCached = new Set();
-      const torznabCached = new Set();
-      const stremThruConfirmed = new Set();
-
-      // FIX: Marcar os hashes cacheados e reordenar a lista para que eles subam ao topo (Boost)
       withHashes.forEach(r => {
         r._isCached = false;
         const h = r._resolved.infoHash;
-        if ((mode === "realdebrid" || mode === "dual") && rdCacheMap[h] && rdCacheMap[h].rd?.length > 0) {
+        if ((mode === "realdebrid" || mode === "dual") && rdCacheMap[h]?.rd?.length > 0) {
           r._isCached = true; debridCached.add(h);
         }
         if ((mode === "torbox" || mode === "dual") && tbCacheMap[h] && typeof tbCacheMap[h] === 'object' && tbCacheMap[h] !== false) {
           r._isCached = true; debridCached.add(h);
         }
-        if (!r._isCached && stremThruCached.has(h)) {
-          r._isCached = true; stremThruConfirmed.add(h);
-        }
-        if (!r._isCached && torznabHashes.has(h)) {
-          r._cacheCandidate = true;
-          torznabCached.add(h);
-        }
       });
-
-      console.log(`[DEBRID] cached=${debridCached.size + stremThruConfirmed.size} (debrid=${debridCached.size} stremthru=${stremThruConfirmed.size} candidatos=${torznabCached.size}) uncached=${withHashes.filter(r => !r._isCached).length}`);
-
-      // Ordenação: cache é prioridade máxima; dentro de cada grupo, ordena por idioma → resolução → qualidade → tamanho
-      const sortMode = prefs.sortMode || "cache";
-      const langScore = (r) => {
-        const t = r.Title || "";
-        const langs = getLangs(t, parsed.isAnime);
-        if (priorityLang && langs.some(l => l.code === priorityLang)) return 3;
-        if (/(multi)[-.\\s]?(audio)?/i.test(t)) return 2;
-        if (langs.length > 0) return 1;
-        return 0;
-      };
-      const resScore  = (r) => { const res  = first(RESOLUTION, r.Title || ""); return res  ? res.score  : 0; };
-      const qualScore = (r) => { const qual = first(QUALITY,    r.Title || ""); return qual ? qual.score : 0; };
-      const sizeScore = (r) => { const gb = (r.Size || 0) / 1e9; return gb > 0 ? Math.max(0, 10 - Math.abs(gb - 10)) : 0; };
-
-      withHashes.sort((a, b) => {
-        // Cache sempre primeiro independente do sortMode
-        const ca = a._isCached ? 1 : 0, cb = b._isCached ? 1 : 0;
-        if (ca !== cb) return cb - ca;
-        // Dentro do grupo, aplica o sortMode escolhido pelo usuário
-        if (sortMode === "resolution") {
-          const dr = resScore(b) - resScore(a); if (dr !== 0) return dr;
-          const dq = qualScore(b) - qualScore(a); if (dq !== 0) return dq;
-        } else if (sortMode === "size") {
-          const ds = sizeScore(b) - sizeScore(a); if (ds !== 0) return ds;
-        } else if (sortMode === "seeders") {
-          return (b.Seeders || 0) - (a.Seeders || 0);
-        } else {
-          // "cache" — dentro do grupo: idioma → resolução → qualidade → tamanho
-          const dl = langScore(b) - langScore(a); if (dl !== 0) return dl;
-          const dr = resScore(b)  - resScore(a);  if (dr !== 0) return dr;
-          const dq = qualScore(b) - qualScore(a); if (dq !== 0) return dq;
-          return sizeScore(b) - sizeScore(a);
-        }
-        return (b._originalScore || 0) - (a._originalScore || 0);
-      });
+      console.log(`[DEBRID] cached=${debridCached.size} uncached=${withHashes.length - debridCached.size}`);
+    } else if (prefs.stConfig) {
+      console.log(`[STREMTHRU] Proxy ativo - cache check desabilitado`);
     }
 
     // Streams sintéticos desabilitados: hashes torznab sem título não podem ser validados
@@ -1961,6 +1716,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             name: qbitName,
             description: [description, matchedFile?.name ? `📂 ${matchedFile.name}` : ""].filter(Boolean).join("\n"),
             url: `${publicBase}/${req.params.userConfig}/qbit/${jobToken}`,
+            indexer: renameIndexer(indexerName),
             _cached: !!localPlayable,
             behaviorHints: {
               filename: matchedFile?.name,
@@ -2004,6 +1760,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
                 name: streamName,
                 description: [descNoSeeds, debridFilename ? `📂 ${debridFilename}` : ""].filter(Boolean).join("\n"),
                 url: resObj.url,
+                indexer: renameIndexer(indexerName),
                 _cached: true,
                 behaviorHints: {
                   filename: debridFilename, videoSize: matchedFile?.size, bingeGroup: `prowjack|debrid|${resolved.infoHash}`, notWebReady: false,
@@ -2024,11 +1781,12 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
                 name: streamName,
                 description: description,
                 url: addUrl,
+                indexer: renameIndexer(indexerName),
                 _cached: false,
                 behaviorHints: { notWebReady: true },
               };
 
-              if (isQbitConfigured()) {
+              if (prefs.enableP2P && isQbitConfigured()) {
                 const qbitOption = await buildQbitStream(localPlayable ? "💾" : "HTTP");
                 return [debridOption, qbitOption];
               }
@@ -2039,16 +1797,35 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           })).then(items => items.filter(Boolean));
         }
 
-        if (isQbitConfigured() && (localPlayable || r.Link || magnet)) {
-          return buildQbitStream(localPlayable ? "💾" : "HTTP");
+        if (prefs.enableP2P && isQbitConfigured() && (localPlayable || r.Link || magnet)) {
+          const qbitStream = await buildQbitStream(localPlayable ? "💾" : "HTTP");
+          const sources = r.MagnetUri ? [r.MagnetUri] : (resolved.infoHash ? [buildMagnet(resolved.infoHash, null, r.Title)] : []);
+          if (!sources.length) return qbitStream;
+          const p2pStream = {
+            name, description: [description, matchedFile?.name ? `📂 ${matchedFile.name}` : ""].filter(Boolean).join("\n"),
+            infoHash: resolved.infoHash, fileIdx: matchedFile?.idx, sources,
+            indexer: renameIndexer(indexerName),
+            behaviorHints: { filename: matchedFile?.name, videoSize: matchedFile?.size, bingeGroup: parsed.isAnime ? `prowjack|anime|${displayTitle}` : `prowjack|${resolved.infoHash}` },
+          };
+          return [qbitStream, p2pStream];
         }
 
         const sources = r.MagnetUri ? [r.MagnetUri] : (resolved.infoHash ? [buildMagnet(resolved.infoHash, null, r.Title)] : []);
         if (!sources.length) return null;
+        if (prefs.stConfig) {
+          const storeCodeMap = { torbox: "TB", realdebrid: "RD" };
+          const desc = [description, matchedFile?.name ? `📂 ${matchedFile.name}` : ""].filter(Boolean).join("\n");
+          const bh = { filename: matchedFile?.name, videoSize: matchedFile?.size, bingeGroup: `prowjack|${resolved.infoHash}`, notWebReady: true };
+          return prefs.stConfig.stores.map(s => {
+            const tag = storeCodeMap[s.c] || s.c.toUpperCase();
+            return { name: `${name.split("\n")[0]}\n⬇️ ${resLabel || "Links"} [${tag}]`, description: desc, url: sources[0], indexer: renameIndexer(indexerName), behaviorHints: bh };
+          });
+        }
         return {
           name,
           description: [description, matchedFile?.name ? `📂 ${matchedFile.name}` : ""].filter(Boolean).join("\n"),
           infoHash: resolved.infoHash, fileIdx: matchedFile?.idx, sources,
+          indexer: renameIndexer(indexerName),
           behaviorHints: {
             filename: matchedFile?.name, videoSize: matchedFile?.size,
             bingeGroup: parsed.isAnime ? `prowjack|anime|${displayTitle}` : `prowjack|${resolved.infoHash}`,
@@ -2060,93 +1837,52 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
     const allStreams = resolvedAll.flat(2).filter(Boolean);
 
-    // Deduplicação por provedor
-    const byProvider = { tb: [], rd: [], qbit: [], magnet: [] };
-    
-    for (const stream of allStreams) {
-      if (stream.name?.includes('[TB]')) byProvider.tb.push(stream);
-      else if (stream.name?.includes('[RD]')) byProvider.rd.push(stream);
-      else if (stream.name?.includes('[QB]')) byProvider.qbit.push(stream);
-      else byProvider.magnet.push(stream);
-    }
-
-    const getStreamKey = (s) => {
-      const hash = s.infoHash?.toLowerCase() || (s.url ? s.url.match(/\/([a-f0-9]{40})/i)?.[1]?.toLowerCase() : null);
-      if (hash) return `hash:${hash}`;
-      const filename = s.behaviorHints?.filename || "";
-      if (filename) return `file:${filename.toLowerCase().trim()}`;
-      const desc = normalizeForDedupe(s.description || s.name || "");
-      return desc ? `desc:${desc}` : null;
-    };
-
-    const dedupeSingleProvider = (streams) => {
-      const seen = new Map();
-      const deduped = [];
-      
-      for (const s of streams) {
-        const key = getStreamKey(s);
-        if (!key) { deduped.push(s); continue; }
-        
-        const existing = seen.get(key);
-        if (existing) {
-          if (s._cached && !existing._cached) {
-            deduped[deduped.indexOf(existing)] = s;
-            seen.set(key, s);
-          }
-          continue;
-        }
-        seen.set(key, s);
-        deduped.push(s);
+    // Propaga metadados de ordenação: cada resolvedAll[i] corresponde a withHashes[i]
+    resolvedAll.forEach((streamOrArr, i) => {
+      const r = withHashes[i];
+      if (!r) return;
+      const items = Array.isArray(streamOrArr) ? streamOrArr.flat() : [streamOrArr];
+      for (const s of items) {
+        if (!s) continue;
+        s._originalScore = r._originalScore || 0;
+        s._title    = r.Title || "";
+        s._seeders  = r.Seeders || 0;
+        s._sizeGb   = (r.Size || 0) / 1e9;
       }
-      return deduped;
+    });
+
+    const dedupedStreams = allStreams;
+
+
+    // Ordenação final: Torz primeiro, depois 1°cache 2°lang 3°resolução 4°qualidade 5°seeders 6°tamanho
+    const _langScore = (s) => {
+      const t = s._title || "";
+      const langs = getLangs(t, parsed.isAnime);
+      if (priorityLang && langs.some(l => l.code === priorityLang)) return 3;
+      if (prefs.keywordBoost && matchesKeywordBoost(t, prefs.keywordBoost)) return 2;
+      if (/(multi|dual)[-.\\s]?(audio)?/i.test(t)) return 1;
+      return 0;
     };
+    const _resScore  = (s) => { const r = first(RESOLUTION, s._title || ""); return r ? r.score  : 0; };
+    const _qualScore = (s) => { const q = first(QUALITY,    s._title || ""); return q ? q.score  : 0; };
 
-    const dedupedTb = dedupeSingleProvider(byProvider.tb);
-    const dedupedRd = dedupeSingleProvider(byProvider.rd);
-    const dedupedQbit = dedupeSingleProvider(byProvider.qbit);
-    const dedupedMagnet = dedupeSingleProvider(byProvider.magnet);
+    dedupedStreams.sort((a, b) => {
+      // Depois: cache > lang > res > qual > seeders > tamanho
+      const ca = a._cached ? 1 : 0, cb = b._cached ? 1 : 0;
+      if (ca !== cb) return cb - ca;
+      const dl = _langScore(b) - _langScore(a); if (dl !== 0) return dl;
+      const dr = _resScore(b)  - _resScore(a);  if (dr !== 0) return dr;
+      const dq = _qualScore(b) - _qualScore(a); if (dq !== 0) return dq;
+      const ds = (b._seeders || 0) - (a._seeders || 0); if (ds !== 0) return ds;
+      return Math.abs((a._sizeGb || 0) - 10) - Math.abs((b._sizeGb || 0) - 10);
+    });
 
-    // Remove uncached quando existe cached do mesmo torrent em qualquer provedor
-    // EXCETO: qBittorrent sempre aparece (não é filtrado)
-    const allCachedKeys = new Set();
-    for (const s of [...dedupedTb, ...dedupedRd]) {
-      if (s._cached) {
-        const key = getStreamKey(s);
-        if (key) allCachedKeys.add(key);
-      }
+    const finalStreams = dedupedStreams.slice(0, maxOut);
+    if (dedupedStreams.length > 0) {
+      const top = dedupedStreams.slice(0, Math.min(5, dedupedStreams.length));
+      console.log(`[ORDEM] top${top.length}: ` + top.map(s => `[cache=${s._cached?1:0} lang=${_langScore(s)} res=${_resScore(s).toFixed(1)}] ${(s._title||s.name||"").slice(0,50)}`).join(" | "));
     }
-
-    const filterUncached = (streams, isQbit = false) => {
-      if (isQbit) return streams; // qBittorrent nunca é filtrado
-      return streams.filter(s => {
-        if (s._cached) return true;
-        const key = getStreamKey(s);
-        return !key || !allCachedKeys.has(key);
-      });
-    };
-
-    const finalTb = filterUncached(dedupedTb);
-    const finalRd = filterUncached(dedupedRd);
-    const finalQbit = filterUncached(dedupedQbit, true);
-
-    console.log(`Deduplicação: TB=${byProvider.tb.length}→${finalTb.length} RD=${byProvider.rd.length}→${finalRd.length} QB=${byProvider.qbit.length}→${finalQbit.length} Magnet=${byProvider.magnet.length}→${dedupedMagnet.length}`);
-
-    const dedupedStreams = [...finalTb, ...finalRd, ...finalQbit, ...dedupedMagnet];
-
-    if (isDebridMode) {
-      dedupedStreams.sort((a, b) => (b._cached ? 1 : 0) - (a._cached ? 1 : 0));
-    }
-
-    const maxOut = prefs.maxResults || 20;
-    let finalStreams;
-    if (isDebridMode) {
-      const cached = dedupedStreams.filter(s => s._cached);
-      const queued = dedupedStreams.filter(s => !s._cached);
-      finalStreams = [...cached, ...queued].slice(0, maxOut);
-    } else {
-      finalStreams = dedupedStreams.slice(0, maxOut);
-    }
-    finalStreams.forEach(s => delete s._cached);
+    finalStreams.forEach(s => { delete s._cached; delete s._originalScore; delete s._title; delete s._seeders; delete s._sizeGb; });
 
     if (isDebridMode) {
       const cached = finalStreams.filter(s => s.url && !s.url.includes('/debrid-add/')).length;

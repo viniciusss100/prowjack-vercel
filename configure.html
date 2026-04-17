@@ -14,6 +14,7 @@
   --tb:#ff9d5c;--tb-dim:#8a4a1e;--tb-bg:rgba(255,157,92,.09);
   --rd:#c88aff;--rd-dim:#6a3ea9;--rd-bg:rgba(200,138,255,.09);
   --dual:#4ae89e;--dual-bg:rgba(74,232,158,.08);
+  --amber:#f5a623;--adim:#5a3a10;
   --mono:'Space Mono',monospace;--sans:'Barlow Condensed',sans-serif;
   --radius:8px;--shadow:0 4px 20px rgba(0,0,0,.3);
 }
@@ -61,6 +62,7 @@ input[type=text],input[type=number],input[type=password],select.ix-select{width:
 input:focus,select.ix-select:focus{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-glow)}
 
 .w-row{display:grid;grid-template-columns:110px 1fr 40px;align-items:center;gap:10px;margin-bottom:10px}
+.w-row2{display:grid;grid-template-columns:130px 1fr;align-items:center;gap:10px;margin-bottom:10px}
 .w-label{font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--dim)}
 .w-val{font-family:var(--mono);font-size:13px;color:var(--accent);text-align:right}
 input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:2px;background:var(--bord2);border-radius:2px;outline:none;cursor:pointer}
@@ -182,27 +184,25 @@ hr{border:none;border-top:1px solid var(--bord);margin:16px 0}
 <div class="pane active" id="pane-setup">
 <div class="g2">
 
-  <div class="card">
+  <div class="card full">
     <div class="ctitle">Conexão Jackett / Prowlarr</div>
-    <label>URL</label>
-    <input type="text" id="jackettUrl" placeholder="ex: http://prowlarr:9696" />
-    <label>API Key</label>
-    <input type="text" id="jackettKey" placeholder="API Key do Jackett/Prowlarr" />
-    <button class="btn btn-p btn-sm" style="margin-top:4px" onclick="loadIndexers()">Conectar e Carregar Indexers</button>
-    <div id="test-log" class="mt8" style="display:none;font-size:11px;color:var(--dim)"></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:end">
+      <div>
+        <label>URL</label>
+        <input type="text" id="jackettUrl" placeholder="ex: http://prowlarr:9696" style="margin-bottom:0" />
+      </div>
+      <div>
+        <label>API Key</label>
+        <input type="text" id="jackettKey" placeholder="API Key do Jackett/Prowlarr" style="margin-bottom:0" />
+      </div>
+    </div>
+    <div style="margin-top:12px">
+      <button class="btn btn-p btn-sm" onclick="loadIndexers()">Conectar e Carregar Indexers</button>
+    </div>
   </div>
-
-  <div class="card">
-    <div class="ctitle">StremThru <span style="font-size:9px;color:var(--dim);font-weight:400;letter-spacing:1px">Cache Torznab</span></div>
-    <label>URL</label>
-    <input type="text" id="stremthruUrl" placeholder="ex: https://stremthru.13377001.xyz/v0/torznab/api" />
-    <label>API Key <span style="color:var(--dim);font-weight:400;font-size:9px">(opcional)</span></label>
-    <input type="text" id="stremthruKey" placeholder="deixe em branco se não usar" />
-  </div>
-
 
   <div class="card full">
-    <div class="ctitle">Categorias &amp; Limites</div>
+    <div class="ctitle">Filtros &amp; Limites</div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
       <div>
         <label>Categorias</label>
@@ -214,41 +214,30 @@ hr{border:none;border-top:1px solid var(--bord);margin:16px 0}
         <div class="anime-info" id="anime-hint" style="display:none">
           Anime usa indexers especializados (Nyaa, AnimeTosho) e busca por episódio.
         </div>
-      </div>
-      <div>
-        <label>Ordenação</label>
-        <div class="tg-group" id="sort-group">
-          <button class="tg on" data-sort="cache">Cache primeiro</button>
-          <button class="tg" data-sort="resolution">Resolução</button>
-          <button class="tg" data-sort="size">Tamanho</button>
-          <button class="tg" data-sort="seeders">Seeders</button>
+        <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="tg on" id="skipBadBtn">Skip CAM/TS</button>
+          <button class="tg on" id="onlyLangBtn">Apenas idioma</button>
+          <button class="tg on" id="dedupeBtn">Deduplicar</button>
         </div>
       </div>
-    </div>
-    <hr/>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
       <div>
         <label>⭐ Boost por Keywords (Regex)</label>
-        <input type="text" id="keywordBoost" placeholder="ex: (brremux|freddiegellar|dual-bioma)" style="margin-bottom:8px;font-size:11px" />
-        <div class="info" style="font-size:10px;margin-top:4px">
-          Prioriza releases que contenham estes termos <strong>além</strong> dos filtros de idioma/qualidade já aplicados.
+        <input type="text" id="keywordBoost" placeholder="ex: (brremux|freddiegellar|dual-bioma)" style="font-size:11px" />
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+          <div>
+            <label>Máx Resultados</label>
+            <input type="number" id="maxResults" value="20" min="5" max="100" style="margin-bottom:0" />
+          </div>
+          <div>
+            <label>Timeout (ms)</label>
+            <input type="number" id="slowThreshold" value="8000" min="1000" max="30000" style="margin-bottom:0" />
+          </div>
+          <div>
+            <label>Máx/Indexer</label>
+            <input type="number" id="maxResultsPerIndexer" value="0" min="0" max="200" style="margin-bottom:0" title="0 = sem limite" />
+          </div>
         </div>
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:end">
-        <div>
-          <label>Máx Resultados</label>
-          <input type="number" id="maxResults" value="20" min="5" max="100" style="margin-bottom:0" />
-        </div>
-        <div>
-          <label>Slow Threshold (ms)</label>
-          <input type="number" id="slowThreshold" value="8000" min="1000" max="30000" style="margin-bottom:0" />
-        </div>
-      </div>
-    </div>
-    <hr/>
-    <div style="display:flex;gap:8px;align-items:center">
-      <button class="tg on" id="skipBadBtn">Skip CAM/TS</button>
-      <button class="tg on" id="onlyLangBtn">Apenas idioma</button>
     </div>
   </div>
 
@@ -282,82 +271,79 @@ hr{border:none;border-top:1px solid var(--bord);margin:16px 0}
 
   <!-- ══ DEBRID NATIVO ════════════════════════════════════════════ -->
   <div class="card full">
-    <div class="ctitle">
-      ⚡ Debrid Direto
-      <span id="native-debrid-badge" style="display:none"></span>
-    </div>
-    <p class="info" style="margin-bottom:14px">
-      Integração nativa com <strong style="color:var(--tb)">TorBox</strong> e/ou <strong style="color:var(--rd)">Real-Debrid</strong> — sem intermediários. 
-      O servidor verifica o cache antes de agir: só torrents cacheados geram link HTTP direto. 
-      Links são entregues ao Stremio como URL, sem cliente torrent.
-    </p>
+    <div class="ctitle">⚡ Debrid</div>
 
-    <label style="display:flex;align-items:center;gap:9px;cursor:pointer;color:var(--text);font-size:11px;letter-spacing:1px;text-transform:uppercase;margin-bottom:16px;">
-      <input type="checkbox" id="useNativeDebrid" style="width:15px;height:15px;accent-color:var(--amber);" onchange="toggleNativeDebrid(this.checked)">
-      Ativar Debrid Nativo
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--text);font-size:12px;margin-bottom:12px;">
+      <input type="checkbox" id="useNativeDebrid" style="width:16px;height:16px;accent-color:var(--amber);" onchange="toggleDebridMode()">
+      Ativar Debrid Nativo (TorBox/Real-Debrid direto)
     </label>
 
-    <div id="nativeDebridConfig" style="display:none">
+    <div id="nativeDebridConfig" style="display:none;background:rgba(245,166,35,.05);border:1px solid var(--adim);border-radius:var(--radius);padding:14px;margin-bottom:14px;">
+      <div class="w-row2">
+        <div class="w-label">TorBox API Key</div>
+        <input type="password" id="tbKey" placeholder="Opcional" style="margin-bottom:0;">
+      </div>
+      <div class="w-row2" style="margin-bottom:4px;">
+        <div class="w-label">Real-Debrid API Key</div>
+        <input type="password" id="rdKey" placeholder="Opcional" style="margin-bottom:0;">
+      </div>
+      <p class="info" style="font-size:10px;padding-left:140px;">Configure ao menos uma das chaves acima.</p>
+    </div>
 
-      <!-- Seletor de Modo -->
-      <div style="margin-bottom:16px">
-        <div style="font-family:var(--sans);font-size:10px;letter-spacing:3px;text-transform:uppercase;color:var(--dim);margin-bottom:10px">Modo de operação</div>
-        <div class="debrid-mode-grid">
-          <div class="debrid-mode-btn" id="dm-torbox" onclick="selectDebridMode('torbox')">
-            <span class="dm-icon">🟠</span>
-            <span class="dm-label">TorBox</span>
-            <span class="dm-desc">Apenas TorBox</span>
-          </div>
-          <div class="debrid-mode-btn active-dual" id="dm-dual" onclick="selectDebridMode('dual')">
-            <span class="dm-icon">⚡</span>
-            <span class="dm-label">Dual</span>
-            <span class="dm-desc">TorBox + RD em paralelo</span>
-          </div>
-          <div class="debrid-mode-btn" id="dm-realdebrid" onclick="selectDebridMode('realdebrid')">
-            <span class="dm-icon">🟣</span>
-            <span class="dm-label">Real-Debrid</span>
-            <span class="dm-desc">Apenas Real-Debrid</span>
-          </div>
-        </div>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--text);font-size:12px;margin-bottom:12px;">
+      <input type="checkbox" id="useStremThru" style="width:16px;height:16px;accent-color:var(--amber);" onchange="toggleDebridMode()">
+      Ativar Proxy Debrid via StremThru
+    </label>
+
+    <div id="stremThruConfig" style="display:none;background:rgba(245,166,35,.05);border:1px solid var(--adim);border-radius:var(--radius);padding:14px;margin-bottom:14px;">
+      <div class="w-row2">
+        <div class="w-label">StremThru URL</div>
+        <input type="text" id="stUrl" placeholder="ex: https://stremthru.13377001.xyz" value="https://stremthru.13377001.xyz" style="margin-bottom:0;">
       </div>
 
-      <!-- TorBox Section -->
-      <div class="debrid-section tb-section" id="tb-panel">
-        <div class="debrid-section-title tb-title">🟠 TorBox</div>
-        <label>API Key</label>
-        <div style="display:flex;gap:8px;align-items:flex-start">
-          <div style="flex:1;position:relative">
-            <input type="password" id="tbKey" placeholder="Insira sua TorBox API Key…" style="margin-bottom:8px;padding-right:38px" oninput="onDebridKeyInput()">
-            <button onclick="toggleVisibility('tbKey', this)" style="position:absolute;right:10px;top:9px;background:none;border:none;color:var(--dim);cursor:pointer;font-size:13px">👁</button>
-          </div>
-        </div>
-        <div style="display:flex;align-items:center;gap:10px">
-          <button class="btn btn-tb btn-sm" onclick="testDebrid('torbox')">Testar Conexão</button>
-          <span class="debrid-status" id="tb-status"></span>
-        </div>
-        <div class="info mt8" style="font-size:10px">
-          Obtenha em: <a href="https://torbox.app/settings" target="_blank" style="color:var(--tb);text-decoration:none">torbox.app/settings</a>
-        </div>
+      <hr style="border-top:1px solid var(--bord2);margin:12px 0;">
+
+      <div class="w-row2">
+        <div class="w-label">Serviço 1</div>
+        <select id="stStore1" class="ix-select" style="margin-bottom:0;">
+          <option value="torbox">TorBox</option>
+          <option value="realdebrid">Real-Debrid</option>
+          <option value="alldebrid">AllDebrid</option>
+          <option value="premiumize">Premiumize</option>
+          <option value="debridlink">Debrid-Link</option>
+          <option value="offcloud">Offcloud</option>
+        </select>
+      </div>
+      <div class="w-row2">
+        <div class="w-label">API Token 1</div>
+        <input type="text" id="stToken1" placeholder="[OBRIGATÓRIO]" style="margin-bottom:0;">
       </div>
 
-      <!-- Real-Debrid Section -->
-      <div class="debrid-section rd-section" id="rd-panel">
-        <div class="debrid-section-title rd-title">🟣 Real-Debrid</div>
-        <label>API Key</label>
-        <div style="display:flex;gap:8px;align-items:flex-start">
-          <div style="flex:1;position:relative">
-            <input type="password" id="rdKey" placeholder="Insira sua Real-Debrid API Key…" style="margin-bottom:8px;padding-right:38px" oninput="onDebridKeyInput()">
-            <button onclick="toggleVisibility('rdKey', this)" style="position:absolute;right:10px;top:9px;background:none;border:none;color:var(--dim);cursor:pointer;font-size:13px">👁</button>
-          </div>
-        </div>
-        <div style="display:flex;align-items:center;gap:10px">
-          <button class="btn btn-rd btn-sm" onclick="testDebrid('realdebrid')">Testar Conexão</button>
-          <span class="debrid-status" id="rd-status"></span>
-        </div>
-        <div class="info mt8" style="font-size:10px">
-          Obtenha em: <a href="https://real-debrid.com/apitoken" target="_blank" style="color:var(--rd);text-decoration:none">real-debrid.com/apitoken</a>
-        </div>
+      <hr style="border-top:1px solid var(--bord2);margin:12px 0;">
+
+      <div class="w-row2">
+        <div class="w-label" style="color:var(--dim)">Serviço 2</div>
+        <select id="stStore2" class="ix-select" style="margin-bottom:0;">
+          <option value="">-- Nenhum --</option>
+          <option value="torbox">TorBox</option>
+          <option value="realdebrid">Real-Debrid</option>
+          <option value="alldebrid">AllDebrid</option>
+          <option value="premiumize">Premiumize</option>
+          <option value="debridlink">Debrid-Link</option>
+          <option value="offcloud">Offcloud</option>
+        </select>
       </div>
+      <div class="w-row2" style="margin-bottom:0;">
+        <div class="w-label" style="color:var(--dim)">API Token 2</div>
+        <input type="text" id="stToken2" placeholder="[OPCIONAL]" style="margin-bottom:0;">
+      </div>
+    </div>
+
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--text);font-size:12px;">
+      <input type="checkbox" id="enableP2P" style="width:16px;height:16px;accent-color:var(--amber);">
+      Habilitar P2P (qBittorrent)
+    </label>
+  </div>
 
     </div>
   </div>
@@ -431,7 +417,6 @@ const state = {
   useAll: true,
   priorityLang: 'pt-br',
   debridMode: 'dual',
-  sortMode: 'cache',
 };
 
 // ── Idioma Prioritário ────────────────────────────────────────────
@@ -465,20 +450,30 @@ function toggleNativeDebrid(on) {
 
 function selectDebridMode(mode) {
   state.debridMode = mode;
-  ['torbox','dual','realdebrid'].forEach(m => {
+  ['torbox','dual','realdebrid','stremthru'].forEach(m => {
     const btn = document.getElementById('dm-' + m);
     btn.className = 'debrid-mode-btn';
     if (m === mode) {
       if (m === 'torbox')      btn.classList.add('active-tb');
       else if (m === 'dual')   btn.classList.add('active-dual');
-      else                     btn.classList.add('active-rd');
+      else if (m === 'realdebrid') btn.classList.add('active-rd');
+      else if (m === 'stremthru')  btn.style.background = '#4a9eff';
     }
   });
   // Mostrar/ocultar paineis de key
   const tbPanel = document.getElementById('tb-panel');
   const rdPanel = document.getElementById('rd-panel');
-  tbPanel.style.display = (mode === 'realdebrid') ? 'none' : 'block';
-  rdPanel.style.display = (mode === 'torbox')     ? 'none' : 'block';
+  const stPanel = document.getElementById('st-panel');
+  
+  if (mode === 'stremthru') {
+    tbPanel.style.display = 'block';
+    rdPanel.style.display = 'block';
+    stPanel.style.display = 'block';
+  } else {
+    tbPanel.style.display = (mode === 'realdebrid') ? 'none' : 'block';
+    rdPanel.style.display = (mode === 'torbox') ? 'none' : 'block';
+    stPanel.style.display = 'none';
+  }
   updateDebridBadge();
 }
 
@@ -491,6 +486,10 @@ function updateDebridBadge() {
   } else if (mode === 'realdebrid') {
     badge.className = 'debrid-badge badge-rd';
     badge.textContent = '🟣 Real-Debrid';
+  } else if (mode === 'stremthru') {
+    badge.className = 'debrid-badge';
+    badge.style.background = '#4a9eff';
+    badge.textContent = '🔵 Stremthru';
   } else {
     badge.className = 'debrid-badge badge-dual';
     badge.textContent = '⚡ Dual';
@@ -506,10 +505,10 @@ function toggleVisibility(inputId, btn) {
 }
 
 async function testDebrid(provider) {
-  const statusEl = document.getElementById(provider === 'torbox' ? 'tb-status' : 'rd-status');
-  const key = provider === 'torbox'
-    ? document.getElementById('tbKey').value.trim()
-    : document.getElementById('rdKey').value.trim();
+  const statusMap = { torbox: 'tb-status', realdebrid: 'rd-status', stremthru: 'st-status' };
+  const keyMap = { torbox: 'tbKey', realdebrid: 'rdKey', stremthru: 'stKey' };
+  const statusEl = document.getElementById(statusMap[provider]);
+  const key = document.getElementById(keyMap[provider]).value.trim();
 
   if (!key) {
     statusEl.className = 'debrid-status err';
@@ -527,7 +526,8 @@ async function testDebrid(provider) {
       const label = (data.name || 'Autenticado') + (data.plan ? ' · ' + data.plan : '');
       statusEl.className = 'debrid-status ok';
       statusEl.textContent = '✔ ' + label;
-      toast('✔ ' + (provider === 'torbox' ? 'TorBox' : 'Real-Debrid') + ' conectado! ' + (data.name || ''), 'ok');
+      const providerName = provider === 'torbox' ? 'TorBox' : provider === 'realdebrid' ? 'Real-Debrid' : 'Stremthru';
+      toast('✔ ' + providerName + ' conectado! ' + (data.name || ''), 'ok');
     } else {
       statusEl.className = 'debrid-status err';
       statusEl.textContent = '✗ ' + (data.error || 'Erro desconhecido');
@@ -566,26 +566,17 @@ document.querySelectorAll('.tg[data-cat]').forEach(t => {
   });
 });
 
-document.querySelectorAll('#sort-group .tg[data-sort]').forEach(t => {
-  t.addEventListener('click', () => {
-    document.querySelectorAll('#sort-group .tg').forEach(b => b.classList.remove('on'));
-    t.classList.add('on');
-    state.sortMode = t.dataset.sort;
-  });
-});
-
 document.getElementById('skipBadBtn').addEventListener('click', function() { this.classList.toggle('on'); });
 document.getElementById('onlyLangBtn').addEventListener('click', function() { this.classList.toggle('on'); });
+document.getElementById('dedupeBtn').addEventListener('click', function() { this.classList.toggle('on'); });
 
 function getCats() { return [...document.querySelectorAll('.tg[data-cat].on')].map(t => t.dataset.cat); }
 
 async function loadEnv() {
   try {
     const env = await fetch('/api/env').then(r => r.json());
-    if (env.jackettUrl)   document.getElementById('jackettUrl').value   = env.jackettUrl;
-    if (env.jackettKey)   document.getElementById('jackettKey').value   = env.jackettKey;
-    if (env.stremthruUrl) document.getElementById('stremthruUrl').value = env.stremthruUrl;
-    if (env.stremthruKey) document.getElementById('stremthruKey').value = env.stremthruKey;
+    if (env.jackettUrl) document.getElementById('jackettUrl').value = env.jackettUrl;
+    if (env.jackettKey) document.getElementById('jackettKey').value = env.jackettKey;
     dot('redis', env.redisOk ? 'ok' : 'err');
     label('redis', env.redisOk ? `Redis` : 'Redis (offline)');
   } catch {}
@@ -735,66 +726,127 @@ function encodeBaseURL(obj) {
   return btoa(utf8Str).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 }
 
-function buildPrefs() {
-  const selected  = state.selectedIndexers.length ? state.selectedIndexers : ['all'];
-  const isNative  = document.getElementById('useNativeDebrid').checked;
+function toggleDebridMode() {
+  document.getElementById('nativeDebridConfig').style.display = document.getElementById('useNativeDebrid').checked ? 'block' : 'none';
+  document.getElementById('stremThruConfig').style.display = document.getElementById('useStremThru').checked ? 'block' : 'none';
+}
 
-  const jackettUrl   = document.getElementById('jackettUrl').value.trim().replace(/\/+$/, '');
-  const jackettKey   = document.getElementById('jackettKey').value.trim();
-  const stremthruUrl = document.getElementById('stremthruUrl').value.trim().replace(/\/+$/, '');
-  const stremthruKey = document.getElementById('stremthruKey').value.trim();
+function buildPrefs() {
+  const selected = state.selectedIndexers.length ? state.selectedIndexers : ['all'];
+  const isNative = document.getElementById('useNativeDebrid').checked;
+  const isStremThru = document.getElementById('useStremThru').checked;
+
+  const jackettUrl = document.getElementById('jackettUrl').value.trim().replace(/\/+$/, '');
+  const jackettKey = document.getElementById('jackettKey').value.trim();
 
   const prefs = {
-    indexers:        state.useAll ? ['all'] : selected,
-    categories:      getCats(),
-    weights:         getWeights(),
-    maxResults:      +document.getElementById('maxResults').value,
-    slowThreshold:   +document.getElementById('slowThreshold').value,
+    indexers: state.useAll ? ['all'] : selected,
+    categories: getCats(),
+    weights: getWeights(),
+    maxResults: +document.getElementById('maxResults').value,
+    slowThreshold: +document.getElementById('slowThreshold').value,
     skipBadReleases: document.getElementById('skipBadBtn').classList.contains('on'),
-    priorityLang:    state.priorityLang,
-    onlyDubbed:      document.getElementById('onlyLangBtn').classList.contains('on'),
-    sortMode:        state.sortMode,
-    debrid:          isNative,
-    keywordBoost:    document.getElementById('keywordBoost').value.trim(),
+    priorityLang: state.priorityLang,
+    onlyDubbed: document.getElementById('onlyLangBtn').classList.contains('on'),
+    dedupe: document.getElementById('dedupeBtn').classList.contains('on'),
+    debrid: isNative || isStremThru,
+    enableP2P: document.getElementById('enableP2P').checked,
+    keywordBoost: document.getElementById('keywordBoost').value.trim(),
+    maxResultsPerIndexer: +document.getElementById('maxResultsPerIndexer').value || 0,
   };
 
   if (jackettUrl) prefs.jackett = { url: jackettUrl, key: jackettKey };
-  if (stremthruUrl) prefs.stremthru = { url: stremthruUrl, key: stremthruKey };
 
-  // ── Debrid Nativo ──────────────────────────────────────
+  // Debrid Nativo
   if (isNative) {
-    const mode   = state.debridMode;
-    const tbKey  = document.getElementById('tbKey').value.trim();
-    const rdKey  = document.getElementById('rdKey').value.trim();
-
-    if (mode === 'torbox'     && !tbKey) throw new Error('tb_key_missing');
-    if (mode === 'realdebrid' && !rdKey) throw new Error('rd_key_missing');
-    if (mode === 'dual' && !tbKey && !rdKey) throw new Error('dual_key_missing');
-
-    prefs.debridConfig = { mode, torboxKey: tbKey || '', rdKey: rdKey || '' };
-
-    const nameMap = { torbox: 'ProwJack [TB]', realdebrid: 'ProwJack [RD]', dual: 'ProwJack PRO' };
-    prefs.addonName = nameMap[mode] || 'ProwJack PRO';
+    const tbKey = document.getElementById('tbKey').value.trim();
+    const rdKey = document.getElementById('rdKey').value.trim();
+    
+    if (!tbKey && !rdKey) throw new Error('native_keys_missing');
+    
+    prefs.debridConfig = {
+      mode: tbKey && rdKey ? 'dual' : (tbKey ? 'torbox' : 'realdebrid'),
+      torboxKey: tbKey || '',
+      rdKey: rdKey || ''
+    };
   }
 
-  if (!isNative) prefs.addonName = 'ProwJack PRO';
+  // Stremthru
+  if (isStremThru) {
+    const stUrl = document.getElementById('stUrl').value.trim().replace(/\/$/, '');
+    const stStore1 = document.getElementById('stStore1').value;
+    const stToken1 = document.getElementById('stToken1').value.trim();
+    const stStore2 = document.getElementById('stStore2').value;
+    const stToken2 = document.getElementById('stToken2').value.trim();
+
+    if (!stToken1) throw new Error("stToken1_missing");
+
+    const storesArray = [{ c: stStore1, t: stToken1 }];
+    if (stStore2 && stToken2) {
+      storesArray.push({ c: stStore2, t: stToken2 });
+    }
+
+    prefs.stConfig = { url: stUrl, stores: storesArray };
+  }
+
+  // Nome do addon
+  if (isNative && isStremThru) {
+    prefs.addonName = 'ProwJack [ST]';
+  } else if (isNative) {
+    const nameMap = { torbox: 'ProwJack [TB]', realdebrid: 'ProwJack [RD]', dual: 'ProwJack PRO' };
+    prefs.addonName = nameMap[prefs.debridConfig.mode] || 'ProwJack PRO';
+  } else if (isStremThru) {
+    prefs.addonName = 'ProwJack [ST]';
+  } else {
+    prefs.addonName = 'ProwJack PRO';
+  }
 
   return prefs;
 }
 
 function generate() {
   try {
-    const prefs   = buildPrefs();
+    const prefs = buildPrefs();
+    
+    // Se Stremthru está ativo, gera URL do Stremthru Wrap
+    if (prefs.stConfig) {
+      const { stConfig, debrid, ...prowjackPrefs } = prefs;
+      const encoded = encodeBaseURL(prowjackPrefs);
+      const prowjackManifest = `${location.origin}/${encoded}/manifest.json`;
+      
+      const storeCodeMap = { torbox: 'tb', realdebrid: 'rd', alldebrid: 'ad', debridlink: 'dl', premiumize: 'pm', offcloud: 'oc' };
+      const wrapConfig = {
+        upstreams: [{ u: prowjackManifest }],
+        stores: prefs.stConfig.stores.map(s => ({ c: storeCodeMap[s.c] || s.c, t: s.t })),
+        name: 'ProwJack [ST]'
+      };
+      
+      const wrapEncoded = btoa(JSON.stringify(wrapConfig));
+      const finalManifestUrl = `${prefs.stConfig.url}/stremio/wrap/${wrapEncoded}/manifest.json`;
+      const finalStremioUrl = finalManifestUrl.replace('https://', 'stremio://');
+
+      if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
+        alert("⚠️ AVISO: Usando 'localhost', o StremThru remoto não conseguirá acessar este ProwJack. Use seu IP ou domínio público!");
+      }
+
+      document.getElementById('ibox-url').textContent = finalManifestUrl;
+      document.getElementById('ibox-url').className = 'ibox-url';
+
+      const link = document.getElementById('stremio-a');
+      link.href = finalStremioUrl;
+      link.style.pointerEvents = 'auto';
+      link.style.opacity = '1';
+
+      toast('✔ URL do Stremthru Wrap gerada!', 'ok');
+      return;
+    }
+    
     const encoded = encodeBaseURL(prefs);
     const finalManifestUrl = `${location.origin}/${encoded}/manifest.json`;
-    const finalStremioUrl  = `stremio://${location.host}/${encoded}/manifest.json`;
-
-    if (prefs.stConfig && (location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
-      alert("⚠️ AVISO: Usando 'localhost', o StremThru remoto não conseguirá alcançar este ProwJack. Use seu IP ou domínio público!");
-    }
+    const finalStremioUrl = `stremio://${location.host}/${encoded}/manifest.json`;
 
     document.getElementById('ibox-url').textContent = finalManifestUrl;
-    document.getElementById('ibox-url').className   = 'ibox-url';
+    document.getElementById('ibox-url').className = 'ibox-url';
 
     const link = document.getElementById('stremio-a');
     link.href = finalStremioUrl;
@@ -810,15 +862,16 @@ function generate() {
       : '';
 
     toast(`✔ URL gerada! ${langLabel}${debridLabel}`, 'ok');
-  } catch(err) {
-    const msgs = {
-      tb_key_missing:   'ERRO: API Key do TorBox é obrigatória!',
-      rd_key_missing:   'ERRO: API Key do Real-Debrid é obrigatória!',
-      dual_key_missing: 'ERRO: Insira ao menos uma API Key (TorBox ou Real-Debrid)!',
-    };
-    toast(msgs[err.message] || 'Erro desconhecido', 'err');
-    if (err.message === 'tb_key_missing')   document.getElementById('tbKey').focus();
-    if (err.message === 'rd_key_missing')   document.getElementById('rdKey').focus();
+  } catch (err) {
+    if (err.message === 'stToken1_missing') {
+      toast('ERRO: O Token do Serviço 1 é obrigatório!', true);
+      document.getElementById('stToken1').focus();
+    } else if (err.message === 'native_keys_missing') {
+      toast('ERRO: Configure ao menos uma chave (TorBox ou Real-Debrid)!', true);
+      document.getElementById('tbKey').focus();
+    } else {
+      toast('Erro desconhecido', true);
+    }
   }
 }
 
@@ -843,3 +896,4 @@ window.addEventListener('load', async () => {
 </script>
 </body>
 </html>
+
