@@ -1621,7 +1621,11 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     }
 
     const maxOut = prefs.maxResults || 20;
-    const topCandidates = filteredCandidates.slice(0, maxOut);
+    // Em modo debrid, expande candidatos para cache check (todos os filtrados, não só top N)
+    const cacheCheckCandidates = isDebridMode && !prefs.stConfig
+      ? filteredCandidates
+      : filteredCandidates.slice(0, maxOut);
+    const topCandidates = cacheCheckCandidates;
     console.log(`Extraindo InfoHashes de ${topCandidates.length} candidatos...`);
     
     const withHashes = (await Promise.all(
@@ -1773,16 +1777,17 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
               const hostUrl = `${req.headers['x-forwarded-proto'] || req.protocol}://${req.headers['x-forwarded-host'] || req.get('host')}`;
               const linkParam = r.Link ? `&link=${encodeURIComponent(r.Link)}` : "";
               const addUrl = `${hostUrl}/${req.params.userConfig}/debrid-add/${provider}/${resolved.infoHash}?magnet=${encodeURIComponent(magnet)}${linkParam}`;
+              const cacheEmoji = resObj.cached ? "⚡️" : "⬇️";
               const streamName = isDual
-                ? `${addonName}\n⬇️ ${resLabelStr} ${providerTag}`
-                : `${addonName}\n⬇️ ${resLabelStr}`;
+                ? `${addonName}\n${cacheEmoji} ${resLabelStr} ${providerTag}`
+                : `${addonName}\n${cacheEmoji} ${resLabelStr}`;
 
               const debridOption = {
                 name: streamName,
                 description: description,
                 url: addUrl,
                 indexer: renameIndexer(indexerName),
-                _cached: false,
+                _cached: !!resObj.cached,
                 behaviorHints: { notWebReady: true },
               };
 
