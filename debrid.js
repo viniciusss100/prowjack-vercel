@@ -205,36 +205,52 @@ async function torboxAddTorrent(magnet, key, addOnlyIfCached = false, torrentBuf
 
 async function rdBatchCheckCache(hashes, key, bufferMap = {}) {
   if (!hashes || !hashes.length) return {};
-  const resultMap = {};
   const headersAuth = { Authorization: `Bearer ${key}` };
+  const headersForm = { ...headersAuth, "Content-Type": "application/x-www-form-urlencoded" };
+  const resultMap = {};
 
-  // Usa instantAvailability para verificar cache sem adicionar torrents
-  const chunks = [];
-  for (let i = 0; i < hashes.length; i += 100) chunks.push(hashes.slice(i, i + 100));
+  // instantAvailability foi desativado pelo RD — verificamos cache via add+selectFiles+info+delete
+  // Torrents cached ficam "downloaded" imediatamente após selectFiles
+  await Promise.allSettled(hashes.map(async hash => {
+    let torrentId;
+    try {
+      const buf = bufferMap[hash];
+      if (buf) {
+        const enriched = injectTrackers(buf);
+        const r = await axios.put("https://api.real-debrid.com/rest/1.0/torrents/addTorrent", enriched,
+          { headers: { ...headersAuth, "Content-Type": "application/x-bittorrent" }, timeout: 10000, validateStatus: s => s < 500 });
+        torrentId = r.data?.id;
+      } else {
+        const magnet = buildMagnet(hash, null, hash);
+        const r = await axios.post("https://api.real-debrid.com/rest/1.0/torrents/addMagnet",
+          `magnet=${encodeURIComponent(magnet)}`,
+          { headers: headersForm, timeout: 10000, validateStatus: s => s < 500 });
+        torrentId = r.data?.id;
+      }
+      if (!torrentId) return;
 
-  const results = await Promise.allSettled(
-    chunks.map(chunk =>
-      axios.get("https://api.real-debrid.com/rest/1.0/torrents/instantAvailability/" + chunk.join("/"), {
-        headers: headersAuth,
-        timeout: 10000,
-        validateStatus: s => s < 500,
-      })
-    )
-  );
+      await axios.post(`https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${torrentId}`,
+        "files=all", { headers: headersForm, timeout: 8000, validateStatus: s => s < 500 });
 
-  for (const r of results) {
-    if (r.status !== "fulfilled") continue;
-    const data = r.value.data;
-    if (!data || typeof data !== "object") continue;
+      const info = await axios.get(`https://api.real-debrid.com/rest/1.0/torrents/info/${torrentId}`,
+        { headers: headersAuth, timeout: 8000 });
 
-    for (const [hash, variants] of Object.entries(data)) {
-      if (!variants || typeof variants !== "object") continue;
-      const rdVariants = variants.rd || [];
-      if (Array.isArray(rdVariants) && rdVariants.length > 0) {
-        resultMap[hash.toLowerCase()] = { rd: rdVariants };
+      if (info.data?.status === "downloaded" && info.data?.links?.length) {
+        // Monta estrutura compatível com o formato antigo { rd: [{ fileId: { filename, filesize } }] }
+        const rdVariant = {};
+        for (const f of (info.data.files || [])) {
+          if (f.selected) rdVariant[String(f.id)] = { filename: f.path?.split("/").pop() || f.path || "", filesize: f.bytes || 0 };
+        }
+        resultMap[hash.toLowerCase()] = { rd: [rdVariant], _links: info.data.links };
+      }
+    } catch {}
+    finally {
+      if (torrentId) {
+        axios.delete(`https://api.real-debrid.com/rest/1.0/torrents/delete/${torrentId}`,
+          { headers: headersAuth, timeout: 6000 }).catch(() => {});
       }
     }
-  }
+  }));
 
   return resultMap;
 }
@@ -448,6 +464,22 @@ async function _resolveRD(infoHash, magnet, season, episode, isAnime, key, rdCac
   if (rdCacheEntry && Array.isArray(rdCacheEntry.rd) && rdCacheEntry.rd.length > 0) {
     const entry = rdCacheEntry.rd[0];
     const fileIds = rdPickFileIds(entry, season, episode, isAnime);
+
+    // Se o batch check já obteve os links, usa diretamente sem re-adicionar
+    if (rdCacheEntry._links?.length) {
+      const linkIdx = fileIds[0] !== "all" ? Math.max(0, parseInt(fileIds[0], 10) - 1) : 0;
+      const link = rdCacheEntry._links[Math.min(linkIdx, rdCacheEntry._links.length - 1)];
+      try {
+        const headersAuth = { Authorization: `Bearer ${key}` };
+        const unresRes = await axios.post("https://api.real-debrid.com/rest/1.0/unrestrict/link",
+          `link=${encodeURIComponent(link)}`,
+          { headers: { ...headersAuth, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 12000 });
+        if (unresRes.data?.download) {
+          return { url: unresRes.data.download, provider: "Real-Debrid", filename: unresRes.data.filename || null };
+        }
+      } catch {}
+    }
+
     const result = await rdGetDirectLink(infoHash, magnet, fileIds, key, torrentBuffer);
     if (result?.download) {
       return { url: result.download, provider: "Real-Debrid", filename: result.filename || null };
