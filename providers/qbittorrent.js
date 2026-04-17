@@ -252,15 +252,22 @@ async function getPlayableLocalFile(infoHash, fileIdx, fileName) {
 }
 
 function resolveFilePath(info, file) {
-  const relative = String(file.name || "").replace(/^\/+/, "").replace(/\.\./g, "");
-  if (!relative || relative.includes("..")) {
-    throw new Error("Path traversal detectado");
+  const relative = String(file.name || "")
+    .replace(/^\/+/, "")
+    .replace(/\.\./g, "")
+    .replace(/%2e/gi, "") // Bloquear encoding
+    .replace(/%252e/gi, "") // Bloquear double encoding
+    .replace(/\\/g, "/"); // Normalizar separadores
+  
+  if (!relative || relative.includes("..") || relative.includes("%") || relative.includes("\\")) {
+    throw new Error("Path inválido detectado");
   }
+  
   const byDir = path.join(QBIT_SAVE_DIR, relative);
   if (fs.existsSync(byDir)) {
     const resolved = path.resolve(byDir);
     const base = path.resolve(QBIT_SAVE_DIR);
-    if (!resolved.startsWith(base)) {
+    if (!resolved.startsWith(base + path.sep) && resolved !== base) {
       throw new Error("Path fora do diretório permitido");
     }
     return byDir;
@@ -271,7 +278,7 @@ function resolveFilePath(info, file) {
   const finalPath = path.join(normalizedRoot, relative);
   const resolvedFinal = path.resolve(finalPath);
   const baseResolved = path.resolve(QBIT_SAVE_DIR);
-  if (!resolvedFinal.startsWith(baseResolved)) {
+  if (!resolvedFinal.startsWith(baseResolved + path.sep) && resolvedFinal !== baseResolved) {
     throw new Error("Path fora do diretório permitido");
   }
   return finalPath;
