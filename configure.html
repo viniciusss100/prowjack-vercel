@@ -339,10 +339,22 @@ hr{border:none;border-top:1px solid var(--bord);margin:16px 0}
       </div>
     </div>
 
-    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--text);font-size:12px;">
-      <input type="checkbox" id="enableP2P" style="width:16px;height:16px;accent-color:var(--amber);">
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--text);font-size:12px;margin-bottom:8px;">
+      <input type="checkbox" id="enableP2P" style="width:16px;height:16px;accent-color:var(--amber);" onchange="toggleQbitMode()">
       Habilitar P2P (qBittorrent)
     </label>
+    
+    <div id="qbitModeConfig" style="display:none;margin-left:24px;margin-bottom:14px;background:rgba(245,166,35,.05);border:1px solid var(--adim);border-radius:var(--radius);padding:10px 14px;">
+      <label style="font-size:11px;color:var(--dim);margin-bottom:6px;display:block;">Modo qBittorrent:</label>
+      <select id="qbitMode" style="width:100%;background:var(--bg);border:1px solid var(--bord2);color:var(--text);padding:6px 10px;font-family:var(--mono);font-size:11px;border-radius:var(--radius);outline:none;">
+        <option value="private">🔒 Apenas Trackers Privados (Recomendado)</option>
+        <option value="always">🌐 Sempre Disponível</option>
+      </select>
+      <p class="info" style="font-size:10px;margin-top:6px;line-height:1.6;">
+        <strong>Privado:</strong> qBit só aparece para torrents sem magnet link (trackers privados).<br>
+        <strong>Sempre:</strong> qBit disponível para todos os torrents.
+      </p>
+    </div>
   </div>
 
     </div>
@@ -731,6 +743,10 @@ function toggleDebridMode() {
   document.getElementById('stremThruConfig').style.display = document.getElementById('useStremThru').checked ? 'block' : 'none';
 }
 
+function toggleQbitMode() {
+  document.getElementById('qbitModeConfig').style.display = document.getElementById('enableP2P').checked ? 'block' : 'none';
+}
+
 function buildPrefs() {
   const selected = state.selectedIndexers.length ? state.selectedIndexers : ['all'];
   const isNative = document.getElementById('useNativeDebrid').checked;
@@ -751,6 +767,7 @@ function buildPrefs() {
     dedupe: document.getElementById('dedupeBtn').classList.contains('on'),
     debrid: isNative || isStremThru,
     enableP2P: document.getElementById('enableP2P').checked,
+    qbitMode: document.getElementById('qbitMode').value || 'private',
     keywordBoost: document.getElementById('keywordBoost').value.trim(),
     maxResultsPerIndexer: +document.getElementById('maxResultsPerIndexer').value || 0,
   };

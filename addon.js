@@ -230,6 +230,8 @@ function defaultPrefs() {
     debridConfig:    null,
     keywordBoost:           "",
     maxResultsPerIndexer:   0,
+    enableP2P:       false,
+    qbitMode:        "private", // "private" ou "always"
   };
 }
 function resolvePrefs(encoded) {
@@ -237,12 +239,34 @@ function resolvePrefs(encoded) {
   const m = { ...defaultPrefs(), ...u };
   if (!Array.isArray(m.indexers) || !m.indexers.length) m.indexers = ["all"];
   if (m.priorityLang === undefined) m.priorityLang = "pt-br";
+  
+  // Processar debridConfig e definir mode
   if (m.debridConfig && (m.debridConfig.torboxKey || m.debridConfig.rdKey)) {
     m.debrid = true;
+    
+    // Determinar mode baseado nas keys disponíveis
+    const hasTB = !!m.debridConfig.torboxKey;
+    const hasRD = !!m.debridConfig.rdKey;
+    
+    if (hasTB && hasRD) m.debridConfig.mode = 'dual';
+    else if (hasTB) m.debridConfig.mode = 'torbox';
+    else if (hasRD) m.debridConfig.mode = 'realdebrid';
+    else m.debridConfig.mode = null;
   }
+  
+  // Processar stConfig se presente
+  if (m.stConfig && Array.isArray(m.stConfig.stores) && m.stConfig.stores.length > 0) {
+    m.debrid = true;
+  }
+  
   // Migração: normalizar addonName — remover PRO e tags de serviço (ficam no name do stream)
   if (m.addonName) m.addonName = m.addonName.replace(/\s*\[(TB\+RD|TB|RD|QB|PRO|ST)\]/gi, "").replace(/\bPRO\b/g, "").trim();
   if (!m.addonName) m.addonName = "ProwJack";
+  
+  // Garantir valores padrão para qBit
+  if (m.enableP2P === undefined) m.enableP2P = false;
+  if (m.qbitMode === undefined) m.qbitMode = 'private';
+  
   return m;
 }
 // ─────────────────────────────────────────────────────────
@@ -530,6 +554,99 @@ function dedupeResults(results) {
   }
 
   return deduped;
+}
+
+// ─────────────────────────────────────────────────────────
+// DEDUP PÓS-CACHE: prioriza tracker público cacheado sobre privado
+// ─────────────────────────────────────────────────────────
+//
+// "Privado" = resultado sem MagnetUri que exigiu download do .torrent
+// (indica tracker privado). "Público" = tem MagnetUri (magnet direto).
+//
+// Lógica por grupo (mesmo título normalizado + tamanho similar ±~500MB):
+//   1. Público cacheado   → usa este, descarta privado (evita dependência do tracker privado)
+//   2. Privado cacheado   → usa este se não há público cacheado
+//   3. Público sem cache  → melhor opção sem cache
+//   4. Privado sem cache  → último recurso
+//
+// Fora do modo debrid não há info de cache, então faz dedup simples por seeders.
+function dedupeWithCachePriority(withHashes, isDebridMode) {
+  const isPrivate = r => !r.MagnetUri && !!r._resolved?.buffer;
+
+  // Bucket de tamanho: agrupa em janelas de ~500MB para tolerar diferenças entre trackers
+  const sizeBucket = r => Math.round((r.Size || 0) / 5e8);
+
+  // Passo 1: dedup exato por infoHash (sem mudança de comportamento)
+  const seenHash = new Set();
+  const noExactDups = [];
+  for (const r of withHashes) {
+    const h = r._resolved.infoHash;
+    if (seenHash.has(h)) continue;
+    seenHash.add(h);
+    noExactDups.push(r);
+  }
+
+  // Sem modo debrid: dedup simples por título+tamanho, prefere mais seeders
+  if (!isDebridMode) {
+    const seen = new Map();
+    const result = [];
+    for (const r of noExactDups) {
+      const norm = normalizeForDedupe(r.Title || "");
+      if (!norm) { result.push(r); continue; }
+      const key = `${norm}|${sizeBucket(r)}`;
+      const existing = seen.get(key);
+      if (!existing) { seen.set(key, r); result.push(r); continue; }
+      if ((r.Seeders || 0) > (existing.Seeders || 0)) {
+        const idx = result.indexOf(existing);
+        if (idx !== -1) result[idx] = r;
+        seen.set(key, r);
+      }
+    }
+    return result;
+  }
+
+  // Modo debrid: agrupa e escolhe vencedor por prioridade de cache + tracker público
+  const groups = new Map();
+  for (const r of noExactDups) {
+    const norm = normalizeForDedupe(r.Title || "");
+    // Título não normalizável: mantém sem agrupar
+    const key = norm ? `${norm}|${sizeBucket(r)}` : `__notitle__${r._resolved.infoHash}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(r);
+  }
+
+  const result = [];
+  for (const group of groups.values()) {
+    if (group.length === 1) { result.push(group[0]); continue; }
+
+    const cachedPublic   = group.filter(r => r._isCached && !isPrivate(r));
+    const cachedPrivate  = group.filter(r => r._isCached &&  isPrivate(r));
+    const uncachedPublic = group.filter(r => !r._isCached && !isPrivate(r));
+    const uncachedPrivate = group.filter(r => !r._isCached && isPrivate(r));
+
+    const bySeeds = arr => arr.slice().sort((a, b) => (b.Seeders || 0) - (a.Seeders || 0));
+
+    let winner;
+    if (cachedPublic.length) {
+      // Melhor caso: tracker público com cache — ignora o privado totalmente
+      winner = bySeeds(cachedPublic)[0];
+      if (cachedPublic.length + cachedPrivate.length + uncachedPrivate.length < group.length) {
+        // Log apenas quando realmente descartou algo
+      }
+    } else if (cachedPrivate.length) {
+      // Cache existe mas só no tracker privado
+      winner = bySeeds(cachedPrivate)[0];
+    } else if (uncachedPublic.length) {
+      // Nenhum cache: prefere tracker público (menos dependência)
+      winner = bySeeds(uncachedPublic)[0];
+    } else {
+      // Só tracker privado sem cache: mantém o melhor por seeders
+      winner = bySeeds(uncachedPrivate)[0];
+    }
+    result.push(winner);
+  }
+
+  return result;
 }
 
 function base32ToHex(b32) {
@@ -1358,17 +1475,20 @@ app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
     }
   }
 
-  // TorBox: faz polling como RD (aguarda até 180s)
+  // TorBox: faz polling com backoff exponencial (até 120s)
   if (isTB) {
-    const deadline = Date.now() + 180000;
-    const pollInterval = 3000;
-    console.log(`[ON-DEMAND] TorBox: aguardando download (até 180s)...`);
+    const deadline = Date.now() + 120000; // Reduzido de 180s para 120s
+    const delays = [2000, 3000, 5000, 8000]; // Backoff exponencial
+    let delayIndex = 0;
+    console.log(`[ON-DEMAND] TorBox: aguardando download (até 120s)...`);
 
     while (Date.now() < deadline) {
       try {
+        const remainingTime = deadline - Date.now();
         const tbRes = await axios.get("https://api.torbox.app/v1/api/torrents/mylist", {
           headers: { Authorization: `Bearer ${config.torboxKey}` },
-          timeout: 8000
+          timeout: Math.min(8000, remainingTime),
+          signal: AbortSignal.timeout(remainingTime)
         });
         
         const torrent = tbRes.data?.data?.find(t => 
@@ -1392,26 +1512,32 @@ app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
         console.log(`[ON-DEMAND] TorBox polling erro: ${err.message}`);
       }
 
-      if (Date.now() + pollInterval < deadline) {
-        await new Promise(resolve => setTimeout(resolve, pollInterval));
+      const pollDelay = delays[Math.min(delayIndex, delays.length - 1)];
+      delayIndex++;
+      
+      if (Date.now() + pollDelay < deadline) {
+        await new Promise(resolve => setTimeout(resolve, pollDelay));
       } else {
         break;
       }
     }
 
-    console.log(`[ON-DEMAND] TorBox timeout (180s) — ainda processando`);
+    console.log(`[ON-DEMAND] TorBox timeout (120s) — ainda processando`);
     res.setHeader("Retry-After", "10");
     return res.status(202).send("Download em andamento no TorBox. O player tentará novamente automaticamente.");
   }
 
-  // Polling: aguarda até 180s
-  const deadline = Date.now() + 180000;
-  const pollInterval = 3000;
+  // Polling RD: com backoff exponencial (até 120s)
+  const deadline = Date.now() + 120000; // Reduzido de 180s para 120s
+  const delays = [2000, 3000, 5000, 8000]; // Backoff exponencial
+  let delayIndex = 0;
 
-  console.log(`[ON-DEMAND] Aguardando processamento (até 180s)...`);
+  console.log(`[ON-DEMAND] Aguardando processamento (até 120s)...`);
 
   while (Date.now() < deadline) {
     try {
+      const remainingTime = deadline - Date.now();
+      
       if (isRD) {
         const { rdFindExistingTorrent } = require("./debrid");
         const existing = await rdFindExistingTorrent(infoHash, config.rdKey);
@@ -1425,7 +1551,8 @@ app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
                 Authorization: `Bearer ${config.rdKey}`, 
                 "Content-Type": "application/x-www-form-urlencoded" 
               }, 
-              timeout: 12000 
+              timeout: Math.min(12000, remainingTime),
+              signal: AbortSignal.timeout(remainingTime)
             }
           );
           
@@ -1440,14 +1567,17 @@ app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
       console.log(`[ON-DEMAND] Erro no polling: ${err.message}`);
     }
 
-    if (Date.now() + pollInterval < deadline) {
-      await new Promise(resolve => setTimeout(resolve, pollInterval));
+    const pollDelay = delays[Math.min(delayIndex, delays.length - 1)];
+    delayIndex++;
+    
+    if (Date.now() + pollDelay < deadline) {
+      await new Promise(resolve => setTimeout(resolve, pollDelay));
     } else {
       break;
     }
   }
 
-  console.log(`[ON-DEMAND] Timeout (180s) — ainda processando`);
+  console.log(`[ON-DEMAND] Timeout (120s) — ainda processando`);
   res.setHeader("Retry-After", "10");
   return res.status(202).send("Download em andamento. O player tentará novamente automaticamente.");
 });
@@ -1677,8 +1807,23 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       console.log(`[STREMTHRU] Proxy ativo - cache check desabilitado`);
     }
 
-    // Streams sintéticos desabilitados: hashes torznab sem título não podem ser validados
-    // contra o conteúdo buscado, gerando resultados irrelevantes.
+    // ── Dedup pós-cache: agrupa por conteúdo similar e elege vencedor ──────────
+    // Objetivo: se o mesmo arquivo existe num tracker público (e está cacheado no
+    // debrid), descarta a versão do tracker privado para não depender dele.
+    //
+    // Prioridade dentro de cada grupo (mesmo título normalizado + tamanho ~±500MB):
+    //   1. Tracker PÚBLICO cacheado   → usa este, descarta todos os outros do grupo
+    //   2. Tracker PRIVADO cacheado   → usa se não há público cacheado
+    //   3. Tracker PÚBLICO sem cache  → melhor opção quando nada está em cache
+    //   4. Tracker PRIVADO sem cache  → último recurso
+    //
+    // "Privado" = sem MagnetUri, com buffer .torrent baixado (típico de tracker privado)
+    // "Público" = tem MagnetUri (magnet link disponível publicamente)
+    const dedupedWithHashes = dedupeWithCachePriority(withHashes, isDebridMode && !prefs.stConfig);
+    if (dedupedWithHashes.length < withHashes.length) {
+      const removed = withHashes.length - dedupedWithHashes.length;
+      console.log(`[DEDUP] ${withHashes.length} → ${dedupedWithHashes.length} candidatos (-${removed} duplicatas, preferiu público cacheado)`);
+    }
 
     // ── Resolução de streams finais ──────────────────────────────────────────
     const streamMeta = {
@@ -1690,10 +1835,10 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     };
 
     const resolvedAll = await Promise.all(
-      withHashes.map(async r => {
+      dedupedWithHashes.map(async r => {
         try {
         const resolved = r._resolved;
-        const indexerName = r.Tracker || r.TrackerId || "Unknown";
+        const indexerName = r.TrackerId || r.Tracker || r.Indexer || "Unknown";
         const { name, description: descNoSeeds, resLabel } = formatStream(r, indexerName, parsed.isAnime, prefs, false, streamMeta);
         const { description } = formatStream(r, indexerName, parsed.isAnime, prefs, true, streamMeta);
         const matchedFile = (type === "series" || parsed.isAnime)
@@ -1704,6 +1849,9 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         const localPlayable = isQbitConfigured()
           ? await getPlayableLocalFile(resolved.infoHash, matchedFile?.idx ?? null, matchedFile?.name || null).catch(() => null)
           : null;
+
+        // Detectar tracker privado: sem MagnetUri e tem buffer .torrent
+        const isPrivateTracker = !r.MagnetUri && !!resolved.buffer;
 
         const buildQbitStream = async (label) => {
           const jobToken = await saveQbitJob({
@@ -1718,7 +1866,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             : `${prefs.addonName || "ProwJack PRO"}\n⬇️ ${resLabel || "Links"} [QB]`;
           return {
             name: qbitName,
-            description: [description, matchedFile?.name ? `📂 ${matchedFile.name}` : ""].filter(Boolean).join("\n"),
+            description: [description, matchedFile?.name ? `📂 ${matchedFile.name}` : "", isPrivateTracker ? "🔒 Tracker Privado" : ""].filter(Boolean).join("\n"),
             url: `${publicBase}/${req.params.userConfig}/qbit/${jobToken}`,
             indexer: renameIndexer(indexerName),
             _cached: !!localPlayable,
@@ -1792,8 +1940,14 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
               };
 
               if (prefs.enableP2P && isQbitConfigured()) {
-                const qbitOption = await buildQbitStream(localPlayable ? "💾" : "HTTP");
-                return [debridOption, qbitOption];
+                // Verificar se deve oferecer qBit baseado no modo
+                const shouldOfferQbit = prefs.qbitMode === 'always' || 
+                                       (prefs.qbitMode === 'private' && isPrivateTracker);
+                
+                if (shouldOfferQbit) {
+                  const qbitOption = await buildQbitStream(localPlayable ? "💾" : "HTTP");
+                  return [debridOption, qbitOption];
+                }
               }
 
               return debridOption;
@@ -1802,12 +1956,16 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           })).then(items => items.filter(Boolean));
         }
 
-        if (prefs.enableP2P && isQbitConfigured() && (localPlayable || r.Link || magnet)) {
+        // Verificar se deve oferecer qBit baseado no modo
+        const shouldOfferQbit = prefs.enableP2P && isQbitConfigured() && 
+          (prefs.qbitMode === 'always' || (prefs.qbitMode === 'private' && isPrivateTracker));
+
+        if (shouldOfferQbit && (localPlayable || r.Link || magnet)) {
           const qbitStream = await buildQbitStream(localPlayable ? "💾" : "HTTP");
           const sources = r.MagnetUri ? [r.MagnetUri] : (resolved.infoHash ? [buildMagnet(resolved.infoHash, null, r.Title)] : []);
           if (!sources.length) return qbitStream;
           const p2pStream = {
-            name, description: [description, matchedFile?.name ? `📂 ${matchedFile.name}` : ""].filter(Boolean).join("\n"),
+            name, description: [description, matchedFile?.name ? `📂 ${matchedFile.name}` : "", isPrivateTracker ? "🔒 Tracker Privado" : ""].filter(Boolean).join("\n"),
             infoHash: resolved.infoHash, fileIdx: matchedFile?.idx, sources,
             indexer: renameIndexer(indexerName),
             behaviorHints: { filename: matchedFile?.name, videoSize: matchedFile?.size, bingeGroup: parsed.isAnime ? `prowjack|anime|${displayTitle}` : `prowjack|${resolved.infoHash}` },
@@ -1842,9 +2000,9 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
     const allStreams = resolvedAll.flat(2).filter(Boolean);
 
-    // Propaga metadados de ordenação: cada resolvedAll[i] corresponde a withHashes[i]
+    // Propaga metadados de ordenação: cada resolvedAll[i] corresponde a dedupedWithHashes[i]
     resolvedAll.forEach((streamOrArr, i) => {
-      const r = withHashes[i];
+      const r = dedupedWithHashes[i];
       if (!r) return;
       const items = Array.isArray(streamOrArr) ? streamOrArr.flat() : [streamOrArr];
       for (const s of items) {
