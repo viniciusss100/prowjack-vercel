@@ -521,14 +521,8 @@ async function _resolveTorbox(infoHash, magnet, season, episode, isAnime, key, t
       return { url, provider: "TorBox", filename: picked.name || null };
     }
 
-    // Fallback: sem ID no cache entry (ou entry === true), adiciona para obter o ID
-    const addedTorrentId = await torboxAddTorrent(magnet, key, true, torrentBuffer);
-    if (addedTorrentId && addedTorrentId !== true) {
-      const url = torboxBuildPermalink(addedTorrentId, picked.fileId, key);
-      // Remove torrent recém-adicionado após obter o link (evita hit&run em trackers privados)
-      await torboxDeleteTorrent(addedTorrentId, key);
-      return { url, provider: "TorBox", filename: picked.name || null };
-    }
+    // Sem torrent_id: retorna como cached mas sem link direto (será adicionado ao clicar)
+    return { queued: true, provider: "TorBox", cached: true };
   }
   return { queued: true, provider: "TorBox" };
 }
