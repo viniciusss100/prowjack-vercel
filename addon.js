@@ -916,9 +916,12 @@ function formatStream(r, indexerName, isAnime = false, prefs = {}, showSeeds = t
   const cleanIndexer = renameIndexer(indexerName);
   const addonName    = prefs.addonName || "ProwJack PRO";
   const resLabel     = res ? res.label : "Desconhecida";
+  const PT_BR_INDEXERS = /capybara|samaritano|bludv|comando|torrent9|filmesbr|cinemasbr|brazilbr/i;
+  const implicitPtBr = !langs.length && PT_BR_INDEXERS.test(cleanIndexer);
   const langDisplay  = [];
   if (langs.length) langDisplay.push(langs.map(l => `${l.emoji} ${l.label}`).join(" / "));
-  else langDisplay.push("🌐 Original");
+  else if (implicitPtBr) langDisplay.push("🇧🇷 PT-BR");
+  else langDisplay.push("🗺️ Original");
   const isMulti = /(multi|dual)[-.\\s]?(audio)?/i.test(t);
   if      (isMulti && isAnime)                              langDisplay.push("🎧 Multi/Dual-Audio");
   else if (isMulti && !langs.some(l => l.code === "pt-br")) langDisplay.push("🎧 Multi");
@@ -934,10 +937,10 @@ function formatStream(r, indexerName, isAnime = false, prefs = {}, showSeeds = t
 
   const desc = [
     titleLine,
-    [qual ? `🎥 ${qual.label}` : "", vis.length ? `📺 ${vis.map(v=>v.label).join(" | ")}` : "", codec ? `🎞️ ${codec.label}` : "", langStr].filter(Boolean).join("  "),
+    [res ? resLabel : "", qual ? `🎥 ${qual.label}` : "", vis.length ? `📺 ${vis.map(v=>v.label).join(" | ")}` : "", codec ? `🎞️ ${codec.label}` : "", langStr].filter(Boolean).join("  "),
     [audios.length ? `🎧 ${audios.map(a=>a.label).join(" | ")}` : ""].filter(Boolean).join("  "),
-    [size ? `📦 ${size}` : "", showSeeds ? `🌱 ${seeds} seeds` : ""].filter(Boolean).join("  "),
-    [`📡 ${cleanIndexer}`, group ? `🏷️ ${group}` : ""].filter(Boolean).join("  "),
+    [size ? `💾 ${size}` : "", showSeeds ? `👤 ${seeds}` : ""].filter(Boolean).join("  "),
+    [`⚙️ ${cleanIndexer}`, group ? `🏷️ ${group}` : ""].filter(Boolean).join("  "),
     p2pLabel,
   ].filter(Boolean).join("\n");
   return { name: `${addonName}\n${resLabel}`, description: desc.trim(), resLabel };
@@ -1784,7 +1787,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
       const [rdResult, tbResult] = await Promise.all([
         (mode === "realdebrid" || mode === "dual") && rdKey
-          ? rdBatchCheckCache(allHashes, rdKey, bufferMap) : Promise.resolve({}),
+          ? rdBatchCheckCache(allHashes, rdKey, bufferMap, privateHashes) : Promise.resolve({}),
         (mode === "torbox" || mode === "dual") && torboxKey
           ? torboxBatchCheckCache(allHashes, torboxKey, privateHashes) : Promise.resolve({}),
       ]);
@@ -1838,7 +1841,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       dedupedWithHashes.map(async r => {
         try {
         const resolved = r._resolved;
-        const indexerName = r.TrackerId || r.Tracker || r.Indexer || "Unknown";
+        const indexerName = r.Tracker || r.TrackerId || r.Indexer || "Unknown";
         const { name, description: descNoSeeds, resLabel } = formatStream(r, indexerName, parsed.isAnime, prefs, false, streamMeta);
         const { description } = formatStream(r, indexerName, parsed.isAnime, prefs, true, streamMeta);
         const matchedFile = (type === "series" || parsed.isAnime)
@@ -1871,7 +1874,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             indexer: renameIndexer(indexerName),
             _cached: !!localPlayable,
             behaviorHints: {
-              filename: matchedFile?.name,
+              filename: matchedFile?.name || r.Title,
               videoSize: matchedFile?.size,
               bingeGroup: `prowjack|qbit|${resolved.infoHash}`,
               notWebReady: false,
@@ -1915,7 +1918,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
                 indexer: renameIndexer(indexerName),
                 _cached: true,
                 behaviorHints: {
-                  filename: debridFilename, videoSize: matchedFile?.size, bingeGroup: `prowjack|debrid|${resolved.infoHash}`, notWebReady: false,
+                  filename: debridFilename || r.Title, videoSize: matchedFile?.size, bingeGroup: `prowjack|debrid|${resolved.infoHash}`, notWebReady: false,
                 },
               };
             }
@@ -1968,7 +1971,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             name, description: [description, matchedFile?.name ? `📂 ${matchedFile.name}` : "", isPrivateTracker ? "🔒 Tracker Privado" : ""].filter(Boolean).join("\n"),
             infoHash: resolved.infoHash, fileIdx: matchedFile?.idx, sources,
             indexer: renameIndexer(indexerName),
-            behaviorHints: { filename: matchedFile?.name, videoSize: matchedFile?.size, bingeGroup: parsed.isAnime ? `prowjack|anime|${displayTitle}` : `prowjack|${resolved.infoHash}` },
+            behaviorHints: { filename: matchedFile?.name || r.Title, videoSize: matchedFile?.size, bingeGroup: parsed.isAnime ? `prowjack|anime|${displayTitle}` : `prowjack|${resolved.infoHash}` },
           };
           return [qbitStream, p2pStream];
         }
@@ -1978,7 +1981,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         if (prefs.stConfig) {
           const storeCodeMap = { torbox: "TB", realdebrid: "RD" };
           const desc = [description, matchedFile?.name ? `📂 ${matchedFile.name}` : ""].filter(Boolean).join("\n");
-          const bh = { filename: matchedFile?.name, videoSize: matchedFile?.size, bingeGroup: `prowjack|${resolved.infoHash}`, notWebReady: true };
+          const bh = { filename: matchedFile?.name || r.Title, videoSize: matchedFile?.size, bingeGroup: `prowjack|${resolved.infoHash}`, notWebReady: true };
           return prefs.stConfig.stores.map(s => {
             const tag = storeCodeMap[s.c] || s.c.toUpperCase();
             return { name: `${name.split("\n")[0]}\n⬇️ ${resLabel || "Links"} [${tag}]`, description: desc, url: sources[0], indexer: renameIndexer(indexerName), behaviorHints: bh };
@@ -1990,7 +1993,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           infoHash: resolved.infoHash, fileIdx: matchedFile?.idx, sources,
           indexer: renameIndexer(indexerName),
           behaviorHints: {
-            filename: matchedFile?.name, videoSize: matchedFile?.size,
+            filename: matchedFile?.name || r.Title, videoSize: matchedFile?.size,
             bingeGroup: parsed.isAnime ? `prowjack|anime|${displayTitle}` : `prowjack|${resolved.infoHash}`,
           },
         };
