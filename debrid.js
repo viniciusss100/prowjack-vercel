@@ -78,93 +78,67 @@ async function rdAddTorrent(magnet, key, buffer = null) {
   }
 }
 
-// NOVA VERSÃO - Cache check otimizado
+// Cache check usando /instantAvailability — NÃO adiciona nada à conta do usuário
 async function rdBatchCheckCache(hashes, key, bufferMap = {}, privateHashes = new Set()) {
   if (!hashes || !hashes.length) return {};
 
   const headersAuth = { Authorization: `Bearer ${key}` };
-  const headersForm = { ...headersAuth, "Content-Type": "application/x-www-form-urlencoded" };
   const resultMap = {};
 
-  // Ignora trackers privados no cache check
+  // Nunca sondamos trackers privados: adicionar ao RD consome ratio mesmo que se delete depois
   const publicHashes = hashes.filter(h => !privateHashes.has(h));
-  if (!publicHashes.length) return resultMap;
+  if (!publicHashes.length) {
+    console.log(`[RD Cache Check] Todos os hashes são de trackers privados — pulando verificação`);
+    return resultMap;
+  }
 
-  await Promise.allSettled(publicHashes.map(async hash => {
-    let torrentId;
+  // O endpoint /instantAvailability aceita até ~100 hashes separados por "/"
+  // e retorna o mapa de disponibilidade SEM adicionar nada à conta.
+  const BATCH_SIZE = 40; // conservador para evitar URL muito longa
+  for (let i = 0; i < publicHashes.length; i += BATCH_SIZE) {
+    const batch = publicHashes.slice(i, i + BATCH_SIZE);
+    const hashPath = batch.join("/");
 
     try {
-      const buf = bufferMap[hash];
-
-      if (buf) {
-        const enriched = injectTrackers(buf);
-        const r = await axios.put(
-          "https://api.real-debrid.com/rest/1.0/torrents/addTorrent",
-          enriched,
-          {
-            headers: { ...headersAuth, "Content-Type": "application/x-bittorrent" },
-            timeout: 10000,
-            validateStatus: s => s < 500
-          }
-        );
-        torrentId = r.data?.id;
-      } else {
-        const magnet = buildMagnet(hash, null, hash);
-        const r = await axios.post(
-          "https://api.real-debrid.com/rest/1.0/torrents/addMagnet",
-          `magnet=${encodeURIComponent(magnet)}`,
-          { headers: headersForm, timeout: 10000, validateStatus: s => s < 500 }
-        );
-        torrentId = r.data?.id;
-      }
-
-      if (!torrentId) return;
-
-      await axios.post(
-        `https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${torrentId}`,
-        "files=all",
-        { headers: headersForm, timeout: 8000, validateStatus: s => s < 500 }
+      const res = await axios.get(
+        `https://api.real-debrid.com/rest/1.0/torrents/instantAvailability/${hashPath}`,
+        { headers: headersAuth, timeout: 10000 }
       );
 
-      const info = await axios.get(
-        `https://api.real-debrid.com/rest/1.0/torrents/info/${torrentId}`,
-        { headers: headersAuth, timeout: 8000 }
-      );
+      const data = res.data || {};
 
-      if (info.data?.status === "downloaded" && info.data?.links?.length) {
-        const rdVariant = {};
-        for (const f of (info.data.files || [])) {
-          if (f.selected) {
-            rdVariant[String(f.id)] = {
-              filename: f.path?.split("/").pop() || f.path || "",
-              filesize: f.bytes || 0
-            };
-          }
+      for (const hash of batch) {
+        // A API retorna as chaves em maiúsculo ou minúsculo dependendo da versão
+        const entry = data[hash.toLowerCase()] || data[hash.toUpperCase()] || data[hash];
+        if (!entry) continue;
+
+        // Formato retornado: { rd: [ { "1": { filename, filesize }, ... } ] }
+        // Verifica se há pelo menos uma variante com arquivos
+        const rdVariants = Array.isArray(entry.rd) ? entry.rd : [];
+        const hasFiles = rdVariants.some(v => v && Object.keys(v).length > 0);
+
+        if (hasFiles) {
+          // Normaliza variantes para o formato interno { filename, filesize }
+          const normalizedVariants = rdVariants.map(v => {
+            const variant = {};
+            for (const [id, f] of Object.entries(v)) {
+              variant[String(id)] = {
+                filename: f.filename || f.path || "",
+                filesize: f.filesize || f.bytes || 0,
+              };
+            }
+            return variant;
+          });
+          resultMap[hash.toLowerCase()] = { rd: normalizedVariants };
+          console.log(`[RD Cache Check] ✅ ${hash.slice(0, 8)} cacheado (${normalizedVariants.length} variante(s))`);
         }
-        resultMap[hash.toLowerCase()] = { rd: [rdVariant], _links: info.data.links };
       }
-      
-      // SEMPRE deleta após verificar cache (não deixa no RD)
-      try {
-        await axios.delete(
-          `https://api.real-debrid.com/rest/1.0/torrents/delete/${torrentId}`,
-          { headers: headersAuth, timeout: 3000 }
-        );
-        console.log(`[RD Cache Check] Torrent ${hash.slice(0, 8)} deletado após verificação`);
-      } catch (err) {
-        console.warn(`[RD Cache Check] Falha ao deletar ${hash.slice(0, 8)}: ${err.message}`);
-      }
-      
-    } catch {
-      if (torrentId) {
-        await axios.delete(
-          `https://api.real-debrid.com/rest/1.0/torrents/delete/${torrentId}`,
-          { headers: headersAuth, timeout: 3000 }
-        ).catch(() => {});
-      }
+    } catch (err) {
+      console.error(`[RD Cache Check] Erro no instantAvailability: ${err.message}`);
     }
-  }));
+  }
 
+  console.log(`[RD Cache Check] ${Object.keys(resultMap).length}/${publicHashes.length} hashes em cache (${privateHashes.size} privados ignorados)`);
   return resultMap;
 }
 
