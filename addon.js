@@ -6,12 +6,11 @@ const Redis   = require("ioredis");
 const path    = require("path");
 const fs      = require("fs");
 const { resolveDebridStream, buildMagnet } = require("./debrid");
+const { startRssPoller, buildRssCacheKey, CATALOG_KEY } = require("./rssPoller");
 const { injectTrackers, extractTrackers, EXTRA_TRACKERS } = require("./torrentEnrich");
 const {
   isConfigured: isQbitConfigured,
-  setCredentials: setQbitCredentials,
   ensureTorrentReady,
-  waitForBuffer: waitForQbitBuffer,
   getPlayableLocalFile,
   streamTorrentFile,
 } = require("./providers/qbittorrent");
@@ -148,6 +147,142 @@ async function loadQbitJob(token) {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
+function toBase64Url(value) {
+  return Buffer.from(String(value || ""), "utf8").toString("base64url");
+}
+
+function fromBase64Url(value) {
+  try { return Buffer.from(String(value || ""), "base64url").toString("utf8"); }
+  catch { return null; }
+}
+
+function getPreferredRssIndexers(prefs) {
+  if (Array.isArray(prefs?.rssIndexers) && prefs.rssIndexers.length) return prefs.rssIndexers.filter(Boolean);
+  if (Array.isArray(prefs?.indexers) && prefs.indexers.length && !prefs.indexers.includes("all")) return prefs.indexers.filter(Boolean);
+  return null;
+}
+
+async function loadRssItemsForType(prefs, rssType) {
+  const allowedRss = getPreferredRssIndexers(prefs);
+  const keys = allowedRss
+    ? await Promise.all(allowedRss.map(ix => rc.keys(`rss:${CACHE_VERSION}:${ix}:${rssType}:*`))).then(a => a.flat())
+    : await rc.keys(`rss:${CACHE_VERSION}:*:${rssType}:*`);
+  if (!keys.length) return [];
+  return (await Promise.all(keys.map(async key => {
+    try {
+      const raw = await rc.get(key);
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  }))).flat();
+}
+
+function getRssItemToken(item) {
+  const raw = item?.InfoHash || item?.Guid || item?.Link || item?.MagnetUri || "";
+  return raw ? toBase64Url(raw) : null;
+}
+
+function parseRssMetaId(id) {
+  if (!String(id || "").startsWith("rssmeta:")) return null;
+  const parts = String(id).split(":");
+  if (parts.length < 3) return null;
+  return { catalogType: parts[1], metaId: parts.slice(2).join(":") };
+}
+
+function parseRssItemId(id) {
+  if (!String(id || "").startsWith("rssitem:")) return null;
+  const parts = String(id).split(":");
+  if (parts.length < 5) return null;
+  const season = parseInt(parts[3], 10);
+  const episode = parseInt(parts[4], 10);
+  return {
+    catalogType: parts[1],
+    metaId: parts[2],
+    season: Number.isFinite(season) ? season : null,
+    episode: Number.isFinite(episode) ? episode : null,
+    token: parts.length > 5 ? parts.slice(5).join(":") : null,
+  };
+}
+
+function extractSeriesFeedMarker(title) {
+  const t = String(title || "");
+  let m = t.match(/\bS(\d{1,2})E(\d{1,3})\b/i) || t.match(/\b(\d{1,2})x(\d{1,3})\b/i);
+  if (m) {
+    return {
+      season: parseInt(m[1], 10),
+      episode: parseInt(m[2], 10),
+      label: `S${String(m[1]).padStart(2, "0")}E${String(m[2]).padStart(2, "0")}`,
+      pack: false,
+    };
+  }
+  m = t.match(/\b(?:S|Season\s?|Temporada\s?)(\d{1,2})\b/i);
+  if (m && isCompletePack(t)) {
+    return {
+      season: parseInt(m[1], 10),
+      episode: 0,
+      label: `Temporada ${String(m[1]).padStart(2, "0")} (Pack RSS)`,
+      pack: true,
+    };
+  }
+  return null;
+}
+
+function extractAnimeFeedMarker(title) {
+  const t = String(title || "").replace(/\./g, " ");
+  let m = t.match(/-\s*0*(\d{1,3})(?:v\d+)?\b/i)
+    || t.match(/\[(\d{1,3})(?:v\d+)?\]/i)
+    || t.match(/\bE(?:p(?:isode)?)?\s*0*(\d{1,3})\b/i);
+  if (m) {
+    return {
+      season: 1,
+      episode: parseInt(m[1], 10),
+      label: `Episodio ${String(m[1]).padStart(2, "0")}`,
+      pack: false,
+    };
+  }
+  if (isCompletePack(t)) {
+    return { season: 1, episode: 0, label: "Temporada/Batch RSS", pack: true };
+  }
+  return null;
+}
+
+function buildRssVideos(items, catalogType, metaId) {
+  const matched = items.filter(item => normalizeImdbId(item.ImdbId) === normalizeImdbId(metaId));
+  const seen = new Set();
+  const videos = [];
+  for (const item of matched) {
+    const marker = catalogType === "anime" ? extractAnimeFeedMarker(item.Title) : extractSeriesFeedMarker(item.Title);
+    if (!marker) continue;
+    const key = `${marker.season}:${marker.episode}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    videos.push({
+      id: `rssitem:${catalogType}:${metaId}:${marker.season ?? 1}:${marker.episode ?? 0}`,
+      title: marker.pack ? marker.label : `${marker.label}`,
+      season: marker.season ?? 1,
+      episode: marker.episode ?? 0,
+      released: item.PublishDate || null,
+      overview: item.Title || null,
+    });
+  }
+  videos.sort((a, b) => (a.season - b.season) || (a.episode - b.episode) || String(b.released || "").localeCompare(String(a.released || "")));
+  return videos;
+}
+
+function findRssItemByToken(items, token) {
+  return items.find(item => getRssItemToken(item) === token) || null;
+}
+
+function matchRssItemsByMarker(items, catalogType, metaId, season, episode) {
+  return items.filter(item => {
+    if (normalizeImdbId(item.ImdbId) !== normalizeImdbId(metaId)) return false;
+    const marker = catalogType === "anime" ? extractAnimeFeedMarker(item.Title) : extractSeriesFeedMarker(item.Title);
+    if (!marker) return false;
+    return marker.season === season && marker.episode === episode;
+  });
+}
+
 
 // ─────────────────────────────────────────────────────────
 // INDEXERS (ISOLAMENTO DE ANIME)
@@ -231,8 +366,10 @@ function defaultPrefs() {
     debridConfig:    null,
     keywordBoost:           "",
     maxResultsPerIndexer:   0,
-    enableP2P:       false,
-    qbitMode:        "private", // "private" ou "always"
+    enableP2P:       true,  // P2P ativo por padrão (necessário para StremThru)
+    qbitMode:        "private",
+    enableCatalog:   true,
+    rssIndexers:     [],    // vazio = todos os privados
   };
 }
 function resolvePrefs(encoded) {
@@ -344,10 +481,10 @@ function qp(extra = {}) {
 function getLangs(title, isAnime) {
   const langs  = matchAll(LANG, title);
   const isDual = /(dual)[-.\\s]?(audio|2\.1|5\.1)?/i.test(title);
-  const hasPtBr = langs.some(l => l.code === "pt-br");
 
-  // Só adiciona PT-BR ao dual se já tiver PT-BR explícito no título
-  if (isDual && !isAnime && hasPtBr) {
+  // Para dual audio em não-anime, retorna os idiomas detectados
+  // (não adiciona PT-BR automaticamente - só se estiver explícito no título)
+  if (isDual && !isAnime) {
     return langs;
   }
   return langs;
@@ -646,6 +783,7 @@ function extractInfoHash(magnet) {
   if (loose) return loose[1].toLowerCase();
   return null;
 }
+
 function extractInfoBuf(buf) {
   if (!Buffer.isBuffer(buf) || buf.length === 0 || buf.length > 10 * 1024 * 1024) return null;
   const s   = buf.toString("latin1");
@@ -951,6 +1089,29 @@ async function jackettFetchIndexers(url, key) {
   return [];
 }
 
+async function fetchIndexerPrivacyMap(url, key) {
+  const jUrl = (url || ENV.jackettUrl).replace(/\/+$/, "");
+  const jKey = key || ENV.apiKey;
+  try {
+    const res = await axios.get(`${jUrl}/api/v1/indexer`, {
+      params: { apikey: jKey }, timeout: 8000, validateStatus: () => true,
+    });
+    if (res.status < 400 && Array.isArray(res.data)) {
+      const out = new Map();
+      for (const ix of res.data) {
+        const id = String(ix.id || "").trim();
+        if (!id) continue;
+        out.set(id, {
+          private: ix.privacy === "private" || ix.privacy === "semiPrivate",
+          privacy: ix.privacy || null,
+        });
+      }
+      return out;
+    }
+  } catch {}
+  return new Map();
+}
+
 function decodeXmlEntities(str = "") {
   return str
     .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
@@ -1210,6 +1371,19 @@ async function getKitsuMeta(kitsuId) {
 }
 function parseStreamId(type, id) {
   if (!id || typeof id !== "string") return { source: "imdb", isAnime: false, metaId: "unknown", season: null, episode: null, type };
+  const rssItem = parseRssItemId(id);
+  if (rssItem) {
+    return {
+      source: "rssitem",
+      isAnime: rssItem.catalogType === "anime",
+      metaId: rssItem.metaId,
+      season: rssItem.season,
+      episode: rssItem.episode,
+      rssToken: rssItem.token,
+      rssType: rssItem.catalogType,
+      type,
+    };
+  }
   if (id.startsWith("kitsu:")) {
     const parts   = id.split(":");
     const season  = parts[2] ? parseInt(parts[2], 10) : null;
@@ -1323,13 +1497,29 @@ app.get("/api/debrid/test/:provider", async (req, res) => {
 
 app.get("/api/env", async (_, res) => {
   let redisOk = false;
-  try { await rc.ping(); redisOk = true; } catch {}
+  try {
+    if (redis) {
+      await redis.ping();
+      redisOk = true;
+    }
+  } catch {}
   res.json({ jackettUrl: ENV.jackettUrl, jackettKey: ENV.apiKey, qbitUrl: (process.env.QBIT_URL||"").replace(/\/+$/,""), qbitUser: process.env.QBIT_USER||"", redisUrl: ENV.redisUrl, redisOk, port: ENV.port, qbitEnabled: isQbitConfigured() });
 });
 app.get("/api/indexers", async (req, res) => {
   const url = (req.query.url || "").trim().replace(/\/+$/, "") || ENV.jackettUrl;
   const key = (req.query.key || "").trim() || ENV.apiKey;
-  try   { const indexers = await jackettFetchIndexers(url, key); res.json({ ok: true, count: indexers.length, indexers }); }
+  try   {
+    const [indexers, privacyMap] = await Promise.all([
+      jackettFetchIndexers(url, key),
+      fetchIndexerPrivacyMap(url, key),
+    ]);
+    const enriched = indexers.map(ix => ({
+      ...ix,
+      private: !!privacyMap.get(String(ix.id))?.private,
+      privacy: privacyMap.get(String(ix.id))?.privacy || null,
+    }));
+    res.json({ ok: true, count: enriched.length, indexers: enriched });
+  }
   catch (err) { res.json({ ok: false, error: err.message, indexers: [] }); }
 });
 app.get("/api/test", async (_, res) => {
@@ -1349,17 +1539,20 @@ app.get("/manifest.json", (_, res) => {
   res.json({
     id: "org.prowjack.pro", version: "3.10.0", name: "ProwJack PRO",
     description: "Configure os parametros pela URL.",
-    resources: ["stream"], types: ["movie", "series"], idPrefixes: ["tt", "kitsu:"],
+    resources: ["stream", "meta"], types: ["movie", "series"], idPrefixes: ["tt", "kitsu:", "rssmeta:", "rssitem:"],
     catalogs: [], behaviorHints: { configurable: true, configurationRequired: true, p2p: true },
   });
 });
-app.get("/configure", (_, res) => {
+function sendConfigurePage(res) {
   const publicPath = path.join(__dirname, "public", "configure.html");
   const rootPath   = path.join(__dirname, "configure.html");
   if (fs.existsSync(publicPath))    res.sendFile(publicPath);
   else if (fs.existsSync(rootPath)) res.sendFile(rootPath);
   else res.status(404).send("Arquivo configure.html nao encontrado.");
-});
+}
+
+app.get("/configure", (_, res) => sendConfigurePage(res));
+app.get("/:userConfig/configure", (_, res) => sendConfigurePage(res));
 app.get("/", (_, res) => res.redirect("/configure"));
 app.get("/:userConfig/manifest.json", (req, res) => {
   const prefs  = resolvePrefs(req.params.userConfig);
@@ -1367,12 +1560,90 @@ app.get("/:userConfig/manifest.json", (req, res) => {
   const name   = prefs.addonName || "ProwJack PRO";
   const isDebridActive = prefs.debrid && prefs.debridConfig &&
     (prefs.debridConfig.torboxKey || prefs.debridConfig.rdKey);
+  const hasP2P = !!prefs.stConfig || (!isDebridActive && prefs.enableP2P !== false);
+
+  const enabledCats = Array.isArray(prefs.categories) && prefs.categories.length ? prefs.categories : ["movie", "series"];
+  const catalogs = [];
+  if (prefs.enableCatalog) {
+    if (enabledCats.includes("movie"))  catalogs.push({ type: "movie",  id: "prowjack_rss_movie",  name: `${name} — Lançamentos` });
+    if (enabledCats.includes("series")) catalogs.push({ type: "series", id: "prowjack_rss_series", name: `${name} — Lançamentos` });
+    if (enabledCats.includes("anime"))  catalogs.push({ type: "series", id: "prowjack_rss_anime",  name: `${name} — Animes` });
+  }
   res.json({
     id: "org.prowjack.pro", version: "3.10.0", name,
     description: `Jackett Otimizado · Prioridade PT-BR`,
-    resources: ["stream"], types, idPrefixes: ["tt", "kitsu:"], catalogs: [],
-    behaviorHints: { configurable: true, configurationRequired: false, p2p: !isDebridActive },
+    resources: ["stream", "catalog", "meta"], types, idPrefixes: ["tt", "kitsu:", "rssmeta:", "rssitem:"], catalogs,
+    behaviorHints: { configurable: true, configurationRequired: false, p2p: hasP2P },
   });
+});
+
+// ─────────────────────────────────────────────────────────
+// CATALOG
+// ─────────────────────────────────────────────────────────
+app.get("/:userConfig/catalog/:type/:id.json", async (req, res) => {
+  const { type, id } = req.params;
+  const catalogTypeMap = {
+    prowjack_rss_movie:  "movie",
+    prowjack_rss_series: "series",
+    prowjack_rss_anime:  "anime",
+  };
+  const catalogType = catalogTypeMap[id];
+  if (!catalogType) return res.json({ metas: [] });
+
+  try {
+    const raw   = await rc.get(`${CATALOG_KEY}:${catalogType}`);
+    const items = raw ? JSON.parse(raw) : [];
+    const metas = items.map(m => ({
+      id:          catalogType === "movie" ? m.id : `rssmeta:${catalogType}:${m.id}`,
+      type:        m.type,
+      name:        m.name,
+      poster:      m.poster,
+      background:  m.background,
+      description: m.description,
+      releaseInfo: m.releaseInfo,
+      imdbRating:  m.imdbRating,
+      genres:      m.genres,
+    })).filter(m => m.id && m.poster);
+    res.json({ metas });
+  } catch {
+    res.json({ metas: [] });
+  }
+});
+
+app.get("/:userConfig/meta/:type/:id.json", async (req, res) => {
+  const { type, id } = req.params;
+  const prefs = resolvePrefs(req.params.userConfig);
+  const rssMeta = parseRssMetaId(id);
+
+  if (!rssMeta) {
+    try {
+      const targetType = type === "movie" ? "movie" : "series";
+      const cleanId = normalizeImdbId(id) || id;
+      const r = await axios.get(`https://v3-cinemeta.strem.io/meta/${targetType}/${cleanId}.json`, { timeout: 6000 });
+      return res.json(r.data || { meta: null });
+    } catch {
+      return res.json({ meta: null });
+    }
+  }
+
+  try {
+    const rssItems = await loadRssItemsForType(prefs, rssMeta.catalogType);
+    const videos = buildRssVideos(rssItems, rssMeta.catalogType, rssMeta.metaId);
+    if (!videos.length) return res.json({ meta: null });
+
+    const r = await axios.get(`https://v3-cinemeta.strem.io/meta/series/${rssMeta.metaId}.json`, { timeout: 6000 });
+    const baseMeta = r.data?.meta || {};
+    return res.json({
+      meta: {
+        ...baseMeta,
+        id,
+        type: "series",
+        videos,
+      }
+    });
+  } catch {
+    return res.json({ meta: null });
+  }
 });
 
 // ── ROTA DEBRID-ADD COM TRAVA REDIS (ANTI-SPAM) E DOWNLOAD DE .TORRENT ───
@@ -1552,15 +1823,14 @@ app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
 // ─────────────────────────────────────────────────────────
 app.get("/:userConfig/qbit/:jobToken", async (req, res) => {
   const prefs = resolvePrefs(req.params.userConfig);
-  if (prefs.qbit) setQbitCredentials(prefs.qbit.url, prefs.qbit.user, prefs.qbit.pass);
-  if (!isQbitConfigured()) return res.status(503).send("qBittorrent não configurado.");
-
   const job = await loadQbitJob(req.params.jobToken);
   if (!job?.infoHash) return res.status(404).send("Job expirado ou inválido.");
+  const qbitCreds = job.qbit || prefs.qbit || null;
+  if (!isQbitConfigured(qbitCreds)) return res.status(503).send("qBittorrent não configurado.");
 
   try {
     // 1. Verifica se já está disponível para reprodução imediata
-    let playable = await getPlayableLocalFile(job.infoHash, job.fileIdx, job.fileName);
+    let playable = await getPlayableLocalFile(job.infoHash, job.fileIdx, job.fileName, qbitCreds);
 
     if (!playable) {
       // 2. Obtém o buffer .torrent — prioridade: buffer salvo no job > re-download pelo link
@@ -1602,11 +1872,11 @@ app.get("/:userConfig/qbit/:jobToken", async (req, res) => {
 
       // 3. Garante que o torrent existe no qBit e prioriza o arquivo correto (operação rápida)
       await ensureTorrentReady(job.infoHash, {
-        torrentBuffer, magnet: job.magnet, fileIdx: job.fileIdx, fileName: job.fileName,
+        torrentBuffer, magnet: job.magnet, fileIdx: job.fileIdx, fileName: job.fileName, creds: qbitCreds,
       });
 
       // 4. Verifica de novo se já tem buffer suficiente para reproduzir
-      playable = await getPlayableLocalFile(job.infoHash, job.fileIdx, job.fileName);
+      playable = await getPlayableLocalFile(job.infoHash, job.fileIdx, job.fileName, qbitCreds);
 
       if (!playable) {
         // Ainda não tem buffer — responde imediatamente e deixa o player tentar em 5s.
@@ -1618,7 +1888,7 @@ app.get("/:userConfig/qbit/:jobToken", async (req, res) => {
     }
 
     // 5. Arquivo disponível: faz o streaming com suporte a Range requests
-    await streamTorrentFile(req, res, job.infoHash, job.fileIdx, job.fileName);
+    await streamTorrentFile(req, res, job.infoHash, job.fileIdx, job.fileName, qbitCreds);
   } catch (err) {
     console.log(`[qBit] Falha ao preparar ${job.infoHash}: ${err.message}`);
     if (!res.headersSent) res.status(503).send(`qBittorrent: ${err.message}`);
@@ -1626,12 +1896,13 @@ app.get("/:userConfig/qbit/:jobToken", async (req, res) => {
 });
 
 app.get("/qbit/stream/:jobToken", async (req, res) => {
-  if (!isQbitConfigured()) return res.status(503).json({ error: "qBittorrent não configurado" });
   const job = await loadQbitJob(req.params.jobToken);
   if (!job?.infoHash) return res.status(404).json({ error: "Job expirado ou inválido" });
+  const qbitCreds = job.qbit || null;
+  if (!isQbitConfigured(qbitCreds)) return res.status(503).json({ error: "qBittorrent não configurado" });
 
   try {
-    await streamTorrentFile(req, res, job.infoHash, job.fileIdx, job.fileName);
+    await streamTorrentFile(req, res, job.infoHash, job.fileIdx, job.fileName, qbitCreds);
   } catch (err) {
     console.error("[qBit stream]", err.message);
     if (!res.headersSent) res.status(503).json({ error: err.message });
@@ -1644,7 +1915,7 @@ app.get("/qbit/stream/:jobToken", async (req, res) => {
 const BAD_RE = /\b(cam|hdcam|camrip|workprint)\b/i;
 app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
   const prefs = resolvePrefs(req.params.userConfig);
-  if (prefs.qbit) setQbitCredentials(prefs.qbit.url, prefs.qbit.user, prefs.qbit.pass);
+  const qbitCreds = prefs.qbit || null;
   const { type, id } = req.params;
   console.log(`\n=========================================`);
   console.log(`NOVA BUSCA: [${type}] ${id}`);
@@ -1666,67 +1937,153 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     if (type === "movie" && !enabledCats.includes("movie"))                      return res.json({ streams: [] });
 
     const indexers     = await resolveSearchIndexers(prefs, parsed.isAnime);
-    const results      = await jackettSearch({ parsed, queries, search }, indexers, prefs);
+
+    // Fast-path: tenta encontrar resultados no cache RSS antes de buscar nos indexers
+    let results;
+    const rssType = parsed.isAnime ? "anime" : type === "movie" ? "movie" : "series";
+    let usedRssFastPath = false;
+    const preferredRssIndexers = Array.isArray(prefs.rssIndexers) && prefs.rssIndexers.length
+      ? prefs.rssIndexers
+      : (Array.isArray(prefs.indexers) && prefs.indexers.length && !prefs.indexers.includes("all") ? prefs.indexers : null);
+    const bypassRssFilters = parsed.source === "rssitem" || !!preferredRssIndexers?.length;
+
+    if (parsed.source === "rssitem" && parsed.rssToken) {
+      const rssHits = await loadRssItemsForType(prefs, parsed.rssType || rssType);
+      const exactItem = findRssItemByToken(rssHits, parsed.rssToken);
+      if (exactItem) {
+        results = [{ ...exactItem, _metaIdMatch: true, _titleMatchScore: 1, _rssPreferred: true, _rssOrder: 0 }];
+        usedRssFastPath = true;
+      }
+    } else if (parsed.source === "rssitem") {
+      const rssHits = await loadRssItemsForType(prefs, parsed.rssType || rssType);
+      const exactItems = matchRssItemsByMarker(
+        rssHits,
+        parsed.rssType || rssType,
+        parsed.metaId,
+        parsed.season ?? 1,
+        parsed.episode ?? 0
+      );
+      if (exactItems.length) {
+        results = exactItems.map((item, idx) => ({ ...item, _metaIdMatch: true, _titleMatchScore: 1, _rssPreferred: true, _rssOrder: idx }));
+        usedRssFastPath = true;
+      }
+    } else if (requestedImdbId || aliases.length) {
+      const allowedRss = preferredRssIndexers;
+      const rssPattern = allowedRss
+        ? null // busca por chaves específicas abaixo
+        : `rss:${CACHE_VERSION}:*:${rssType}:*`;
+      const rssKeys = allowedRss
+        ? await Promise.all(allowedRss.map(ix => rc.keys(`rss:${CACHE_VERSION}:${ix}:${rssType}:*`))).then(a => a.flat())
+        : await rc.keys(rssPattern);
+      if (rssKeys.length > 0) {
+        const rssHits = (await Promise.all(
+          rssKeys.map(async key => {
+            try { const raw = await rc.get(key); return raw ? JSON.parse(raw) : []; }
+            catch { return []; }
+          })
+        )).flat();
+
+        const matched = rssHits
+          .map((r, idx) => {
+            const resultImdbId = normalizeImdbId(r.ImdbId);
+            const byImdb = !!(requestedImdbId && resultImdbId && resultImdbId === requestedImdbId);
+            const titleScore = titleMatchScore(r.Title || "", [displayTitle, ...aliases]);
+            const relaxedScore = relaxedTitleMatchScore(r.Title || "", [displayTitle, ...aliases]);
+            const effectiveScore = Math.max(titleScore, (parsed.isAnime || type === "series") ? relaxedScore * 0.85 : 0);
+            const minAliasScore = parsed.isAnime ? 0.45 : type === "series" ? 0.5 : 0.6;
+            const byAlias = effectiveScore >= minAliasScore;
+            if (!byImdb && !byAlias) return null;
+            return {
+              ...r,
+              _metaIdMatch: byImdb,
+              _titleMatchScore: effectiveScore,
+              _rssPreferred: bypassRssFilters,
+              _rssOrder: idx,
+            };
+          })
+          .filter(Boolean);
+
+        if (matched.length > 0) {
+          console.log(`[RSS Fast-path] ${matched.length} resultados do cache RSS para ${requestedImdbId || displayTitle}`);
+          results = matched;
+          usedRssFastPath = true;
+        }
+      }
+    }
+
+    if (!usedRssFastPath) {
+      results = await jackettSearch({ parsed, queries, search }, indexers, prefs);
+    }
     const priorityLang = prefs.priorityLang ?? "pt-br";
 
     console.log(`Filtros ativos: onlyDubbed=${prefs.onlyDubbed}, priorityLang=${priorityLang}, keywordBoost=${prefs.keywordBoost ? 'SIM' : 'NÃO'}`);
 
-    const candidates = results
-      .filter(r => r?.InfoHash || r?.MagnetUri || r?.Link)
-      .filter(r => !prefs.skipBadReleases || !BAD_RE.test(r.Title || ""))
-      .filter(r => type !== "movie" || !looksLikeEpisodeRelease(r.Title || ""))
-      .filter(r => {
-        if (parsed.isAnime) return animeEpisodeMatches(r.Title || "", episode);
-        if (type === "series") return seriesEpisodeMatches(r.Title || "", parsed.season, parsed.episode);
-        return true;
-      })
-      .filter(r => {
-        if (prefs.keywordBoost && matchesKeywordBoost(r.Title || "", prefs.keywordBoost)) {
-          r._titleMatchScore = 1; r._keywordMatch = true; return true;
-        }
-        if (!prefs.onlyDubbed) return true;
-        const langs   = getLangs(r.Title || "", parsed.isAnime);
-        const hasLang = priorityLang ? langs.some(l => l.code === priorityLang) : false;
-        if (!priorityLang) return true;
-        return hasLang;
-      })
-      .filter(r => {
-        if (r._keywordMatch || r._metaIdMatch) return true;
-        const resultImdbId = getResultImdbId(r);
-        if (requestedImdbId && resultImdbId && resultImdbId === requestedImdbId) {
-          r._titleMatchScore = Math.max(r._titleMatchScore || 0, 1);
-          r._metaIdMatch = true; return true;
-        }
-        const langs   = getLangs(r.Title || "", parsed.isAnime);
-        const hasLang = priorityLang ? langs.some(l => l.code === priorityLang) : false;
-        if (hasLang) { r._titleMatchScore = 1; return true; }
-        if (!priorityLang) {
-          const sc           = titleMatchScore(r.Title || "", [displayTitle, ...aliases]);
-          const relaxedScore = relaxedTitleMatchScore(r.Title || "", [displayTitle, ...aliases]);
-          const episodeRank  = parsed.isAnime ? animeEpisodeMatchRank(r.Title || "", episode) : episodeMatchRank(r.Title || "", parsed.season, parsed.episode);
-          const minScore     = parsed.isAnime ? 0.34 : (type === "series" && episodeRank >= 2 ? 0.2 : 0.45);
-          const finalScore   = Math.max(sc, type === "series" ? relaxedScore * 0.8 : 0);
-          r._titleMatchScore = finalScore;
-          return finalScore >= minScore;
-        }
-        return false;
-      })
-      .filter(r => { if (type !== "movie" || !year) return true; const ry = extractReleaseYear(r.Title || ""); return !ry || Math.abs(ry - year) <= 1; })
-      .map(r => {
-        const t       = r.Title || "";
-        const langs   = getLangs(t, parsed.isAnime);
-        const hasLang = priorityLang ? langs.some(l => l.code === priorityLang) : false;
-        const isMulti = /(multi)[-.\\s]?(audio)?/i.test(t);
-        const langPriority = hasLang ? 3 : (prefs.keywordBoost && matchesKeywordBoost(t, prefs.keywordBoost) ? 2 : (isMulti ? 1 : 0));
-        r._originalScore = (langPriority * 100000) +
-          ((r._metaIdMatch    ? 1 : 0) * 40000) +
-          ((r._structuredMatch ? 1 : 0) * 20000) +
-          (parsed.isAnime ? animeEpisodeMatchRank(r.Title || "", episode) : episodeMatchRank(r.Title || "", parsed.season, parsed.episode)) * 10000 +
-          (r._titleMatchScore || 0) * 1000 +
-          score(r, prefs.weights, parsed.isAnime, priorityLang);
-        return r;
-      })
-      .sort((a, b) => b._originalScore - a._originalScore);
+    const candidates = (bypassRssFilters && usedRssFastPath
+      ? results
+          .filter(r => r?.InfoHash || r?.MagnetUri || r?.Link)
+          .filter(r => {
+            if (parsed.source === "rssitem") return true;
+            if (parsed.isAnime) return animeEpisodeMatches(r.Title || "", episode);
+            if (type === "series") return seriesEpisodeMatches(r.Title || "", parsed.season, parsed.episode);
+            return true;
+          })
+          .map(r => {
+            r._originalScore = 1_000_000 - (r._rssOrder || 0);
+            return r;
+          })
+      : results
+          .filter(r => r?.InfoHash || r?.MagnetUri || r?.Link)
+          .filter(r => !prefs.skipBadReleases || !BAD_RE.test(r.Title || ""))
+          .filter(r => type !== "movie" || !looksLikeEpisodeRelease(r.Title || ""))
+          .filter(r => {
+            if (parsed.isAnime) return animeEpisodeMatches(r.Title || "", episode);
+            if (type === "series") return seriesEpisodeMatches(r.Title || "", parsed.season, parsed.episode);
+            return true;
+          })
+          .filter(r => {
+            if (prefs.keywordBoost && matchesKeywordBoost(r.Title || "", prefs.keywordBoost)) {
+              r._titleMatchScore = 1; r._keywordMatch = true; return true;
+            }
+            if (!prefs.onlyDubbed || !priorityLang) return true;
+            const langs   = getLangs(r.Title || "", parsed.isAnime);
+            const hasLang = priorityLang ? langs.some(l => l.code === priorityLang) : false;
+            return hasLang;
+          })
+          .filter(r => {
+            if (r._keywordMatch || r._metaIdMatch) return true;
+            const resultImdbId = getResultImdbId(r);
+            if (requestedImdbId && resultImdbId && resultImdbId === requestedImdbId) {
+              r._titleMatchScore = Math.max(r._titleMatchScore || 0, 1);
+              r._metaIdMatch = true; return true;
+            }
+            const langs   = getLangs(r.Title || "", parsed.isAnime);
+            const hasLang = priorityLang ? langs.some(l => l.code === priorityLang) : false;
+
+            const sc           = titleMatchScore(r.Title || "", [displayTitle, ...aliases]);
+            const relaxedScore = relaxedTitleMatchScore(r.Title || "", [displayTitle, ...aliases]);
+            const episodeRank  = parsed.isAnime ? animeEpisodeMatchRank(r.Title || "", episode) : episodeMatchRank(r.Title || "", parsed.season, parsed.episode);
+            const minScore     = parsed.isAnime ? 0.34 : (type === "series" && episodeRank >= 2 ? 0.2 : 0.45);
+            const finalScore   = Math.max(sc, type === "series" ? relaxedScore * 0.8 : 0);
+            if (hasLang && finalScore > 0) r._titleMatchScore = Math.max(r._titleMatchScore || 0, 1);
+            r._titleMatchScore = Math.max(r._titleMatchScore || 0, finalScore);
+            return finalScore >= minScore || (hasLang && finalScore > 0);
+          })
+          .filter(r => { if (type !== "movie" || !year) return true; const ry = extractReleaseYear(r.Title || ""); return !ry || Math.abs(ry - year) <= 1; })
+          .map(r => {
+            const t       = r.Title || "";
+            const langs   = getLangs(t, parsed.isAnime);
+            const hasLang = priorityLang ? langs.some(l => l.code === priorityLang) : false;
+            const isMulti = /(multi)[-.\\s]?(audio)?/i.test(t);
+            const langPriority = hasLang ? 3 : (prefs.keywordBoost && matchesKeywordBoost(t, prefs.keywordBoost) ? 2 : (isMulti ? 1 : 0));
+            r._originalScore = (langPriority * 100000) +
+              ((r._metaIdMatch    ? 1 : 0) * 40000) +
+              ((r._structuredMatch ? 1 : 0) * 20000) +
+              (parsed.isAnime ? animeEpisodeMatchRank(r.Title || "", episode) : episodeMatchRank(r.Title || "", parsed.season, parsed.episode)) * 10000 +
+              (r._titleMatchScore || 0) * 1000 +
+              score(r, prefs.weights, parsed.isAnime, priorityLang);
+            return r;
+          })
+          .sort((a, b) => b._originalScore - a._originalScore));
 
     console.log(`Resultados: ${results.length} brutos → ${candidates.length} após filtros (idioma, título, ano)`);
     if (prefs.keywordBoost) {
@@ -1735,7 +2092,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     }
 
     let filteredCandidates = candidates;
-    if (prefs.maxResultsPerIndexer > 0) {
+    if (!bypassRssFilters && prefs.maxResultsPerIndexer > 0) {
       const countByIndexer = new Map();
       filteredCandidates = candidates.filter(r => {
         if (r._keywordMatch) return true;
@@ -1747,7 +2104,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     }
 
     const maxOut              = prefs.maxResults || 20;
-    const cacheCheckCandidates = isDebridMode && !prefs.stConfig
+    const cacheCheckCandidates = isDebridMode && !prefs.stConfig && !bypassRssFilters
       ? filteredCandidates
       : filteredCandidates.slice(0, maxOut);
     const topCandidates = cacheCheckCandidates;
@@ -1809,8 +2166,8 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       console.log(`[STREMTHRU] Proxy ativo - cache check desabilitado`);
     }
 
-    const dedupedWithHashes = dedupeWithCachePriority(withHashes, isDebridMode && !prefs.stConfig);
-    if (dedupedWithHashes.length < withHashes.length) {
+    const dedupedWithHashes = bypassRssFilters ? withHashes : dedupeWithCachePriority(withHashes, isDebridMode && !prefs.stConfig);
+    if (!bypassRssFilters && dedupedWithHashes.length < withHashes.length) {
       const removed = withHashes.length - dedupedWithHashes.length;
       console.log(`[DEDUP] ${withHashes.length} → ${dedupedWithHashes.length} candidatos (-${removed} duplicatas, preferiu público cacheado)`);
     }
@@ -1827,7 +2184,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       dedupedWithHashes.map(async r => {
         try {
           const resolved     = r._resolved;
-          const indexerName  = r.Tracker || r.TrackerId || r.Indexer || "Unknown";
+          const indexerName  = r._indexerName || r.Tracker || r.TrackerId || r.Indexer || "Unknown";
           const { name, description: descNoSeeds, resLabel } = formatStream(r, indexerName, parsed.isAnime, prefs, false, streamMeta);
           const { description } = formatStream(r, indexerName, parsed.isAnime, prefs, true, streamMeta);
           const matchedFile  = (type === "series" || parsed.isAnime)
@@ -1835,14 +2192,17 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             : null;
           const magnet      = buildMagnet(resolved.infoHash, r.MagnetUri, r.Title);
           const publicBase  = getPublicBase(req);
-          const localPlayable = isQbitConfigured()
-            ? await getPlayableLocalFile(resolved.infoHash, matchedFile?.idx ?? null, matchedFile?.name || null).catch(() => null)
+          const localPlayable = isQbitConfigured(qbitCreds)
+            ? await getPlayableLocalFile(resolved.infoHash, matchedFile?.idx ?? null, matchedFile?.name || null, qbitCreds).catch(() => null)
             : null;
 
           // Tracker privado = sem MagnetUri mas com buffer .torrent baixado
           const isPrivateTracker = !r.MagnetUri && !!resolved.buffer;
 
-          const buildQbitStream = async (label) => {
+          let qbitStreamPromise = null;
+          const buildQbitStream = async () => {
+            if (qbitStreamPromise) return qbitStreamPromise;
+            qbitStreamPromise = (async () => {
             // FIX: salva o buffer .torrent já baixado no job (evita re-download que pode falhar)
             // para trackers privados sem MagnetUri o re-download frequentemente falha por expiração
             // de sessão do Jackett. O buffer é enriquecido com trackers extras antes de salvar.
@@ -1861,6 +2221,11 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
               fileIdx:  matchedFile?.idx  ?? null,
               fileName: matchedFile?.name || null,
               torrentB64,
+              qbit: prefs.qbit ? {
+                url: prefs.qbit.url || "",
+                user: prefs.qbit.user || "",
+                pass: prefs.qbit.pass || "",
+              } : null,
             });
             const qbitName = localPlayable
               ? `${prefs.addonName || "ProwJack PRO"}\n⚡️ ${resLabel || "Links"} [QB]`
@@ -1871,6 +2236,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
               url:   `${publicBase}/${req.params.userConfig}/qbit/${jobToken}`,
               indexer: renameIndexer(indexerName),
               _cached: !!localPlayable,
+              _sourceType: "http",
               behaviorHints: {
                 filename:   matchedFile?.name || r.Title,
                 videoSize:  matchedFile?.size,
@@ -1878,6 +2244,8 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
                 notWebReady: false,
               },
             };
+            })();
+            return qbitStreamPromise;
           };
 
           if (isDebridMode) {
@@ -1896,28 +2264,10 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             );
 
             if (!debridData) {
-              // Tracker privado sem cache no debrid: P2P nativo com trackers do .torrent + seeding qBit em background
-              if (isPrivateTracker && resolved.buffer) {
-                const enrichedBuf  = injectTrackers(resolved.buffer);
-                const allTrackers  = extractTrackers(enrichedBuf);
-                const trParams     = allTrackers.map(t => `&tr=${encodeURIComponent(t)}`).join("");
-                const enrichedMagnet = `magnet:?xt=urn:btih:${resolved.infoHash}&dn=${encodeURIComponent(r.Title || "")}${trParams}`;
-                if (isQbitConfigured()) {
-                  setImmediate(async () => {
-                    try {
-                      await ensureTorrentReady(resolved.infoHash, { torrentBuffer: enrichedBuf, magnet: enrichedMagnet, fileIdx: matchedFile?.idx ?? null, fileName: matchedFile?.name || null });
-                      console.log(`[qBit Seed] ${resolved.infoHash} adicionado para seeding (debrid miss)`);
-                    } catch (e) { console.log(`[qBit Seed] Falha: ${e.message}`); }
-                  });
-                }
-                return {
-                  name: `${prefs.addonName || "ProwJack PRO"}\n${resLabel} 🔒`,
-                  description: [descNoSeeds, matchedFile?.name ? `📂 ${matchedFile.name}` : "", "🔒 Tracker Privado"].filter(Boolean).join("\n"),
-                  infoHash: resolved.infoHash, fileIdx: matchedFile?.idx,
-                  sources: [enrichedMagnet],
-                  indexer: renameIndexer(indexerName),
-                  behaviorHints: { filename: matchedFile?.name || r.Title, videoSize: matchedFile?.size, bingeGroup: `prowjack|${resolved.infoHash}` },
-                };
+              // Tracker privado sem cache no debrid: oferecer qBit se habilitado
+              if (prefs.enableP2P && isQbitConfigured(qbitCreds) && isPrivateTracker && resolved.buffer &&
+                  (prefs.qbitMode === 'always' || prefs.qbitMode === 'private')) {
+                return buildQbitStream();
               }
               return null;
             }
@@ -1938,8 +2288,8 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
                   name: streamName,
                   description: [descNoSeeds, debridFilename ? `📂 ${debridFilename}` : ""].filter(Boolean).join("\n"),
                   url:     resObj.url,
-                  indexer: renameIndexer(indexerName),
                   _cached: true,
+                  _sourceType: "debrid",
                   behaviorHints: {
                     filename:   debridFilename || r.Title,
                     videoSize:  matchedFile?.size,
@@ -1963,16 +2313,16 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
                   name: streamName,
                   description,
                   url:     addUrl,
-                  indexer: renameIndexer(indexerName),
                   _cached: !!resObj.cached,
+                  _sourceType: "debrid",
                   behaviorHints: { notWebReady: true },
                 };
 
-                if (prefs.enableP2P && isQbitConfigured()) {
+                if (prefs.enableP2P && isQbitConfigured(qbitCreds)) {
                   const shouldOfferQbit = prefs.qbitMode === 'always' ||
                     (prefs.qbitMode === 'private' && isPrivateTracker);
                   if (shouldOfferQbit) {
-                    const qbitOption = await buildQbitStream(localPlayable ? "💾" : "HTTP");
+                    const qbitOption = await buildQbitStream();
                     return [debridOption, qbitOption];
                   }
                 }
@@ -1984,85 +2334,99 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           }
 
           // ── Modo P2P (sem debrid) ──────────────────────────────────────
-          //
-          // TRACKER PRIVADO (sem MagnetUri, tem buffer .torrent):
-          //   → Reprodução via P2P nativo do Stremio com magnet enriquecido
-          //     (trackers do .torrent + trackers públicos extras via injectTrackers)
-          //   → Em background, adiciona ao qBit para seeding (se configurado)
-          //
-          // TRACKER PÚBLICO (tem MagnetUri):
-          //   → P2P nativo padrão do Stremio (comportamento inalterado)
-          // ─────────────────────────────────────────────────────────────
+          const shouldOfferQbit = prefs.enableP2P && isQbitConfigured(qbitCreds) &&
+            (prefs.qbitMode === 'always' || (prefs.qbitMode === 'private' && isPrivateTracker));
 
-          if (isPrivateTracker && resolved.buffer) {
-            // 1. Enriquece o .torrent com trackers extras e extrai a lista completa
-            const enrichedBuf  = injectTrackers(resolved.buffer);
-            const allTrackers  = extractTrackers(enrichedBuf);
-            const trParams     = allTrackers.map(t => `&tr=${encodeURIComponent(t)}`).join("");
-            const enrichedMagnet = `magnet:?xt=urn:btih:${resolved.infoHash}&dn=${encodeURIComponent(r.Title || "")}${trParams}`;
+          if (shouldOfferQbit && (localPlayable || r.Link || magnet)) {
+            const qbitStream = await buildQbitStream();
 
-            // 2. Background: adiciona ao qBit para seeding (fire-and-forget, não bloqueia)
-            if (isQbitConfigured()) {
-              setImmediate(async () => {
-                try {
-                  await ensureTorrentReady(resolved.infoHash, {
-                    torrentBuffer: enrichedBuf,
-                    magnet:        enrichedMagnet,
-                    fileIdx:       matchedFile?.idx  ?? null,
-                    fileName:      matchedFile?.name || null,
-                  });
-                  console.log(`[qBit Seed] ${resolved.infoHash} adicionado para seeding em background`);
-                } catch (e) {
-                  console.log(`[qBit Seed] Falha ao adicionar ${resolved.infoHash}: ${e.message}`);
-                }
-              });
+            if (isPrivateTracker && !r.MagnetUri) {
+              return qbitStream;
             }
 
-            // 3. Stream P2P nativo para o Stremio com magnet enriquecido
-            return {
-              name: `${prefs.addonName || "ProwJack PRO"}\n${resLabel} 🔒`,
-              description: [description, matchedFile?.name ? `📂 ${matchedFile.name}` : "", "🔒 Tracker Privado"].filter(Boolean).join("\n"),
+            let _qbitTrackers = [];
+            if (resolved.buffer) {
+              _qbitTrackers = extractTrackers(resolved.buffer);
+            } else if (r.MagnetUri) {
+              for (const m of (r.MagnetUri.matchAll(/[&?]tr=([^&]+)/g) || [])) {
+                try { _qbitTrackers.push(decodeURIComponent(m[1])); } catch {}
+              }
+            }
+            const _qbitAllTrackers = _qbitTrackers.length ? _qbitTrackers : EXTRA_TRACKERS;
+            const sources = _qbitAllTrackers.map(t => `tracker:${t}`).concat(`dht:${resolved.infoHash}`);
+            if (!resolved.infoHash) return qbitStream;
+
+            const p2pStream = {
+              name,
+              description: [description, matchedFile?.name ? `📂 ${matchedFile.name}` : ""].filter(Boolean).join("\n"),
               infoHash: resolved.infoHash,
-              fileIdx:  matchedFile?.idx,
-              sources:  [enrichedMagnet],
-              indexer:  renameIndexer(indexerName),
+              sources,
+              _sourceType: "p2p",
               behaviorHints: {
                 filename:   matchedFile?.name || r.Title,
-                videoSize:  matchedFile?.size,
+                videoSize:  matchedFile?.size || undefined,
                 bingeGroup: parsed.isAnime ? `prowjack|anime|${displayTitle}` : `prowjack|${resolved.infoHash}`,
               },
             };
+            if (matchedFile?.idx != null) p2pStream.fileIdx = matchedFile.idx;
+            return [qbitStream, p2pStream];
           }
 
-          // Tracker público: P2P nativo padrão
-          const sources = r.MagnetUri
-            ? [r.MagnetUri]
-            : (resolved.infoHash ? [buildMagnet(resolved.infoHash, r.MagnetUri, r.Title)] : []);
-          if (!sources.length) return null;
+          // Tracker privado sem MagnetUri e sem P2P habilitado
+          if (isPrivateTracker && !r.MagnetUri && !prefs.enableP2P) return null;
 
+          // P2P nativo: só retorna se P2P habilitado, sem debrid nativo e sem proxy StremThru.
+          if (prefs.enableP2P !== false && !isDebridMode && !prefs.stConfig) {
+            if (!resolved.infoHash) return null;
+
+            // Formato exato do Torrentio (referência oficial):
+            // sources = trackers.map(t => `tracker:${t}`).concat(`dht:${infoHash}`)
+            let trackerList = [];
+            if (resolved.buffer) {
+              trackerList = extractTrackers(resolved.buffer);
+            } else if (r.MagnetUri) {
+              for (const m of (r.MagnetUri.matchAll(/[&?]tr=([^&]+)/g) || [])) {
+                try { trackerList.push(decodeURIComponent(m[1])); } catch {}
+              }
+            }
+            const allTrackers = trackerList.length ? trackerList : EXTRA_TRACKERS;
+            const sources = allTrackers.map(t => `tracker:${t}`).concat(`dht:${resolved.infoHash}`);
+
+            const stream = {
+              name,
+              description: [description, matchedFile?.name ? `📂 ${matchedFile.name}` : ""].filter(Boolean).join("\n"),
+              infoHash: resolved.infoHash,
+              sources,
+              _sourceType: "p2p",
+              behaviorHints: {
+                filename:   matchedFile?.name || r.Title,
+                videoSize:  matchedFile?.size || undefined,
+                bingeGroup: parsed.isAnime ? `prowjack|anime|${displayTitle}` : `prowjack|${resolved.infoHash}`,
+              },
+            };
+
+            if (matchedFile?.idx != null) stream.fileIdx = matchedFile.idx;
+
+            return stream;
+          }
+
+          // StremThru: retorna magnet/infoHash para proxy debrid
           if (prefs.stConfig) {
+            const sources = r.MagnetUri
+              ? [r.MagnetUri]
+              : (resolved.infoHash ? [buildMagnet(resolved.infoHash, null, r.Title)] : []);
+            if (!sources.length) return null;
+            
             const storeCodeMap = { torbox: "TB", realdebrid: "RD" };
             const desc = [description, matchedFile?.name ? `📂 ${matchedFile.name}` : ""].filter(Boolean).join("\n");
             const bh   = { filename: matchedFile?.name || r.Title, videoSize: matchedFile?.size, bingeGroup: `prowjack|${resolved.infoHash}`, notWebReady: true };
             return prefs.stConfig.stores.map(s => {
               const tag = storeCodeMap[s.c] || s.c.toUpperCase();
-              return { name: `${name.split("\n")[0]}\n⬇️ ${resLabel || "Links"} [${tag}]`, description: desc, url: sources[0], indexer: renameIndexer(indexerName), behaviorHints: bh };
+              return { name: `${name.split("\n")[0]}\n⬇️ ${resLabel || "Links"} [${tag}]`, description: desc, url: sources[0], _sourceType: "debrid", behaviorHints: bh };
             });
           }
 
-          return {
-            name,
-            description: [description, matchedFile?.name ? `📂 ${matchedFile.name}` : ""].filter(Boolean).join("\n"),
-            infoHash: resolved.infoHash,
-            fileIdx:  matchedFile?.idx,
-            sources,
-            indexer: renameIndexer(indexerName),
-            behaviorHints: {
-              filename:   matchedFile?.name || r.Title,
-              videoSize:  matchedFile?.size,
-              bingeGroup: parsed.isAnime ? `prowjack|anime|${displayTitle}` : `prowjack|${resolved.infoHash}`,
-            },
-          };
+          return null;
         } catch { return null; }
       })
     );
@@ -2082,7 +2446,27 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       }
     });
 
-    const dedupedStreams = allStreams;
+    const dedupedStreams = (() => {
+      const out = [];
+      const seenQbit = new Set();
+      for (const s of allStreams) {
+        const isQbit = s?._sourceType === "http" && typeof s.url === "string" && s.url.includes("/qbit/");
+        if (isQbit) {
+          const key = `${s.behaviorHints?.bingeGroup || ""}|${s.behaviorHints?.filename || ""}`;
+          if (seenQbit.has(key)) continue;
+          seenQbit.add(key);
+        }
+        out.push(s);
+      }
+      return out;
+    })();
+
+    const _sourceRank = (s) => {
+      if (s?._sourceType === "debrid") return 0;
+      if (s?._sourceType === "http") return 1;
+      if (s?._sourceType === "p2p") return 2;
+      return 3;
+    };
 
     const _langScore = (s) => {
       const t    = s._title || "";
@@ -2096,6 +2480,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     const _qualScore = (s) => { const q = first(QUALITY,    s._title || ""); return q ? q.score  : 0; };
 
     dedupedStreams.sort((a, b) => {
+      const dsr = _sourceRank(a) - _sourceRank(b); if (dsr !== 0) return dsr;
       const ca = a._cached ? 1 : 0, cb = b._cached ? 1 : 0;
       if (ca !== cb) return cb - ca;
       const dl = _langScore(b) - _langScore(a); if (dl !== 0) return dl;
@@ -2110,7 +2495,14 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       const top = dedupedStreams.slice(0, Math.min(5, dedupedStreams.length));
       console.log(`[ORDEM] top${top.length}: ` + top.map(s => `[cache=${s._cached?1:0} lang=${_langScore(s)} res=${_resScore(s).toFixed(1)}] ${(s._title||s.name||"").slice(0,50)}`).join(" | "));
     }
-    finalStreams.forEach(s => { delete s._cached; delete s._originalScore; delete s._title; delete s._seeders; delete s._sizeGb; });
+    finalStreams.forEach(s => {
+      delete s._cached;
+      delete s._originalScore;
+      delete s._title;
+      delete s._seeders;
+      delete s._sizeGb;
+      delete s.indexer; // Campo não usado pelo Stremio
+    });
 
     if (isDebridMode) {
       const cached = finalStreams.filter(s => s.url && !s.url.includes('/debrid-add/')).length;
@@ -2132,4 +2524,5 @@ app.listen(ENV.port, () => {
   console.log(`   Jackett : ${ENV.jackettUrl}`);
   console.log(`   Redis   : ${ENV.redisUrl}`);
   console.log(`   qBittorrent: ${isQbitConfigured() ? "ativo" : "desativado"}`);
+  startRssPoller(ENV.jackettUrl, ENV.apiKey, rc, redis);
 });
