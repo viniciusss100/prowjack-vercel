@@ -43,6 +43,17 @@ app.use((req, res, next) => {
   next();
 });
 app.options("*", (_, res) => res.sendStatus(200));
+
+// Middleware de token de acesso — protege todas as rotas /:userConfig/*
+app.use("/:userConfig/*", (req, res, next) => {
+  if (!ENV.accessToken) return next(); // sem token configurado = aberto
+  const prefs = decodeUserCfg(req.params.userConfig);
+  if (prefs?.token === ENV.accessToken) return next();
+  // Permite /configure e /manifest.json sem token para facilitar setup
+  const path = req.path;
+  if (path === "/configure" || path === "/manifest.json") return next();
+  res.status(403).json({ error: "Acesso negado" });
+});
 // ─────────────────────────────────────────────────────────
 // ENV
 // ─────────────────────────────────────────────────────────
@@ -52,6 +63,7 @@ const ENV = {
   port:           process.env.PORT || 7014,
   redisUrl:       process.env.REDIS_URL || "redis://localhost:6379",
   addonPublicUrl: (process.env.ADDON_PUBLIC_URL || "").trim().replace(/\/+$/, ""),
+  accessToken:    (process.env.ACCESS_TOKEN || "").trim(),
 };
 // ─────────────────────────────────────────────────────────
 // REDIS
@@ -370,6 +382,7 @@ function defaultPrefs() {
     qbitMode:        "private",
     enableCatalog:   true,
     rssIndexers:     [],    // vazio = todos os privados
+    token:           "",
   };
 }
 function resolvePrefs(encoded) {
