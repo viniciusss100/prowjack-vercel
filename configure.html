@@ -254,6 +254,10 @@ hr{border:none;border-top:1px solid var(--bord);margin:16px 0}
         <label>API Key</label>
         <input type="text" id="jackettKey" placeholder="API Key do Jackett/Prowlarr" style="margin-bottom:0" />
       </div>
+      <div>
+        <label>Token de Acesso</label>
+        <input type="text" id="accessToken" placeholder="Deixe vazio para acesso livre" style="margin-bottom:0" title="Deve bater com ACCESS_TOKEN no .env do servidor" />
+      </div>
     </div>
     <div style="margin-top:12px">
       <button class="btn btn-p btn-sm" onclick="loadIndexers()">Conectar e Carregar Indexers</button>
@@ -543,6 +547,7 @@ function applyPrefsToForm(prefs) {
 
   if (prefs.jackett?.url) document.getElementById('jackettUrl').value = prefs.jackett.url;
   if (prefs.jackett?.key) document.getElementById('jackettKey').value = prefs.jackett.key;
+  if (prefs.token) document.getElementById('accessToken').value = prefs.token;
 
   const cats = Array.isArray(prefs.categories) && prefs.categories.length ? prefs.categories : ['movie', 'series'];
   document.querySelectorAll('.tg[data-cat]').forEach(btn => {
@@ -946,6 +951,7 @@ function buildPrefs() {
 
   const jackettUrl = document.getElementById('jackettUrl').value.trim().replace(/\/+$/, '');
   const jackettKey = document.getElementById('jackettKey').value.trim();
+  const accessToken = document.getElementById('accessToken').value.trim();
 
   const prefs = {
     indexers: state.useAll ? ['all'] : selected,
@@ -965,6 +971,7 @@ function buildPrefs() {
   };
 
   if (jackettUrl) prefs.jackett = { url: jackettUrl, key: jackettKey };
+  if (accessToken) prefs.token = accessToken;
 
   // Debrid Nativo
   if (isNative) {
