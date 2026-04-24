@@ -416,7 +416,7 @@ function resolvePrefs(encoded) {
   if (!m.addonName) m.addonName = "ProwJack";
 
   // Garantir valores padrão para qBit
-  if (m.enableP2P === undefined) m.enableP2P = false;
+  if (m.enableP2P === undefined) m.enableP2P = true;
   if (m.qbitMode  === undefined) m.qbitMode  = 'private';
 
   return m;
@@ -1581,12 +1581,11 @@ app.get("/:userConfig/manifest.json", (req, res) => {
   if (prefs.enableCatalog) {
     if (enabledCats.includes("movie"))  catalogs.push({ type: "movie",  id: "prowjack_rss_movie",  name: `${name} — Lançamentos` });
     if (enabledCats.includes("series")) catalogs.push({ type: "series", id: "prowjack_rss_series", name: `${name} — Lançamentos` });
-    if (enabledCats.includes("anime"))  catalogs.push({ type: "series", id: "prowjack_rss_anime",  name: `${name} — Animes` });
   }
   res.json({
     id: "org.prowjack.pro", version: "3.10.0", name,
     description: `Jackett Otimizado · Prioridade PT-BR`,
-    resources: ["stream", "catalog", "meta"], types, idPrefixes: ["tt", "kitsu:", "rssmeta:", "rssitem:"], catalogs,
+    resources: ["stream", "catalog"], types, idPrefixes: ["tt", "kitsu:"], catalogs,
     behaviorHints: { configurable: true, configurationRequired: false, p2p: hasP2P },
   });
 });
@@ -1608,7 +1607,7 @@ app.get("/:userConfig/catalog/:type/:id.json", async (req, res) => {
     const raw   = await rc.get(`${CATALOG_KEY}:${catalogType}`);
     const items = raw ? JSON.parse(raw) : [];
     const metas = items.map(m => ({
-      id:          catalogType === "movie" ? m.id : `rssmeta:${catalogType}:${m.id}`,
+      id:          m.id,
       type:        m.type,
       name:        m.name,
       poster:      m.poster,
