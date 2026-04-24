@@ -33,10 +33,10 @@ function extractHashFromTorrent(buf) {
 
 // Baixa .torrent e extrai infoHash durante o polling (timeout generoso de 30s)
 async function resolveItemHash(item) {
-  if (item.InfoHash) return item.InfoHash;
+  if (item.InfoHash) return { hash: item.InfoHash.toLowerCase(), buffer: null };
   if (item.MagnetUri) {
     const m = item.MagnetUri.match(/btih:([a-fA-F0-9]{40})/i);
-    return m ? m[1].toLowerCase() : null;
+    return m ? { hash: m[1].toLowerCase(), buffer: null } : null;
   }
   if (!item.Link) return null;
   try {
@@ -45,20 +45,46 @@ async function resolveItemHash(item) {
       maxContentLength: 8 * 1024 * 1024, validateStatus: s => s < 400,
       headers: { "User-Agent": "Mozilla/5.0" },
     });
-    return extractHashFromTorrent(Buffer.from(res.data));
+    const buf = Buffer.from(res.data);
+    const hash = extractHashFromTorrent(buf);
+    return hash ? { hash, buffer: buf } : null;
   } catch { return null; }
 }
 
-// Detecta indexers privados via API do Prowlarr
+// Detecta indexers privados via API do Prowlarr ou Jackett
 async function fetchPrivateIndexers(jUrl, jKey) {
+  // Tenta Prowlarr primeiro
   try {
     const res = await axios.get(`${jUrl}/api/v1/indexer`, {
       params: { apikey: jKey }, timeout: 8000, validateStatus: () => true,
     });
     if (res.status < 400 && Array.isArray(res.data)) {
-      return res.data
+      const privates = res.data
         .filter(ix => ix.privacy === "private" || ix.privacy === "semiPrivate")
         .map(ix => ({ id: String(ix.id), name: String(ix.name || ix.id) }));
+      if (privates.length) return privates;
+      // Prowlarr respondeu mas sem privados — retorna todos configurados
+      return res.data.map(ix => ({ id: String(ix.id), name: String(ix.name || ix.id) }));
+    }
+  } catch {}
+
+  // Fallback: Jackett — busca indexers via torznab caps
+  try {
+    const params = { t: "indexers", configured: "true" };
+    if (jKey) params.apikey = jKey;
+    const res = await axios.get(`${jUrl}/api/v2.0/indexers/all/results/torznab/api`, {
+      params, timeout: 8000, responseType: "text", validateStatus: () => true,
+    });
+    if (res.status < 400 && typeof res.data === "string") {
+      const indexers = [];
+      for (const m of res.data.matchAll(/<indexer\s+id="([^"]+)"[^>]*>([\s\S]*?)<\/indexer>/gi)) {
+        const id = m[1];
+        if (!id || id === "all") continue;
+        const titleMatch = m[2].match(/<title>([^<]+)<\/title>/i);
+        const name = titleMatch ? titleMatch[1].trim() : id;
+        indexers.push({ id, name });
+      }
+      if (indexers.length) return indexers;
     }
   } catch (err) {
     console.log(`[RSS] Erro ao buscar indexers: ${err.message}`);
@@ -116,27 +142,43 @@ function parseRssItems(xml, indexerId, indexerName) {
   }).filter(Boolean);
 }
 
-async function fetchIndexerRss(jUrl, jKey, indexerId, indexerName) {
+async function fetchIndexerRss(jUrl, jKey, indexerId, indexerName, rc) {
+  // Prowlarr: /{numericId}/api — Jackett: /api/v2.0/indexers/{id}/results/torznab/api
+  const isProwlarr = /^\d+$/.test(String(indexerId));
+  const url = isProwlarr
+    ? `${jUrl}/${indexerId}/api`
+    : `${jUrl}/api/v2.0/indexers/${indexerId}/results/torznab/api`;
   try {
-    const res = await axios.get(`${jUrl}/${indexerId}/api`, {
+    const res = await axios.get(url, {
       params: { apikey: jKey, t: "search", q: "" },
       timeout: 20000, responseType: "text", validateStatus: () => true,
     });
     if (res.status >= 400) return [];
     const items = parseRssItems(String(res.data || ""), indexerId, indexerName);
 
-    // Resolve infoHash em background durante o polling (concorrência 3)
-    let idx = 0;
-    async function worker() {
-      while (idx < items.length) {
-        const item = items[idx++];
-        if (!item.InfoHash) {
-          const hash = await resolveItemHash(item);
-          if (hash) item.InfoHash = hash;
+    // Resolve infoHash em background e re-salva no Redis conforme resolve
+    setImmediate(async () => {
+      let idx = 0;
+      let updated = false;
+      async function worker() {
+        while (idx < items.length) {
+          const item = items[idx++];
+          if (!item.InfoHash) {
+            const result = await resolveItemHash(item);
+            if (result?.hash) {
+              item.InfoHash = result.hash;
+              updated = true;
+              if (result.buffer) {
+                await rc.setBuffer(`torrent:${result.hash}`, result.buffer, 7 * 24 * 3600).catch(() => {});
+              }
+            }
+          }
         }
       }
-    }
-    await Promise.all([worker(), worker(), worker()]);
+      await Promise.all([worker(), worker(), worker()]);
+      if (updated) await saveHashesOnly(rc, indexerId, indexerName, items);
+    });
+
     return items;
   } catch (err) {
     console.log(`[RSS] ${indexerName || indexerId}: ${err.message}`);
@@ -204,7 +246,7 @@ const CATALOG_TTL = 6 * 3600; // 6h
 const CATALOG_KEY = "rss:catalog"; // hash Redis: field = "movie" | "series" | "anime"
 
 // Salva resultados no Redis agrupados por tipo + atualiza catálogo
-async function saveToRedis(rc, indexerId, indexerName, items) {
+async function saveToRedis(rc, indexerId, indexerName, items, skipCatalog = false) {
   const byType = { movie: [], series: [], anime: [] };
   for (const item of items) {
     const t = item._rssType === "anime" ? "anime" : item._rssType === "series" ? "series" : "movie";
@@ -221,8 +263,22 @@ async function saveToRedis(rc, indexerId, indexerName, items) {
     console.log(`[RSS] ${indexerName} (${type}): ${list.length} itens salvos`);
   }
 
-  // Resolve metadados e atualiza catálogo em background
-  setImmediate(() => updateCatalog(rc, items).catch(() => {}));
+  // Atualiza catálogo apenas se explicitamente solicitado
+  if (!skipCatalog) setImmediate(() => updateCatalog(rc, items).catch(() => {}));
+}
+
+async function saveHashesOnly(rc, indexerId, indexerName, items) {
+  // Salva apenas os hashes atualizados sem disparar updateCatalog
+  const byType = { movie: [], series: [], anime: [] };
+  for (const item of items) {
+    const t = item._rssType === "anime" ? "anime" : item._rssType === "series" ? "series" : "movie";
+    byType[t].push(item);
+  }
+  for (const [type, list] of Object.entries(byType)) {
+    if (!list.length) continue;
+    const key = buildRssCacheKey(indexerId, type);
+    await rc.set(key, JSON.stringify(list), RSS_CACHE_TTL).catch(() => {});
+  }
 }
 
 // Deduplica por imdbId e atualiza catálogo no Redis
@@ -324,7 +380,7 @@ async function pollOnce(jUrl, jKey, rc) {
   console.log(`[RSS] ${indexers.length} indexers privados: ${indexers.map(i => i.name).join(", ")}`);
 
   for (const ix of indexers) {
-    const items = await fetchIndexerRss(jUrl, jKey, ix.id, ix.name);
+    const items = await fetchIndexerRss(jUrl, jKey, ix.id, ix.name, rc);
     if (items.length) await saveToRedis(rc, ix.id, ix.name, items);
     await new Promise(r => setTimeout(r, 1000));
   }
