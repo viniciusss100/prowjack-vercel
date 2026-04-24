@@ -47,12 +47,12 @@ app.options("*", (_, res) => res.sendStatus(200));
 // Middleware de token de acesso — protege todas as rotas /:userConfig/*
 app.use("/:userConfig/*", (req, res, next) => {
   if (!ENV.accessToken) return next();
-  // Não bloqueia rotas de API pública (userConfig seria "api" nesse caso)
   if (req.params.userConfig === "api") return next();
   const prefs = decodeUserCfg(req.params.userConfig);
   if (prefs?.token === ENV.accessToken) return next();
-  const path = req.path;
-  if (path === "/configure" || path === "/manifest.json") return next();
+  const subpath = req.params[0] || "";
+  if (subpath === "configure" || subpath === "manifest.json") return next();
+  if (subpath.startsWith("catalog/") || subpath.startsWith("meta/")) return next();
   res.status(403).json({ error: "Acesso negado" });
 });
 // ─────────────────────────────────────────────────────────
@@ -126,6 +126,21 @@ const rc = {
   async del(k) {
     memoryDel(k);
     try { if (redis) await redis.del(k); } catch {}
+  },
+  async setBuffer(k, buf, ttl) {
+    const b64 = buf.toString("base64");
+    memorySet(k, b64, ttl);
+    try { if (redis) await redis.set(k, b64, "EX", ttl); } catch {}
+  },
+  async getBuffer(k) {
+    try {
+      if (redis) {
+        const v = await redis.get(k);
+        if (v) return Buffer.from(v, "base64");
+      }
+    } catch {}
+    const mem = memoryGet(k);
+    return mem ? Buffer.from(mem, "base64") : null;
   },
   async keys(p) {
     const regex = new RegExp(`^${String(p).replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\\\*/g, ".*")}$`);
@@ -928,6 +943,15 @@ async function resolveInfoHash(r) {
   let magnetHash   = r.MagnetUri ? extractInfoHash(r.MagnetUri) : null;
   const httpLink   = (r.Link && !r.Link.startsWith("magnet:")) ? r.Link : null;
 
+  // Se já temos o hash, verificar se o buffer está em cache Redis
+  if (fallbackHash) {
+    try {
+      const cached = await rc.getBuffer(`torrent:${fallbackHash}`);
+      if (cached) return { infoHash: fallbackHash, files: null, buffer: cached };
+    } catch {}
+    return { infoHash: fallbackHash, files: null, buffer: null };
+  }
+
   if (r.MagnetUri && magnetHash && !httpLink) {
     return { infoHash: magnetHash, files: null, buffer: null };
   }
@@ -965,6 +989,8 @@ async function resolveInfoHash(r) {
         const infoBuf = extractInfoBuf(buf);
         if (infoBuf) {
           const realHash = crypto.createHash("sha1").update(infoBuf).digest("hex");
+          // Cacheia o buffer para uso futuro (TTL 7 dias)
+          rc.setBuffer(`torrent:${realHash}`, buf, 7 * 24 * 3600).catch(() => {});
           return { infoHash: realHash, files: extractTorrentFiles(buf), buffer: buf };
         }
       }
@@ -1553,7 +1579,8 @@ app.get("/manifest.json", (_, res) => {
   res.json({
     id: "org.prowjack.pro", version: "3.10.0", name: "ProwJack PRO",
     description: "Configure os parametros pela URL.",
-    resources: ["stream", "meta"], types: ["movie", "series"], idPrefixes: ["tt", "kitsu:", "rssmeta:", "rssitem:"],
+    resources: ["stream", "meta"], types: ["movie", "series"],
+    idPrefixes: ["tt", "kitsu:", "rssmovie:", "rssmeta:", "rssitem:"],
     catalogs: [], behaviorHints: { configurable: true, configurationRequired: true, p2p: true },
   });
 });
@@ -1585,7 +1612,8 @@ app.get("/:userConfig/manifest.json", (req, res) => {
   res.json({
     id: "org.prowjack.pro", version: "3.10.0", name,
     description: `Jackett Otimizado · Prioridade PT-BR`,
-    resources: ["stream", "catalog"], types, idPrefixes: ["tt", "kitsu:"], catalogs,
+    resources: ["stream", "catalog", "meta"],
+    types, idPrefixes: ["tt", "kitsu:", "rssitem:"], catalogs,
     behaviorHints: { configurable: true, configurationRequired: false, p2p: hasP2P },
   });
 });
@@ -1626,13 +1654,25 @@ app.get("/:userConfig/catalog/:type/:id.json", async (req, res) => {
 app.get("/:userConfig/meta/:type/:id.json", async (req, res) => {
   const { type, id } = req.params;
   const prefs = resolvePrefs(req.params.userConfig);
+
+  // rssmovie: — busca meta no Cinemeta pelo tt... extraído
+  if (id.startsWith("rssmovie:")) {
+    const ttId = id.slice("rssmovie:".length);
+    try {
+      const r = await axios.get(`https://v3-cinemeta.strem.io/meta/movie/${ttId}.json`, { timeout: 6000 });
+      const meta = r.data?.meta;
+      if (meta) return res.json({ meta: { ...meta, id } });
+    } catch {}
+    return res.json({ meta: null });
+  }
+
   const rssMeta = parseRssMetaId(id);
 
   if (!rssMeta) {
     try {
       const targetType = type === "movie" ? "movie" : "series";
       const cleanId = normalizeImdbId(id) || id;
-      const r = await axios.get(`https://v3-cinemeta.strem.io/meta/${targetType}/${cleanId}.json`, { timeout: 6000 });
+      const r = await axios.get(`https://v3-cinemeta.strem.io/meta/${targetType}/${cleanId}.json`, { timeout: 5000 });
       return res.json(r.data || { meta: null });
     } catch {
       return res.json({ meta: null });
@@ -1652,6 +1692,7 @@ app.get("/:userConfig/meta/:type/:id.json", async (req, res) => {
         id,
         type: "series",
         videos,
+        behaviorHints: { defaultVideoId: videos[0].id, hasScheduledVideos: false },
       }
     });
   } catch {
@@ -1953,19 +1994,33 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
     // Fast-path: tenta encontrar resultados no cache RSS antes de buscar nos indexers
     let results;
-    const rssType = parsed.isAnime ? "anime" : type === "movie" ? "movie" : "series";
+    const rssType = parsed.rssType || (parsed.isAnime ? "anime" : type === "movie" ? "movie" : "series");
     let usedRssFastPath = false;
+    const isRssSource = parsed.source === "rssmovie" || parsed.source === "rssitem";
     const preferredRssIndexers = Array.isArray(prefs.rssIndexers) && prefs.rssIndexers.length
       ? prefs.rssIndexers
       : (Array.isArray(prefs.indexers) && prefs.indexers.length && !prefs.indexers.includes("all") ? prefs.indexers : null);
     const bypassRssFilters = parsed.source === "rssitem" || !!preferredRssIndexers?.length;
 
-    if (parsed.source === "rssitem" && parsed.rssToken) {
+    if (parsed.source === "rssmovie") {
+      // Filme do catálogo RSS — busca só no cache RSS, sem jackettSearch
+      const rssHits = await loadRssItemsForType(prefs, "movie");
+      const matched = rssHits.filter(r => normalizeImdbId(r.ImdbId) === normalizeImdbId(parsed.metaId));
+      if (matched.length) {
+        results = matched.map((item, idx) => ({ ...item, _metaIdMatch: true, _titleMatchScore: 1, _rssPreferred: true, _rssOrder: idx }));
+        usedRssFastPath = true;
+        console.log(`[RSS Fast-path] ${results.length} resultados do cache RSS para ${parsed.metaId}`);
+      } else {
+        return res.json({ streams: [] });
+      }
+    } else if (parsed.source === "rssitem" && parsed.rssToken) {
       const rssHits = await loadRssItemsForType(prefs, parsed.rssType || rssType);
       const exactItem = findRssItemByToken(rssHits, parsed.rssToken);
       if (exactItem) {
         results = [{ ...exactItem, _metaIdMatch: true, _titleMatchScore: 1, _rssPreferred: true, _rssOrder: 0 }];
         usedRssFastPath = true;
+      } else {
+        return res.json({ streams: [] });
       }
     } else if (parsed.source === "rssitem") {
       const rssHits = await loadRssItemsForType(prefs, parsed.rssType || rssType);
@@ -1979,6 +2034,8 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       if (exactItems.length) {
         results = exactItems.map((item, idx) => ({ ...item, _metaIdMatch: true, _titleMatchScore: 1, _rssPreferred: true, _rssOrder: idx }));
         usedRssFastPath = true;
+      } else {
+        return res.json({ streams: [] });
       }
     } else if (requestedImdbId || aliases.length) {
       const allowedRss = preferredRssIndexers;
