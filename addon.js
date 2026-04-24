@@ -46,10 +46,11 @@ app.options("*", (_, res) => res.sendStatus(200));
 
 // Middleware de token de acesso — protege todas as rotas /:userConfig/*
 app.use("/:userConfig/*", (req, res, next) => {
-  if (!ENV.accessToken) return next(); // sem token configurado = aberto
+  if (!ENV.accessToken) return next();
+  // Não bloqueia rotas de API pública (userConfig seria "api" nesse caso)
+  if (req.params.userConfig === "api") return next();
   const prefs = decodeUserCfg(req.params.userConfig);
   if (prefs?.token === ENV.accessToken) return next();
-  // Permite /configure e /manifest.json sem token para facilitar setup
   const path = req.path;
   if (path === "/configure" || path === "/manifest.json") return next();
   res.status(403).json({ error: "Acesso negado" });
