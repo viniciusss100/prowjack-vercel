@@ -132,7 +132,7 @@ services:
 
 ```bash
 # Clone o repositório
-git clone https://github.com/seu-usuario/prowjack-pro.git
+git clone https://github.com/viniciusss100/prowjack-vercel.git
 cd prowjack-pro
 
 # Instale as dependências
