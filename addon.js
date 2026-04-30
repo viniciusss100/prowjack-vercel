@@ -371,9 +371,9 @@ function decodeUserCfg(str) {
 function defaultPrefs() {
   return {
     indexers:        ["all"],
-    categories:      ["movie", "series"],
+    categories:      ["movie", "series", "anime"],
     weights:         { language: 40, resolution: 30, seeders: 20, size: 5, codec: 5 },
-    maxResults:      20,
+    maxResults:      40,
     slowThreshold:   8000,
     skipBadReleases: true,
     priorityLang:    "pt-br",
@@ -381,7 +381,7 @@ function defaultPrefs() {
     dedupe:          true,
     debrid:          false,
     debridConfig:    null,
-    keywordBoost:           "",
+    keywordBoost:           "(\bremux\b|cypher|freddiegellar|dual-bioma|dual-c76|tossato|c0ral|dual-nogroup|dual-pia|dual-xor|dual-xar|g4ris|dual-sigma|andrehsa|riper|sigla|tontom|dual-eck|1-sf|0-sf|por-br|RARBR|TupaC|alfaHD|DUAL-cza|DUAL-7sprite7|potatin|Dual-fly|Brazilian|franceira)",
     maxResultsPerIndexer:   0,
     enableP2P:       true,  
     qbitMode:        "private",
