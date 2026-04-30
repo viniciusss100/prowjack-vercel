@@ -209,8 +209,6 @@ function parseRssMetaId(id) {
   if (!s.startsWith("rssmeta:") && !s.startsWith("prowjack:")) return null;
   const parts = s.split(":");
   if (parts.length < 3) return null;
-  // O metaId é armazenado sem "tt" para evitar que o Cinemeta intercepte
-  // Reconstrói com "tt" para buscas internas
   const rawId = parts.slice(2).join(":");
   const metaId = /^\d+$/.test(rawId) ? `tt${rawId}` : rawId;
   return { catalogType: parts[1], metaId };
@@ -305,10 +303,7 @@ function matchRssItemsByMarker(items, catalogType, metaId, season, episode) {
     if (normalizeImdbId(item.ImdbId) !== normalizeImdbId(metaId)) return false;
     const marker = catalogType === "anime" ? extractAnimeFeedMarker(item.Title) : extractSeriesFeedMarker(item.Title);
     if (!marker) return false;
-    // Episódio exato (ex: S01E01 → S01E01)
     if (marker.season === season && marker.episode === episode) return true;
-    // Season Pack (episode: 0, pack: true): aceitar para qualquer episódio da mesma temporada.
-    // O arquivo correto será selecionado depois por pickEpisodeFile com o episode real.
     if (marker.pack === true && marker.season === season) return true;
     return false;
   });
@@ -388,10 +383,10 @@ function defaultPrefs() {
     debridConfig:    null,
     keywordBoost:           "",
     maxResultsPerIndexer:   0,
-    enableP2P:       true,  // P2P ativo por padrão (necessário para StremThru)
+    enableP2P:       true,  
     qbitMode:        "private",
     enableCatalog:   true,
-    rssIndexers:     [],    // vazio = todos os privados
+    rssIndexers:     [],  
     token:           "",
   };
 }
@@ -417,7 +412,6 @@ function resolvePrefs(encoded) {
     m.debrid = true;
   }
 
-  // Migração: normalizar addonName — remover PRO e tags de serviço (ficam no name do stream)
   if (m.addonName) m.addonName = m.addonName.replace(/\s*\[(TB\+RD|TB|RD|QB|PRO|ST)\]/gi, "").replace(/\bPRO\b/g, "").trim();
   if (!m.addonName) m.addonName = "ProwJack";
 
@@ -696,15 +690,11 @@ function dedupeResults(results) {
   return deduped;
 }
 
-// ─────────────────────────────────────────────────────────
-// DEDUP PÓS-CACHE
-// ─────────────────────────────────────────────────────────
 function dedupeWithCachePriority(withHashes, isDebridMode) {
   const isPrivate = r => !r.MagnetUri && !!r._resolved?.buffer;
 
   const sizeBucket = r => Math.round((r.Size || 0) / 5e8);
 
-  // Passo 1: dedup exato por infoHash
   const seenHash   = new Set();
   const noExactDups = [];
   for (const r of withHashes) {
@@ -714,7 +704,6 @@ function dedupeWithCachePriority(withHashes, isDebridMode) {
     noExactDups.push(r);
   }
 
-  // Sem modo debrid: dedup simples por título+tamanho, prefere mais seeders
   if (!isDebridMode) {
     const seen   = new Map();
     const result = [];
@@ -733,7 +722,6 @@ function dedupeWithCachePriority(withHashes, isDebridMode) {
     return result;
   }
 
-  // Modo debrid: agrupa e escolhe vencedor por prioridade de cache + tracker público
   const groups = new Map();
   for (const r of noExactDups) {
     const norm = normalizeForDedupe(r.Title || "");
@@ -898,8 +886,6 @@ function pickEpisodeFile(files, season, episode, isAnime) {
       : (name) => episodeMatchRank(name, season, episode)
   );
 
-  // Fallback: anime cujos arquivos usam convenção SxxExx padrão (ex: releases do Crunchyroll/CR WEB-DL)
-  // animeEpisodeMatchRank não reconhece esse padrão — tenta episodeMatchRank como segunda estratégia
   if (!scored.length && isAnime) {
     const fallback = scoreFiles((name) => episodeMatchRank(name, season, episode));
     if (fallback.length) {
@@ -932,7 +918,6 @@ async function resolveInfoHash(r) {
   let magnetHash   = r.MagnetUri ? extractInfoHash(r.MagnetUri) : null;
   const httpLink   = (r.Link && !r.Link.startsWith("magnet:")) ? r.Link : null;
 
-  // Se já temos o hash, verificar se o buffer está em cache Redis
   if (fallbackHash) {
     try {
       const cached = await rc.getBuffer(`torrent:${fallbackHash}`);
@@ -978,7 +963,6 @@ async function resolveInfoHash(r) {
         const infoBuf = extractInfoBuf(buf);
         if (infoBuf) {
           const realHash = crypto.createHash("sha1").update(infoBuf).digest("hex");
-          // Cacheia o buffer para uso futuro (TTL 7 dias)
           rc.setBuffer(`torrent:${realHash}`, buf, 7 * 24 * 3600).catch(() => {});
           return { infoHash: realHash, files: extractTorrentFiles(buf), buffer: buf };
         }
@@ -1091,7 +1075,6 @@ async function jackettFetchIndexers(url, key) {
       if (indexers.length) return indexers;
     }
   } catch {}
-  // Fallback Prowlarr
   try {
     const res = await axios.get(`${(url || ENV.jackettUrl).replace(/\/+$/, "")}/api/v1/indexer`, {
       params: { apikey: jKey }, timeout: 8000, validateStatus: () => true,
@@ -1628,7 +1611,6 @@ app.get("/:userConfig/meta/:type/:id.json", async (req, res) => {
   const { type, id } = req.params;
   const prefs = resolvePrefs(req.params.userConfig);
 
-  // rssmovie: — busca meta no Cinemeta pelo tt... extraído
   if (id.startsWith("rssmovie:")) {
     const ttId = id.slice("rssmovie:".length);
     try {
@@ -1653,10 +1635,6 @@ app.get("/:userConfig/meta/:type/:id.json", async (req, res) => {
   }
 
   try {
-    // ── PASSO 1: Cinemeta primeiro (lista completa de episódios com thumbnails/títulos) ──
-    // Lógica inspirada no builder.js do addon TorBox: buscar metadados ricos do Cinemeta
-    // ANTES de verificar o RSS, e só depois filtrar pelos episódios disponíveis no cache.
-    // Isso evita o "nenhuma informação disponível" causado por ImdbIds ainda não resolvidos.
     const metaCacheKey = `rssmeta:${rssMeta.metaId}`;
     let baseMeta = {};
     const cachedMetaRaw = await rc.get(metaCacheKey).catch(() => null);
@@ -1669,7 +1647,6 @@ app.get("/:userConfig/meta/:type/:id.json", async (req, res) => {
         baseMeta = r.data?.meta || {};
         if (baseMeta.name) rc.set(metaCacheKey, JSON.stringify(baseMeta), 86400).catch(() => {});
       } catch {
-        // Fallback: catálogo local
         const catalogRaw = await rc.get(`${CATALOG_KEY}:${rssMeta.catalogType}`).catch(() => null);
         const catalogItems = catalogRaw ? JSON.parse(catalogRaw) : [];
         const found = catalogItems.find(i => i.id === id || i.id === rssMeta.metaId);
@@ -1677,8 +1654,6 @@ app.get("/:userConfig/meta/:type/:id.json", async (req, res) => {
       }
     }
 
-    // ── PASSO 2: Construir set de episódios disponíveis a partir do cache RSS ──
-    // Mesmo padrão do builder.js: availableEps determina quais episódios mostrar.
     const rssItems = await loadRssItemsForType(prefs, rssMeta.catalogType);
     const matchedRssItems = rssItems.filter(item =>
       normalizeImdbId(item.ImdbId) === normalizeImdbId(rssMeta.metaId)
@@ -1690,34 +1665,28 @@ app.get("/:userConfig/meta/:type/:id.json", async (req, res) => {
         ? extractAnimeFeedMarker(item.Title)
         : extractSeriesFeedMarker(item.Title);
       if (!marker) {
-        // Não foi possível parsear — assume que cobre tudo (ex: season pack sem marker)
         availableEps.add("all");
         continue;
       }
       if (marker.pack) {
-        // Season Pack: temporada inteira disponível
         availableEps.add(`season:${marker.season}`);
       } else {
-        // Episódio específico
         availableEps.add(`${marker.season}:${marker.episode}`);
       }
     }
 
     console.log(`[Meta] ${rssMeta.metaId}: ${matchedRssItems.length} itens RSS → marcadores: [${[...availableEps].join(", ")}]`);
 
-    // ── PASSO 3: Filtrar episódios do Cinemeta e remalear IDs para rssitem: ──
     const cinemetaVideos = baseMeta.videos || [];
     let videos;
 
     if (availableEps.size === 0) {
-      // Nenhum item RSS encontrado para esta série ainda.
-      // Retornar meta sem episódios mas com poster/nome para não quebrar o catálogo.
       videos = [];
       console.log(`[Meta] ${rssMeta.metaId}: nenhum episódio RSS disponível`);
     } else {
       videos = cinemetaVideos
         .filter(v => {
-          if (!v.season || !v.episode) return false; // Ignorar entradas sem S/E
+          if (!v.season || !v.episode) return false;
           if (availableEps.has("all"))                      return true;
           if (availableEps.has(`${v.season}:${v.episode}`)) return true;
           if (availableEps.has(`season:${v.season}`))       return true;
@@ -1725,23 +1694,16 @@ app.get("/:userConfig/meta/:type/:id.json", async (req, res) => {
         })
         .map(v => ({
           ...v,
-          // Remapear ID para o formato rssitem: que o /stream sabe resolver
           id: `rssitem:${rssMeta.catalogType}:${rssMeta.metaId}:${v.season}:${v.episode}`,
         }));
 
-      // Fallback: nenhum episódio do Cinemeta bate com os marcadores RSS
       if (videos.length === 0 && matchedRssItems.length > 0) {
         const rssVideos = buildRssVideos(rssItems, rssMeta.catalogType, rssMeta.metaId);
 
         if (cinemetaVideos.length === 0) {
-          // Cinemeta não tem NENHUM episódio (série nova / fora do catálogo) → RSS puro
           console.log(`[Meta] ${rssMeta.metaId}: Cinemeta sem episódios → usando RSS`);
           videos = rssVideos;
         } else {
-          // Cinemeta tem episódios de outra(s) temporada(s) e o RSS tem temporada mais nova
-          // → merge: exibe todos os eps do Cinemeta (com ID original) + novos do RSS (com rssitem:)
-          // Os eps do Cinemeta ficam com ID original (streamable via outros addons/P2P);
-          // os do RSS ficam com rssitem: (streamable via este addon).
           const rssKeys = new Set(rssVideos.map(v => `${v.season}:${v.episode}`));
           const cinemetaOther = cinemetaVideos
             .filter(v => v.season && v.episode && !rssKeys.has(`${v.season}:${v.episode}`))
@@ -1757,7 +1719,6 @@ app.get("/:userConfig/meta/:type/:id.json", async (req, res) => {
       console.log(`[Meta] ${rssMeta.metaId}: ${totalCount} eps disponíveis (${rssCount} via RSS, ${totalCount - rssCount} via Cinemeta)`);
     }
 
-    // Sem nome e sem episódios = não há o que mostrar
     if (!baseMeta.name && !videos.length) return res.json({ meta: null });
 
     const { videos: _ignored, imdb_id: _imdb, moviedb_id: _tmdb, slug: _slug, trailers: _tr, credits_cast: _cc, credits_crew: _cr, ...baseMetaWithoutVideos } = baseMeta;
@@ -1776,7 +1737,6 @@ app.get("/:userConfig/meta/:type/:id.json", async (req, res) => {
   }
 });
 
-// ── ROTA DEBRID-ADD COM TRAVA REDIS (ANTI-SPAM) E DOWNLOAD DE .TORRENT ───
 app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
   const { provider, infoHash } = req.params;
   const magnet  = req.query.magnet;
@@ -1791,7 +1751,6 @@ app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
   const lockKey      = `addlock:${provider}:${infoHash}`;
   const alreadyAdded = await rc.get(lockKey);
 
-  // Download do .torrent se disponível
   let torrentBuffer = null;
   if (linkUrl?.startsWith("http")) {
     try {
@@ -1844,7 +1803,6 @@ app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
     }
   }
 
-  // TorBox: polling com backoff exponencial (até 120s)
   if (isTB) {
     const deadline = Date.now() + 120000;
     const delays   = [2000, 3000, 5000, 8000];
@@ -1892,7 +1850,6 @@ app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
     return res.status(202).send("Download em andamento no TorBox. O player tentará novamente automaticamente.");
   }
 
-  // Polling RD com backoff exponencial (até 120s)
   const deadline = Date.now() + 120000;
   const delays   = [2000, 3000, 5000, 8000];
   let delayIndex = 0;
@@ -1940,17 +1897,6 @@ app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
   return res.status(202).send("Download em andamento. O player tentará novamente automaticamente.");
 });
 
-// ─────────────────────────────────────────────────────────
-// ROTA qBIT — FIX #2: não bloqueia a conexão HTTP
-// ─────────────────────────────────────────────────────────
-// Problema original: waitForQbitBuffer() bloqueava a conexão aberta por até 180s.
-// Todo player de vídeo tem timeout de poucos segundos — a conexão era encerrada antes
-// de qualquer dado ser enviado.
-//
-// Solução: responder imediatamente com 503 + Retry-After quando o buffer ainda não está
-// pronto. O player (Stremio, VLC, Infuse...) tenta novamente automaticamente até que
-// o arquivo esteja disponível, aí a rota faz o streaming direto.
-// ─────────────────────────────────────────────────────────
 app.get("/:userConfig/qbit/:jobToken", async (req, res) => {
   const prefs = resolvePrefs(req.params.userConfig);
   const job = await loadQbitJob(req.params.jobToken);
@@ -1959,18 +1905,12 @@ app.get("/:userConfig/qbit/:jobToken", async (req, res) => {
   if (!isQbitConfigured(qbitCreds)) return res.status(503).send("qBittorrent não configurado.");
 
   try {
-    // 1. Verifica se já está disponível para reprodução imediata
     let playable = await getPlayableLocalFile(job.infoHash, job.fileIdx, job.fileName, qbitCreds);
 
     if (!playable) {
-      // 2. Obtém o buffer .torrent — prioridade: buffer salvo no job > re-download pelo link
-      // FIX: o buffer já foi baixado e enriquecido na hora de montar o stream (buildQbitStream).
-      // Usar o buffer do job evita falhas causadas por links do Jackett que expiram ou
-      // requerem autenticação de sessão que não está disponível aqui.
       let torrentBuffer = null;
 
       if (job.torrentB64) {
-        // Caminho preferencial: buffer pré-baixado salvo no job como base64
         try {
           torrentBuffer = Buffer.from(job.torrentB64, "base64");
           console.log(`[qBit] Buffer .torrent do job: ${torrentBuffer.length} bytes`);
@@ -1980,7 +1920,6 @@ app.get("/:userConfig/qbit/:jobToken", async (req, res) => {
       }
 
       if (!torrentBuffer && job.link && !job.link.startsWith("magnet:")) {
-        // Fallback: tenta re-download do link do Jackett
         try {
           const dl = await axios.get(job.link, {
             responseType: "arraybuffer", timeout: 15000, maxRedirects: 5,
@@ -2000,24 +1939,19 @@ app.get("/:userConfig/qbit/:jobToken", async (req, res) => {
         }
       }
 
-      // 3. Garante que o torrent existe no qBit e prioriza o arquivo correto (operação rápida)
       await ensureTorrentReady(job.infoHash, {
         torrentBuffer, magnet: job.magnet, fileIdx: job.fileIdx, fileName: job.fileName, creds: qbitCreds,
       });
 
-      // 4. Verifica de novo se já tem buffer suficiente para reproduzir
       playable = await getPlayableLocalFile(job.infoHash, job.fileIdx, job.fileName, qbitCreds);
 
       if (!playable) {
-        // Ainda não tem buffer — responde imediatamente e deixa o player tentar em 5s.
-        // O Stremio e a maioria dos players respeitam o Retry-After e tentam novamente.
         console.log(`[qBit] ${job.infoHash} sem buffer ainda — respondendo 503 para retry`);
         res.setHeader("Retry-After", "5");
         return res.status(503).send("Aguardando buffer do qBittorrent...");
       }
     }
 
-    // 5. Arquivo disponível: faz o streaming com suporte a Range requests
     await streamTorrentFile(req, res, job.infoHash, job.fileIdx, job.fileName, qbitCreds);
   } catch (err) {
     console.log(`[qBit] Falha ao preparar ${job.infoHash}: ${err.message}`);
@@ -2049,17 +1983,15 @@ async function fetchScrapStreams(manifestUrl, type, id) {
     return streams
       .filter(s => s.infoHash || (s.url && !s.url.startsWith("magnet:")))
       .map(s => {
-        // Extrai título do campo name ou title para scoring de idioma/resolução
         const rawName = s.name || "";
         const desc    = s.description || s.title || "";
-        // O título relevante para filtros está geralmente na description (ex: Torrentio)
         const titleForFilters = desc || rawName;
         const size = s.behaviorHints?.videoSize || 0;
         return {
           ...s,
           _sourceType:  "debrid",
           _scrapSource: true,
-          _cached:      true,   // streams do scrap já estão resolvidos no debrid
+          _cached:      true,   
           _title:       titleForFilters,
           _filename:    s.behaviorHints?.filename || "",
           _sizeBytes:   size,
@@ -2085,7 +2017,6 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     console.log(`[DEBRID] Modo ativo: ${prefs.debridConfig.mode.toUpperCase()} — P2P desabilitado`);
   }
 
-  // Cache de streams resolvidos — retorno instantâneo se já processado antes
   const streamCacheKey = `streams:${CACHE_VERSION}:${req.params.userConfig}:${type}:${id}`;
   const cachedStreams = await rc.get(streamCacheKey).catch(() => null);
   if (cachedStreams) {
@@ -2110,7 +2041,6 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
     const indexers     = await resolveSearchIndexers(prefs, parsed.isAnime);
 
-    // Fast-path: tenta encontrar resultados no cache RSS antes de buscar nos indexers
     let results;
     const rssType = parsed.rssType || (parsed.isAnime ? "anime" : type === "movie" ? "movie" : "series");
     let usedRssFastPath = false;
@@ -2120,7 +2050,6 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     const bypassRssFilters = parsed.source === "rssitem" || !!preferredRssIndexers?.length;
 
     if (parsed.source === "rssmovie") {
-      // Filme do catálogo RSS — busca só no cache RSS, sem jackettSearch
       const rssHits = await loadRssItemsForType(prefs, "movie");
       const matched = rssHits.filter(r => normalizeImdbId(r.ImdbId) === normalizeImdbId(parsed.metaId));
       if (matched.length) {
@@ -2158,7 +2087,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     } else if (requestedImdbId || aliases.length) {
       const allowedRss = preferredRssIndexers;
       const rssPattern = allowedRss
-        ? null // busca por chaves específicas abaixo
+        ? null 
         : `rss:${CACHE_VERSION}:*:${rssType}:*`;
       const rssKeys = allowedRss
         ? await Promise.all(allowedRss.map(ix => rc.keys(`rss:${CACHE_VERSION}:${ix}:${rssType}:*`))).then(a => a.flat())
@@ -2200,7 +2129,6 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     }
 
     if (!usedRssFastPath) {
-      // Busca Jackett e scrap em paralelo
       const [jackettResults, scrapResults] = await Promise.all([
         jackettSearch({ parsed, queries, search }, indexers, prefs),
         ENV.scrapManifests.length
@@ -2208,7 +2136,6 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           : Promise.resolve([])
       ]);
       results = jackettResults;
-      // Guarda scrap para injetar depois em allStreams
       results._scrapStreams = scrapResults.flat();
     }
     const priorityLang = prefs.priorityLang ?? "pt-br";
@@ -2398,16 +2325,12 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             ? await getPlayableLocalFile(resolved.infoHash, matchedFile?.idx ?? null, matchedFile?.name || null, qbitCreds).catch(() => null)
             : null;
 
-          // Tracker privado = sem MagnetUri mas com buffer .torrent baixado
           const isPrivateTracker = !r.MagnetUri && !!resolved.buffer;
 
           let qbitStreamPromise = null;
           const buildQbitStream = async () => {
             if (qbitStreamPromise) return qbitStreamPromise;
             qbitStreamPromise = (async () => {
-            // FIX: salva o buffer .torrent já baixado no job (evita re-download que pode falhar)
-            // para trackers privados sem MagnetUri o re-download frequentemente falha por expiração
-            // de sessão do Jackett. O buffer é enriquecido com trackers extras antes de salvar.
             let torrentB64 = null;
             if (resolved.buffer) {
               try {
@@ -2466,7 +2389,6 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             );
 
             if (!debridData) {
-              // Tracker privado sem cache no debrid: oferecer qBit se habilitado
               if (prefs.enableP2P && isQbitConfigured(qbitCreds) && isPrivateTracker && resolved.buffer &&
                   (prefs.qbitMode === 'always' || prefs.qbitMode === 'private')) {
                 return buildQbitStream();
@@ -2535,7 +2457,6 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             })).then(items => items.filter(Boolean));
           }
 
-          // ── Modo P2P (sem debrid) ──────────────────────────────────────
           const shouldOfferQbit = prefs.enableP2P && isQbitConfigured(qbitCreds) &&
             (prefs.qbitMode === 'always' || (prefs.qbitMode === 'private' && isPrivateTracker));
 
@@ -2574,15 +2495,11 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             return [qbitStream, p2pStream];
           }
 
-          // Tracker privado sem MagnetUri e sem P2P habilitado
           if (isPrivateTracker && !r.MagnetUri && !prefs.enableP2P) return null;
 
-          // P2P nativo: só retorna se P2P habilitado, sem debrid nativo e sem proxy StremThru.
           if (prefs.enableP2P !== false && !isDebridMode && !prefs.stConfig) {
             if (!resolved.infoHash) return null;
 
-            // Formato exato do Torrentio (referência oficial):
-            // sources = trackers.map(t => `tracker:${t}`).concat(`dht:${infoHash}`)
             let trackerList = [];
             if (resolved.buffer) {
               trackerList = extractTrackers(resolved.buffer);
@@ -2612,7 +2529,6 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             return stream;
           }
 
-          // StremThru: retorna magnet/infoHash para proxy debrid
           if (prefs.stConfig) {
             const sources = r.MagnetUri
               ? [r.MagnetUri]
@@ -2635,19 +2551,15 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
     const allStreams = resolvedAll.flat(2).filter(Boolean);
 
-    // Scrap: injeta streams externos já resolvidos — passam pela mesma ordenação que os do Jackett
     const pendingScrap = results._scrapStreams || [];
     if (pendingScrap.length) {
-      // onlyDubbed: scrap passa se keyword bate OU se não tem info de idioma (debrid externo)
       const filteredScrap = prefs.onlyDubbed && priorityLang
         ? pendingScrap.filter(s => {
             if (prefs.keywordBoost && matchesKeywordBoost(s._title, prefs.keywordBoost)) return true;
             const langs = getLangs(s._title, parsed.isAnime);
-            // Se não tem nenhuma keyword de idioma no título, passa (debrid sem info de idioma)
             return langs.length === 0 || langs.some(l => l.code === priorityLang);
           })
         : pendingScrap;
-      // Limita scrap a metade dos slots para não sufocar resultados do Jackett
       const scrapSlots = Math.ceil(maxOut / 2);
       const scrapToAdd = filteredScrap.slice(0, scrapSlots);
       if (scrapToAdd.length) {
@@ -2673,17 +2585,14 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     const dedupedStreams = (() => {
       const out = [];
       const seenQbit = new Set();
-      // Dedup scrap vs Jackett: scrap tem prioridade por infoHash idêntico OU tamanho similar (±5%)
       const scrapHashes = new Set(allStreams.filter(s => s._scrapSource && s.infoHash).map(s => s.infoHash.toLowerCase()));
       const scrapSizes  = allStreams.filter(s => s._scrapSource && (s._sizeBytes > 0)).map(s => s._sizeBytes);
       const jackettHashes = new Set(allStreams.filter(s => !s._scrapSource && s.infoHash).map(s => s.infoHash.toLowerCase()));
       const isSimilarSize = (a, b) => a > 0 && b > 0 && Math.abs(a - b) / Math.max(a, b) < 0.05;
       for (const s of allStreams) {
-        // Scrap: marca _cached=true se mesmo hash que Jackett
         if (s._scrapSource && s.infoHash && jackettHashes.has(s.infoHash.toLowerCase())) {
           s._cached = true;
         }
-        // Jackett: remove se scrap cobre mesmo hash OU tamanho similar
         if (!s._scrapSource) {
           const hash = s.infoHash?.toLowerCase();
           const size = s.behaviorHints?.videoSize || s._sizeBytes || 0;
@@ -2714,7 +2623,6 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       if (priorityLang && langs.some(l => l.code === priorityLang)) return 3;
       if (prefs.keywordBoost && matchesKeywordBoost(t, prefs.keywordBoost)) return 2;
       if (/(multi|dual)[-.\\s]?(audio)?/i.test(t)) return 1;
-      // Scrap sem info de idioma: score neutro (não penaliza por falta de keyword)
       if (s._scrapSource && langs.length === 0) return 1;
       return 0;
     };
@@ -2743,7 +2651,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       delete s._title;
       delete s._seeders;
       delete s._sizeGb;
-      delete s.indexer; // Campo não usado pelo Stremio
+      delete s.indexer; 
     });
 
     if (isDebridMode) {
@@ -2754,7 +2662,6 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       console.log(`Magnets listados: Enviando ${finalStreams.length} torrents!`);
     }
     console.log(`=========================================\n`);
-    // Salva streams resolvidos no cache (TTL 3h) — só se tiver resultados
     if (finalStreams.length > 0) {
       rc.set(streamCacheKey, JSON.stringify(finalStreams), 10800).catch(() => {});
     }
@@ -2766,7 +2673,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 });
 
 app.listen(ENV.port, () => {
-  console.log(`ProwJack PRO v3.10.0 -> http://localhost:${ENV.port}/configure`);
+  console.log(`ProwJack v3.11.0 -> http://localhost:${ENV.port}/configure`);
   console.log(`   Jackett : ${ENV.jackettUrl}`);
   console.log(`   Redis   : ${ENV.redisUrl}`);
   console.log(`   qBittorrent: ${isQbitConfigured() ? "ativo" : "desativado"}`);
