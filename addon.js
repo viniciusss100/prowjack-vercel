@@ -18,7 +18,6 @@ const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-// Rate limiting simples
 const requestCounts = new Map();
 setInterval(() => requestCounts.clear(), 60000);
 
@@ -44,7 +43,6 @@ app.use((req, res, next) => {
 });
 app.options("*", (_, res) => res.sendStatus(200));
 
-// Middleware de token de acesso — protege todas as rotas /:userConfig/*
 app.use("/:userConfig/*", (req, res, next) => {
   if (!ENV.accessToken) return next();
   if (req.params.userConfig === "api") return next();
@@ -55,20 +53,15 @@ app.use("/:userConfig/*", (req, res, next) => {
   if (subpath.startsWith("catalog/") || subpath.startsWith("meta/")) return next();
   res.status(403).json({ error: "Acesso negado" });
 });
-// ─────────────────────────────────────────────────────────
-// ENV
-// ─────────────────────────────────────────────────────────
 const ENV = {
-  jackettUrl:     (process.env.JACKETT_URL || "http://localhost:9117").replace(/\/+$/, ""),
-  apiKey:         (process.env.JACKETT_API_KEY || "").trim(),
-  port:           process.env.PORT || 7014,
-  redisUrl:       process.env.REDIS_URL || "redis://localhost:6379",
-  addonPublicUrl: (process.env.ADDON_PUBLIC_URL || "").trim().replace(/\/+$/, ""),
-  accessToken:    (process.env.ACCESS_TOKEN || "").trim(),
+  jackettUrl:      (process.env.JACKETT_URL || "http://localhost:9117").replace(/\/+$/, ""),
+  apiKey:          (process.env.JACKETT_API_KEY || "").trim(),
+  port:            process.env.PORT || 7014,
+  redisUrl:        process.env.REDIS_URL || "redis://localhost:6379",
+  addonPublicUrl:  (process.env.ADDON_PUBLIC_URL || "").trim().replace(/\/+$/, ""),
+  accessToken:     (process.env.ACCESS_TOKEN || "").trim(),
+  scrapManifests:  (process.env.SCRAP_MANIFEST_URLS || "").split(",").map(s => s.trim()).filter(Boolean),
 };
-// ─────────────────────────────────────────────────────────
-// REDIS
-// ─────────────────────────────────────────────────────────
 let redis = null;
 const memoryStore = new Map();
 try {
@@ -212,10 +205,15 @@ function getRssItemToken(item) {
 }
 
 function parseRssMetaId(id) {
-  if (!String(id || "").startsWith("rssmeta:")) return null;
-  const parts = String(id).split(":");
+  const s = String(id || "");
+  if (!s.startsWith("rssmeta:") && !s.startsWith("prowjack:")) return null;
+  const parts = s.split(":");
   if (parts.length < 3) return null;
-  return { catalogType: parts[1], metaId: parts.slice(2).join(":") };
+  // O metaId é armazenado sem "tt" para evitar que o Cinemeta intercepte
+  // Reconstrói com "tt" para buscas internas
+  const rawId = parts.slice(2).join(":");
+  const metaId = /^\d+$/.test(rawId) ? `tt${rawId}` : rawId;
+  return { catalogType: parts[1], metaId };
 }
 
 function parseRssItemId(id) {
@@ -307,14 +305,16 @@ function matchRssItemsByMarker(items, catalogType, metaId, season, episode) {
     if (normalizeImdbId(item.ImdbId) !== normalizeImdbId(metaId)) return false;
     const marker = catalogType === "anime" ? extractAnimeFeedMarker(item.Title) : extractSeriesFeedMarker(item.Title);
     if (!marker) return false;
-    return marker.season === season && marker.episode === episode;
+    // Episódio exato (ex: S01E01 → S01E01)
+    if (marker.season === season && marker.episode === episode) return true;
+    // Season Pack (episode: 0, pack: true): aceitar para qualquer episódio da mesma temporada.
+    // O arquivo correto será selecionado depois por pickEpisodeFile com o episode real.
+    if (marker.pack === true && marker.season === season) return true;
+    return false;
   });
 }
 
 
-// ─────────────────────────────────────────────────────────
-// INDEXERS (ISOLAMENTO DE ANIME)
-// ─────────────────────────────────────────────────────────
 const ANIME_ONLY_IDS = new Set([
   "nyaasi", "animetosho", "animez", "nekobt",
   "animebytes", "anidex", "tokyotosho", "animeworld",
@@ -356,9 +356,6 @@ async function resolveSearchIndexers(prefs, isAnime) {
   const generalPool = pool.filter(id => !isAnimeOnly(id));
   return generalPool.length > 0 ? generalPool : pool;
 }
-// ─────────────────────────────────────────────────────────
-// RATE LIMIT
-// ─────────────────────────────────────────────────────────
 async function isRateLimited(indexer) {
   return !!(await rc.get(`rl:${indexer}`));
 }
@@ -367,9 +364,6 @@ async function setRateLimit(indexer, retryAfterHeader) {
   const ttl    = Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 3600) : 90;
   await rc.set(`rl:${indexer}`, "1", ttl);
 }
-// ─────────────────────────────────────────────────────────
-// CONFIG (Base64URL)
-// ─────────────────────────────────────────────────────────
 function decodeUserCfg(str) {
   try {
     if (!str || typeof str !== "string" || str.length > 10000) return null;
@@ -407,11 +401,9 @@ function resolvePrefs(encoded) {
   if (!Array.isArray(m.indexers) || !m.indexers.length) m.indexers = ["all"];
   if (m.priorityLang === undefined) m.priorityLang = "pt-br";
 
-  // Processar debridConfig e definir mode
   if (m.debridConfig && (m.debridConfig.torboxKey || m.debridConfig.rdKey)) {
     m.debrid = true;
 
-    // Determinar mode baseado nas keys disponíveis
     const hasTB = !!m.debridConfig.torboxKey;
     const hasRD = !!m.debridConfig.rdKey;
 
@@ -421,7 +413,6 @@ function resolvePrefs(encoded) {
     else                 m.debridConfig.mode = null;
   }
 
-  // Processar stConfig se presente
   if (m.stConfig && Array.isArray(m.stConfig.stores) && m.stConfig.stores.length > 0) {
     m.debrid = true;
   }
@@ -430,15 +421,11 @@ function resolvePrefs(encoded) {
   if (m.addonName) m.addonName = m.addonName.replace(/\s*\[(TB\+RD|TB|RD|QB|PRO|ST)\]/gi, "").replace(/\bPRO\b/g, "").trim();
   if (!m.addonName) m.addonName = "ProwJack";
 
-  // Garantir valores padrão para qBit
   if (m.enableP2P === undefined) m.enableP2P = true;
   if (m.qbitMode  === undefined) m.qbitMode  = 'private';
 
   return m;
 }
-// ─────────────────────────────────────────────────────────
-// PARSERS E DICIONÁRIOS
-// ─────────────────────────────────────────────────────────
 const RESOLUTION = [
   { re: /\b(4k|2160p)\b/i, label: "2160p", emoji: "🎞️ 4K",  score: 4   },
   { re: /\b1440p\b/i,      label: "1440p", emoji: "🎞️ 2K",  score: 3.5 },
@@ -504,19 +491,8 @@ function qp(extra = {}) {
   if (ENV.apiKey) p.apikey = ENV.apiKey;
   return p;
 }
-// ─────────────────────────────────────────────────────────
-// DETECÇÃO DE IDIOMA E SCORE
-// ─────────────────────────────────────────────────────────
-function getLangs(title, isAnime) {
-  const langs  = matchAll(LANG, title);
-  const isDual = /(dual)[-.\\s]?(audio|2\.1|5\.1)?/i.test(title);
-
-  // Para dual audio em não-anime, retorna os idiomas detectados
-  // (não adiciona PT-BR automaticamente - só se estiver explícito no título)
-  if (isDual && !isAnime) {
-    return langs;
-  }
-  return langs;
+function getLangs(title) {
+  return matchAll(LANG, title);
 }
 
 function score(r, weights = {}, isAnime = false, priorityLang = "") {
@@ -908,14 +884,30 @@ function extractTorrentFiles(buf) {
 
 function pickEpisodeFile(files, season, episode, isAnime) {
   if (!Array.isArray(files) || !files.length || episode == null) return null;
-  const scored = files.map(file => {
+
+  const scoreFiles = (rankFn) => files.map(file => {
     const name = file.name || "";
-    const rank = isAnime
-      ? animeEpisodeMatchRank(name, episode)
-      : episodeMatchRank(name, season, episode);
+    const rank = rankFn(name);
     const videoBonus = /\.(mkv|mp4|avi|ts|m2ts|mov|wmv)$/i.test(name) ? 5 : 0;
     return { ...file, rank, total: rank * 1000 + videoBonus + Math.min(file.size || 0, 50 * 1e9) / 1e9 };
-  }).filter(file => file.rank > 0);
+  }).filter(f => f.rank > 0);
+
+  const scored = scoreFiles(
+    isAnime
+      ? (name) => animeEpisodeMatchRank(name, episode)
+      : (name) => episodeMatchRank(name, season, episode)
+  );
+
+  // Fallback: anime cujos arquivos usam convenção SxxExx padrão (ex: releases do Crunchyroll/CR WEB-DL)
+  // animeEpisodeMatchRank não reconhece esse padrão — tenta episodeMatchRank como segunda estratégia
+  if (!scored.length && isAnime) {
+    const fallback = scoreFiles((name) => episodeMatchRank(name, season, episode));
+    if (fallback.length) {
+      fallback.sort((a, b) => b.total - a.total);
+      console.log(`[FILE] pickEpisodeFile: match via fallback SxxExx para anime S${String(season).padStart(2,"0")}E${String(episode).padStart(2,"0")} → "${fallback[0].name}"`);
+      return fallback[0];
+    }
+  }
 
   if (!scored.length) return null;
   scored.sort((a, b) => b.total - a.total);
@@ -935,9 +927,6 @@ function relaxedTitleMatchScore(title, aliases = []) {
   return best;
 }
 
-// ─────────────────────────────────────────────────────────
-// RESOLVE INFO HASH
-// ─────────────────────────────────────────────────────────
 async function resolveInfoHash(r) {
   let fallbackHash = r.InfoHash ? r.InfoHash.toLowerCase() : null;
   let magnetHash   = r.MagnetUri ? extractInfoHash(r.MagnetUri) : null;
@@ -1027,26 +1016,17 @@ function renameIndexer(name) {
     .trim();
 }
 
-// ─────────────────────────────────────────────────────────
-// FORMATTER
-// ─────────────────────────────────────────────────────────
 function matchesKeywordBoost(title, boostFilter) {
   if (!boostFilter || !boostFilter.trim()) return false;
   const pattern = boostFilter.trim();
   if (pattern.length > 500) return false;
   try {
-    const regex   = new RegExp(pattern, "i");
-    const testStr = String(title || "").slice(0, 500);
-    const start   = Date.now();
-    const result  = regex.test(testStr);
-    if (Date.now() - start > 100) {
-      console.warn(`[SECURITY] Regex timeout detectado: ${pattern}`);
-      return false;
-    }
+    const regex = new RegExp(pattern, "i");
+    const start = Date.now();
+    const result = regex.test(String(title || "").slice(0, 500));
+    if (Date.now() - start > 100) { console.warn(`[SECURITY] Regex timeout: ${pattern}`); return false; }
     return result;
-  } catch {
-    return title.toLowerCase().includes(pattern.toLowerCase());
-  }
+  } catch { return false; }
 }
 
 function formatStream(r, indexerName, isAnime = false, prefs = {}, showSeeds = true, streamMeta = {}) {
@@ -1063,17 +1043,14 @@ function formatStream(r, indexerName, isAnime = false, prefs = {}, showSeeds = t
   const cleanIndexer = renameIndexer(indexerName);
   const addonName    = prefs.addonName || "ProwJack PRO";
   const resLabel     = res ? res.label : "Desconhecida";
-  const PT_BR_INDEXERS = /capybara|samaritano|bludv|comando|torrent9|filmesbr|cinemasbr|brazilbr/i;
-  const implicitPtBr   = !langs.length && PT_BR_INDEXERS.test(cleanIndexer);
-  const langDisplay    = [];
-  if (langs.length)       langDisplay.push(langs.map(l => `${l.emoji} ${l.label}`).join(" / "));
-  else if (implicitPtBr)  langDisplay.push("🇧🇷 PT-BR");
-  else                    langDisplay.push("🗺️ Original");
+
   const isMulti = /(multi|dual)[-.\\s]?(audio)?/i.test(t);
-  if      (isMulti && isAnime)                              langDisplay.push("🎧 Multi/Dual-Audio");
-  else if (isMulti && !langs.some(l => l.code === "pt-br")) langDisplay.push("🎧 Multi");
+  const langParts = [];
+  if (langs.length)  langParts.push(langs.map(l => `${l.emoji} ${l.label}`).join(" / "));
+  if (isMulti && !langs.some(l => l.code === "pt-br")) langParts.push("🎧 Multi");
+  const langLine = langParts.length ? langParts.join(" | ") : "";
+
   const p2pLabel = prefs.debrid ? "" : "⚠️ P2P";
-  const langStr  = langDisplay.join(" | ");
 
   const titleLine = [
     streamMeta.title ? `🎬 ${streamMeta.title}` : "",
@@ -1083,7 +1060,8 @@ function formatStream(r, indexerName, isAnime = false, prefs = {}, showSeeds = t
 
   const desc = [
     titleLine,
-    [res ? resLabel : "", qual ? `🎥 ${qual.label}` : "", vis.length ? `📺 ${vis.map(v=>v.label).join(" | ")}` : "", codec ? `🎞️ ${codec.label}` : "", langStr].filter(Boolean).join("  "),
+    [res ? resLabel : "", qual ? `🎥 ${qual.label}` : "", vis.length ? `📺 ${vis.map(v=>v.label).join(" | ")}` : "", codec ? `🎞️ ${codec.label}` : ""].filter(Boolean).join("  "),
+    langLine,
     [audios.length ? `🎧 ${audios.map(a=>a.label).join(" | ")}` : ""].filter(Boolean).join("  "),
     [size ? `💾 ${size}` : "", showSeeds ? `👤 ${seeds}` : ""].filter(Boolean).join("  "),
     [`⚙️ ${cleanIndexer}`, group ? `🏷️ ${group}` : ""].filter(Boolean).join("  "),
@@ -1091,10 +1069,6 @@ function formatStream(r, indexerName, isAnime = false, prefs = {}, showSeeds = t
   ].filter(Boolean).join("\n");
   return { name: `${addonName}\n${resLabel}`, description: desc.trim(), resLabel };
 }
-// ─────────────────────────────────────────────────────────
-// JACKETT + SEARCH
-// ─────────────────────────────────────────────────────────
-
 async function jackettFetchIndexers(url, key) {
   const jUrl = (url || ENV.jackettUrl).replace(/\/+$/, "");
   const jKey = key || ENV.apiKey;
@@ -1362,9 +1336,6 @@ async function jackettSearch(plan, indexers, prefs) {
   return fastDeduped;
 }
 
-// ─────────────────────────────────────────────────────────
-// METADATA
-// ─────────────────────────────────────────────────────────
 async function getCinemetaTitle(type, imdbId) {
   try {
     const res    = await axios.get(
@@ -1424,6 +1395,14 @@ function parseStreamId(type, id) {
       type,
     };
   }
+  if (id.startsWith("rssmovie:")) {
+    return { source: "rssmovie", isAnime: false, metaId: id.slice("rssmovie:".length), season: null, episode: null, type };
+  }
+  if (id.startsWith("rssmeta:") || id.startsWith("prowjack:")) {
+    const parts = id.split(":");
+    const metaId = parts.slice(2).join(":");
+    return { source: "rssmovie", isAnime: false, metaId, season: null, episode: null, type };
+  }
   if (id.startsWith("kitsu:")) {
     const parts   = id.split(":");
     const season  = parts[2] ? parseInt(parts[2], 10) : null;
@@ -1452,9 +1431,6 @@ function parseStreamId(type, id) {
   }
   return { source: "imdb", isAnime: false, metaId: id, season: null, episode: null, type };
 }
-// ─────────────────────────────────────────────────────────
-// BUILD QUERIES
-// ─────────────────────────────────────────────────────────
 async function buildQueries(type, id) {
   const parsed = parseStreamId(type, id);
   if (parsed.isAnime) {
@@ -1502,10 +1478,6 @@ async function buildQueries(type, id) {
     },
   };
 }
-
-// ─────────────────────────────────────────────────────────
-// API E MANIFEST
-// ─────────────────────────────────────────────────────────
 
 app.get("/api/debrid/test/:provider", async (req, res) => {
   const { provider } = req.params;
@@ -1610,17 +1582,18 @@ app.get("/:userConfig/manifest.json", (req, res) => {
     if (enabledCats.includes("series")) catalogs.push({ type: "series", id: "prowjack_rss_series", name: `${name} — Lançamentos` });
   }
   res.json({
-    id: "org.prowjack.pro", version: "3.10.0", name,
+    id: "org.prowjack.pro", version: "3.11.0", name,
     description: `Jackett Otimizado · Prioridade PT-BR`,
-    resources: ["stream", "catalog", "meta"],
-    types, idPrefixes: ["tt", "kitsu:", "rssitem:"], catalogs,
+    resources: [
+      "catalog",
+      { name: "meta",   types, idPrefixes: ["rssmovie:", "rssmeta:", "prowjack:", "rssitem:"] },
+      { name: "stream", types, idPrefixes: ["tt", "kitsu:", "rssmovie:", "rssmeta:", "prowjack:", "rssitem:"] },
+    ],
+    types, idPrefixes: ["tt", "kitsu:", "rssmovie:", "rssmeta:", "prowjack:", "rssitem:"], catalogs,
     behaviorHints: { configurable: true, configurationRequired: false, p2p: hasP2P },
   });
 });
 
-// ─────────────────────────────────────────────────────────
-// CATALOG
-// ─────────────────────────────────────────────────────────
 app.get("/:userConfig/catalog/:type/:id.json", async (req, res) => {
   const { type, id } = req.params;
   const catalogTypeMap = {
@@ -1680,22 +1653,125 @@ app.get("/:userConfig/meta/:type/:id.json", async (req, res) => {
   }
 
   try {
-    const rssItems = await loadRssItemsForType(prefs, rssMeta.catalogType);
-    const videos = buildRssVideos(rssItems, rssMeta.catalogType, rssMeta.metaId);
-    if (!videos.length) return res.json({ meta: null });
+    // ── PASSO 1: Cinemeta primeiro (lista completa de episódios com thumbnails/títulos) ──
+    // Lógica inspirada no builder.js do addon TorBox: buscar metadados ricos do Cinemeta
+    // ANTES de verificar o RSS, e só depois filtrar pelos episódios disponíveis no cache.
+    // Isso evita o "nenhuma informação disponível" causado por ImdbIds ainda não resolvidos.
+    const metaCacheKey = `rssmeta:${rssMeta.metaId}`;
+    let baseMeta = {};
+    const cachedMetaRaw = await rc.get(metaCacheKey).catch(() => null);
+    if (cachedMetaRaw) {
+      try { baseMeta = JSON.parse(cachedMetaRaw); } catch {}
+    }
+    if (!baseMeta.name) {
+      try {
+        const r = await axios.get(`https://v3-cinemeta.strem.io/meta/series/${rssMeta.metaId}.json`, { timeout: 6000 });
+        baseMeta = r.data?.meta || {};
+        if (baseMeta.name) rc.set(metaCacheKey, JSON.stringify(baseMeta), 86400).catch(() => {});
+      } catch {
+        // Fallback: catálogo local
+        const catalogRaw = await rc.get(`${CATALOG_KEY}:${rssMeta.catalogType}`).catch(() => null);
+        const catalogItems = catalogRaw ? JSON.parse(catalogRaw) : [];
+        const found = catalogItems.find(i => i.id === id || i.id === rssMeta.metaId);
+        if (found) baseMeta = found;
+      }
+    }
 
-    const r = await axios.get(`https://v3-cinemeta.strem.io/meta/series/${rssMeta.metaId}.json`, { timeout: 6000 });
-    const baseMeta = r.data?.meta || {};
+    // ── PASSO 2: Construir set de episódios disponíveis a partir do cache RSS ──
+    // Mesmo padrão do builder.js: availableEps determina quais episódios mostrar.
+    const rssItems = await loadRssItemsForType(prefs, rssMeta.catalogType);
+    const matchedRssItems = rssItems.filter(item =>
+      normalizeImdbId(item.ImdbId) === normalizeImdbId(rssMeta.metaId)
+    );
+
+    const availableEps = new Set();
+    for (const item of matchedRssItems) {
+      const marker = rssMeta.catalogType === "anime"
+        ? extractAnimeFeedMarker(item.Title)
+        : extractSeriesFeedMarker(item.Title);
+      if (!marker) {
+        // Não foi possível parsear — assume que cobre tudo (ex: season pack sem marker)
+        availableEps.add("all");
+        continue;
+      }
+      if (marker.pack) {
+        // Season Pack: temporada inteira disponível
+        availableEps.add(`season:${marker.season}`);
+      } else {
+        // Episódio específico
+        availableEps.add(`${marker.season}:${marker.episode}`);
+      }
+    }
+
+    console.log(`[Meta] ${rssMeta.metaId}: ${matchedRssItems.length} itens RSS → marcadores: [${[...availableEps].join(", ")}]`);
+
+    // ── PASSO 3: Filtrar episódios do Cinemeta e remalear IDs para rssitem: ──
+    const cinemetaVideos = baseMeta.videos || [];
+    let videos;
+
+    if (availableEps.size === 0) {
+      // Nenhum item RSS encontrado para esta série ainda.
+      // Retornar meta sem episódios mas com poster/nome para não quebrar o catálogo.
+      videos = [];
+      console.log(`[Meta] ${rssMeta.metaId}: nenhum episódio RSS disponível`);
+    } else {
+      videos = cinemetaVideos
+        .filter(v => {
+          if (!v.season || !v.episode) return false; // Ignorar entradas sem S/E
+          if (availableEps.has("all"))                      return true;
+          if (availableEps.has(`${v.season}:${v.episode}`)) return true;
+          if (availableEps.has(`season:${v.season}`))       return true;
+          return false;
+        })
+        .map(v => ({
+          ...v,
+          // Remapear ID para o formato rssitem: que o /stream sabe resolver
+          id: `rssitem:${rssMeta.catalogType}:${rssMeta.metaId}:${v.season}:${v.episode}`,
+        }));
+
+      // Fallback: nenhum episódio do Cinemeta bate com os marcadores RSS
+      if (videos.length === 0 && matchedRssItems.length > 0) {
+        const rssVideos = buildRssVideos(rssItems, rssMeta.catalogType, rssMeta.metaId);
+
+        if (cinemetaVideos.length === 0) {
+          // Cinemeta não tem NENHUM episódio (série nova / fora do catálogo) → RSS puro
+          console.log(`[Meta] ${rssMeta.metaId}: Cinemeta sem episódios → usando RSS`);
+          videos = rssVideos;
+        } else {
+          // Cinemeta tem episódios de outra(s) temporada(s) e o RSS tem temporada mais nova
+          // → merge: exibe todos os eps do Cinemeta (com ID original) + novos do RSS (com rssitem:)
+          // Os eps do Cinemeta ficam com ID original (streamable via outros addons/P2P);
+          // os do RSS ficam com rssitem: (streamable via este addon).
+          const rssKeys = new Set(rssVideos.map(v => `${v.season}:${v.episode}`));
+          const cinemetaOther = cinemetaVideos
+            .filter(v => v.season && v.episode && !rssKeys.has(`${v.season}:${v.episode}`))
+            .map(v => ({ ...v, id: `rssitem:${rssMeta.catalogType}:${rssMeta.metaId}:${v.season}:${v.episode}` }));
+          videos = [...cinemetaOther, ...rssVideos]
+            .sort((a, b) => (a.season - b.season) || (a.episode - b.episode));
+          console.log(`[Meta] ${rssMeta.metaId}: temporada RSS mais recente → merge ${cinemetaOther.length} Cinemeta + ${rssVideos.length} RSS`);
+        }
+      }
+
+      const rssCount   = videos.filter(v => String(v.id).startsWith("rssitem:")).length;
+      const totalCount = videos.length;
+      console.log(`[Meta] ${rssMeta.metaId}: ${totalCount} eps disponíveis (${rssCount} via RSS, ${totalCount - rssCount} via Cinemeta)`);
+    }
+
+    // Sem nome e sem episódios = não há o que mostrar
+    if (!baseMeta.name && !videos.length) return res.json({ meta: null });
+
+    const { videos: _ignored, imdb_id: _imdb, moviedb_id: _tmdb, slug: _slug, trailers: _tr, credits_cast: _cc, credits_crew: _cr, ...baseMetaWithoutVideos } = baseMeta;
     return res.json({
       meta: {
-        ...baseMeta,
+        ...baseMetaWithoutVideos,
         id,
         type: "series",
         videos,
-        behaviorHints: { defaultVideoId: videos[0].id, hasScheduledVideos: false },
+        behaviorHints: { hasScheduledVideos: false },
       }
     });
-  } catch {
+  } catch (err) {
+    console.error(`[Meta] Erro: ${err.message}`);
     return res.json({ meta: null });
   }
 });
@@ -1963,9 +2039,37 @@ app.get("/qbit/stream/:jobToken", async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────
-// STREAMS
-// ─────────────────────────────────────────────────────────
+async function fetchScrapStreams(manifestUrl, type, id) {
+  try {
+    const base = manifestUrl.replace(/\/manifest\.json$/i, "");
+    const url  = `${base}/stream/${type}/${id}.json`;
+    const res  = await axios.get(url, { timeout: 8000, validateStatus: s => s < 400 });
+    const streams = res.data?.streams;
+    if (!Array.isArray(streams)) return [];
+    return streams
+      .filter(s => s.infoHash || (s.url && !s.url.startsWith("magnet:")))
+      .map(s => {
+        // Extrai título do campo name ou title para scoring de idioma/resolução
+        const rawName = s.name || "";
+        const desc    = s.description || s.title || "";
+        // O título relevante para filtros está geralmente na description (ex: Torrentio)
+        const titleForFilters = desc || rawName;
+        const size = s.behaviorHints?.videoSize || 0;
+        return {
+          ...s,
+          _sourceType:  "debrid",
+          _scrapSource: true,
+          _cached:      true,   // streams do scrap já estão resolvidos no debrid
+          _title:       titleForFilters,
+          _filename:    s.behaviorHints?.filename || "",
+          _sizeBytes:   size,
+          _seeders:     0,
+          _sizeGb:      size / 1e9,
+        };
+      });
+  } catch { return []; }
+}
+
 const BAD_RE = /\b(cam|hdcam|camrip|workprint)\b/i;
 app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
   const prefs = resolvePrefs(req.params.userConfig);
@@ -1979,6 +2083,20 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
   if (isDebridMode) {
     console.log(`[DEBRID] Modo ativo: ${prefs.debridConfig.mode.toUpperCase()} — P2P desabilitado`);
+  }
+
+  // Cache de streams resolvidos — retorno instantâneo se já processado antes
+  const streamCacheKey = `streams:${CACHE_VERSION}:${req.params.userConfig}:${type}:${id}`;
+  const cachedStreams = await rc.get(streamCacheKey).catch(() => null);
+  if (cachedStreams) {
+    try {
+      const parsed = JSON.parse(cachedStreams);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        console.log(`[Stream Cache HIT] ${parsed.length} streams para ${id}`);
+        console.log(`=========================================\n`);
+        return res.json({ streams: parsed });
+      }
+    } catch {}
   }
 
   try {
@@ -1996,7 +2114,6 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     let results;
     const rssType = parsed.rssType || (parsed.isAnime ? "anime" : type === "movie" ? "movie" : "series");
     let usedRssFastPath = false;
-    const isRssSource = parsed.source === "rssmovie" || parsed.source === "rssitem";
     const preferredRssIndexers = Array.isArray(prefs.rssIndexers) && prefs.rssIndexers.length
       ? prefs.rssIndexers
       : (Array.isArray(prefs.indexers) && prefs.indexers.length && !prefs.indexers.includes("all") ? prefs.indexers : null);
@@ -2024,12 +2141,13 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       }
     } else if (parsed.source === "rssitem") {
       const rssHits = await loadRssItemsForType(prefs, parsed.rssType || rssType);
+      const requestedEpisode = parsed.episode ?? 0;
       const exactItems = matchRssItemsByMarker(
         rssHits,
         parsed.rssType || rssType,
         parsed.metaId,
         parsed.season ?? 1,
-        parsed.episode ?? 0
+        requestedEpisode
       );
       if (exactItems.length) {
         results = exactItems.map((item, idx) => ({ ...item, _metaIdMatch: true, _titleMatchScore: 1, _rssPreferred: true, _rssOrder: idx }));
@@ -2082,7 +2200,16 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     }
 
     if (!usedRssFastPath) {
-      results = await jackettSearch({ parsed, queries, search }, indexers, prefs);
+      // Busca Jackett e scrap em paralelo
+      const [jackettResults, scrapResults] = await Promise.all([
+        jackettSearch({ parsed, queries, search }, indexers, prefs),
+        ENV.scrapManifests.length
+          ? Promise.all(ENV.scrapManifests.map(m => fetchScrapStreams(m, type, id)))
+          : Promise.resolve([])
+      ]);
+      results = jackettResults;
+      // Guarda scrap para injetar depois em allStreams
+      results._scrapStreams = scrapResults.flat();
     }
     const priorityLang = prefs.priorityLang ?? "pt-br";
 
@@ -2198,7 +2325,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     let rdCacheMap = {};
     let tbCacheMap = {};
 
-    if (isDebridMode && !prefs.stConfig && withHashes.length > 0) {
+    if (isDebridMode && !prefs.stConfig && withHashes.length > 0 && !bypassRssFilters) {
       const allHashes   = [...new Set(withHashes.map(r => r._resolved.infoHash))];
       const { mode, torboxKey, rdKey } = prefs.debridConfig;
       const { rdBatchCheckCache, torboxBatchCheckCache } = require("./debrid");
@@ -2260,6 +2387,11 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           const matchedFile  = (type === "series" || parsed.isAnime)
             ? pickEpisodeFile(resolved.files, parsed.season, parsed.episode ?? episode, parsed.isAnime)
             : null;
+          if ((type === "series" || parsed.isAnime) && resolved.files?.length && !matchedFile) {
+            console.log(`[WARN] pickEpisodeFile: nenhum arquivo encontrado para S${parsed.season}E${parsed.episode ?? episode} em "${r.Title?.slice(0,60)}"`);
+          } else if (matchedFile) {
+            console.log(`[FILE] Arquivo selecionado: "${matchedFile.name}" (idx=${matchedFile.idx}) para S${parsed.season}E${parsed.episode ?? episode}`);
+          }
           const magnet      = buildMagnet(resolved.infoHash, r.MagnetUri, r.Title);
           const publicBase  = getPublicBase(req);
           const localPlayable = isQbitConfigured(qbitCreds)
@@ -2503,6 +2635,28 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
     const allStreams = resolvedAll.flat(2).filter(Boolean);
 
+    // Scrap: injeta streams externos já resolvidos — passam pela mesma ordenação que os do Jackett
+    const pendingScrap = results._scrapStreams || [];
+    if (pendingScrap.length) {
+      // onlyDubbed: scrap passa se keyword bate OU se não tem info de idioma (debrid externo)
+      const filteredScrap = prefs.onlyDubbed && priorityLang
+        ? pendingScrap.filter(s => {
+            if (prefs.keywordBoost && matchesKeywordBoost(s._title, prefs.keywordBoost)) return true;
+            const langs = getLangs(s._title, parsed.isAnime);
+            // Se não tem nenhuma keyword de idioma no título, passa (debrid sem info de idioma)
+            return langs.length === 0 || langs.some(l => l.code === priorityLang);
+          })
+        : pendingScrap;
+      // Limita scrap a metade dos slots para não sufocar resultados do Jackett
+      const scrapSlots = Math.ceil(maxOut / 2);
+      const scrapToAdd = filteredScrap.slice(0, scrapSlots);
+      if (scrapToAdd.length) {
+        scrapToAdd.forEach(s => { s._originalScore = 0; });
+        console.log(`[SCRAP] ${scrapToAdd.length}/${pendingScrap.length} streams de ${ENV.scrapManifests.length} addon(s) externo(s)`);
+        allStreams.push(...scrapToAdd);
+      }
+    }
+
     resolvedAll.forEach((streamOrArr, i) => {
       const r = dedupedWithHashes[i];
       if (!r) return;
@@ -2519,7 +2673,23 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     const dedupedStreams = (() => {
       const out = [];
       const seenQbit = new Set();
+      // Dedup scrap vs Jackett: scrap tem prioridade por infoHash idêntico OU tamanho similar (±5%)
+      const scrapHashes = new Set(allStreams.filter(s => s._scrapSource && s.infoHash).map(s => s.infoHash.toLowerCase()));
+      const scrapSizes  = allStreams.filter(s => s._scrapSource && (s._sizeBytes > 0)).map(s => s._sizeBytes);
+      const jackettHashes = new Set(allStreams.filter(s => !s._scrapSource && s.infoHash).map(s => s.infoHash.toLowerCase()));
+      const isSimilarSize = (a, b) => a > 0 && b > 0 && Math.abs(a - b) / Math.max(a, b) < 0.05;
       for (const s of allStreams) {
+        // Scrap: marca _cached=true se mesmo hash que Jackett
+        if (s._scrapSource && s.infoHash && jackettHashes.has(s.infoHash.toLowerCase())) {
+          s._cached = true;
+        }
+        // Jackett: remove se scrap cobre mesmo hash OU tamanho similar
+        if (!s._scrapSource) {
+          const hash = s.infoHash?.toLowerCase();
+          const size = s.behaviorHints?.videoSize || s._sizeBytes || 0;
+          if (hash && scrapHashes.has(hash)) continue;
+          if (size > 0 && scrapSizes.some(ss => isSimilarSize(ss, size))) continue;
+        }
         const isQbit = s?._sourceType === "http" && typeof s.url === "string" && s.url.includes("/qbit/");
         if (isQbit) {
           const key = `${s.behaviorHints?.bingeGroup || ""}|${s.behaviorHints?.filename || ""}`;
@@ -2533,8 +2703,8 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
     const _sourceRank = (s) => {
       if (s?._sourceType === "debrid") return 0;
-      if (s?._sourceType === "http") return 1;
-      if (s?._sourceType === "p2p") return 2;
+      if (s?._sourceType === "http")   return 1;
+      if (s?._sourceType === "p2p")    return 2;
       return 3;
     };
 
@@ -2544,6 +2714,8 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       if (priorityLang && langs.some(l => l.code === priorityLang)) return 3;
       if (prefs.keywordBoost && matchesKeywordBoost(t, prefs.keywordBoost)) return 2;
       if (/(multi|dual)[-.\\s]?(audio)?/i.test(t)) return 1;
+      // Scrap sem info de idioma: score neutro (não penaliza por falta de keyword)
+      if (s._scrapSource && langs.length === 0) return 1;
       return 0;
     };
     const _resScore  = (s) => { const r = first(RESOLUTION, s._title || ""); return r ? r.score  : 0; };
@@ -2582,6 +2754,10 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       console.log(`Magnets listados: Enviando ${finalStreams.length} torrents!`);
     }
     console.log(`=========================================\n`);
+    // Salva streams resolvidos no cache (TTL 3h) — só se tiver resultados
+    if (finalStreams.length > 0) {
+      rc.set(streamCacheKey, JSON.stringify(finalStreams), 10800).catch(() => {});
+    }
     res.json({ streams: finalStreams });
   } catch (err) {
     console.log(`Erro no processamento: ${err.message}`);
