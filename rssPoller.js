@@ -53,18 +53,21 @@ async function resolveItemHash(item) {
 
 // Detecta indexers privados via API do Prowlarr ou Jackett
 async function fetchPrivateIndexers(jUrl, jKey) {
+  const catalogFilter = (process.env.RSS_CATALOG_INDEXERS || "").trim();
+
   // Tenta Prowlarr primeiro
   try {
     const res = await axios.get(`${jUrl}/api/v1/indexer`, {
       params: { apikey: jKey }, timeout: 8000, validateStatus: () => true,
     });
     if (res.status < 400 && Array.isArray(res.data)) {
-      const privates = res.data
-        .filter(ix => ix.privacy === "private" || ix.privacy === "semiPrivate")
-        .map(ix => ({ id: String(ix.id), name: String(ix.name || ix.id) }));
-      if (privates.length) return privates;
-      // Prowlarr respondeu mas sem privados — retorna todos configurados
-      return res.data.map(ix => ({ id: String(ix.id), name: String(ix.name || ix.id) }));
+      const all = res.data.map(ix => ({ id: String(ix.id), name: String(ix.name || ix.id) }));
+      // Se RSS_CATALOG_INDEXERS definido, usa todos (inclui públicos); senão só privados
+      if (catalogFilter) return all;
+      const privates = all.filter((_, i) =>
+        res.data[i].privacy === "private" || res.data[i].privacy === "semiPrivate"
+      );
+      return privates.length ? privates : all;
     }
   } catch {}
 
