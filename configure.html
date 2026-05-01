@@ -280,9 +280,9 @@ hr{border:none;border-top:1px solid var(--bord);margin:14px 0}
         <div class="card-title">Opções</div>
         <div class="tg-row">
           <button class="tg on" id="skipBadBtn">Skip CAM/TS</button>
-          <button class="tg on" id="onlyLangBtn">Apenas idioma</button>
+          <button class="tg" id="onlyLangBtn">Apenas idioma</button>
           <button class="tg on" id="dedupeBtn">Deduplicar</button>
-          <button class="tg on" id="enableCatalogBtn" title="Exibe catálogo RSS no Stremio">Catálogo RSS</button>
+          <button class="tg" id="enableCatalogBtn" title="Exibe catálogo RSS no Stremio">Catálogo RSS</button>
         </div>
         <div class="info" style="margin-top:-4px;margin-bottom:12px">Catálogo RSS requer uma instância persistente (VPS/Docker) ou worker/cron externo alimentando o Redis. Em Vercel/serverless, o poller interno não roda de forma confiável.</div>
 
@@ -429,7 +429,7 @@ hr{border:none;border-top:1px solid var(--bord);margin:14px 0}
         </div>
 
         <label style="display:flex;align-items:center;gap:9px;cursor:pointer;margin-bottom:10px">
-          <input type="checkbox" id="enableP2P" checked style="width:15px;height:15px;accent-color:var(--amber)" onchange="toggleQbitMode()"/>
+          <input type="checkbox" id="enableP2P" style="width:15px;height:15px;accent-color:var(--amber)" onchange="toggleQbitMode()"/>
           <span style="font-size:13px;font-weight:500">qBittorrent HTTP</span>
         </label>
         <div class="info" style="margin-left:24px;margin-bottom:10px">Opcional. Só funciona em instância auto-hospedada com <code>QBIT_URL</code>, <code>QBIT_USER</code> e <code>QBIT_PASS</code> no <code>.env</code>. Magnet links nativos continuam ativos sem qBittorrent quando não há Debrid.</div>
