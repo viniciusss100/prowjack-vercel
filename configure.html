@@ -280,15 +280,15 @@ hr{border:none;border-top:1px solid var(--bord);margin:14px 0}
         <div class="card-title">Opções</div>
         <div class="tg-row">
           <button class="tg on" id="skipBadBtn">Skip CAM/TS</button>
-          <button class="tg" id="onlyLangBtn">Apenas idioma</button>
+          <button class="tg on" id="onlyLangBtn">Apenas idioma</button>
           <button class="tg on" id="dedupeBtn">Deduplicar</button>
-          <button class="tg" id="enableCatalogBtn" title="Exibe catálogo RSS no Stremio">Catálogo RSS</button>
+          <button class="tg on" id="enableCatalogBtn" title="Exibe catálogo RSS no Stremio">Catálogo RSS</button>
         </div>
         <div class="info" style="margin-top:-4px;margin-bottom:12px">Catálogo RSS requer uma instância persistente (VPS/Docker) ou worker/cron externo alimentando o Redis. Em Vercel/serverless, o poller interno não roda de forma confiável.</div>
 
         <label class="lbl">⭐ Boost por Keywords</label>
-        <input type="text" id="keywordBoost" placeholder="ex: dual-bioma  ou  brremux  (palavras inteiras)" value="(cypher|freddiegellar|dual-bioma|dual-c76|tossato|c0ral|dual-nogroup|dual-pia|dual-xor|dual-xar|g4ris|dual-sigma|andrehsa|riper|sigla|tontom|dual-eck|1-sf|0-sf|por-br|RARBR|TupaC|alfaHD|DUAL-cza|DUAL-7sprite7|potatin|Dual-fly|Brazilian|franceira)"/>
-        <div class="info" style="margin-top:-8px;margin-bottom:12px">Cada palavra é verificada como termo completo. Separe por espaço para exigir múltiplas palavras.</div>
+        <input type="text" id="keywordBoost" placeholder="ex: dual-bioma  ou  brremux  (palavras inteiras)" value="portuguese, Brazilian, por-br, dublado, bremux, cypher, freddiegellar, dual-bioma, dual-c76, tossato, c0ral, dual-nogroup, dual-pia, dual-xor, dual-xar, g4ris, dual-sigma, andrehsa, riper, sigla, tontom, dual-eck, 1-sf, 0-sf, RARBR, TupaC, alfaHD, DUAL-cza, DUAL-7sprite7, potatin, Dual-fly, franceira"/>
+        <div class="info" style="margin-top:-8px;margin-bottom:12px">Funciona como inclusão: com "Apenas idioma" ativo, itens que baterem nas keywords também entram. Aceita regex (<code>\bremux\b|cypher|dual-bioma</code>) ou lista por espaço/vírgula (<code>remux, cypher, dual-bioma</code>).</div>
 
         <div class="g3">
           <div>
