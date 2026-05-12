@@ -287,7 +287,7 @@ hr{border:none;border-top:1px solid var(--bord);margin:14px 0}
         <div class="info" style="margin-top:-4px;margin-bottom:12px">Catálogo RSS requer uma instância persistente (VPS/Docker) ou worker/cron externo alimentando o Redis. Em Vercel/serverless, o poller interno não roda de forma confiável.</div>
 
         <label class="lbl">⭐ Boost por Keywords</label>
-        <input type="text" id="keywordBoost" placeholder="ex: dual-bioma  ou  brremux  (palavras inteiras)" value="(\bremux\b|cypher|freddiegellar|dual-bioma|dual-c76|tossato|c0ral|dual-nogroup|dual-pia|dual-xor|dual-xar|g4ris|dual-sigma|andrehsa|riper|sigla|tontom|dual-eck|1-sf|0-sf|por-br|RARBR|TupaC|alfaHD|DUAL-cza|DUAL-7sprite7|potatin|Dual-fly|Brazilian|franceira)"/>
+        <input type="text" id="keywordBoost" placeholder="ex: dual-bioma  ou  brremux  (palavras inteiras)" value="DUBLADO|PORTUGUES|POR-BR|BRAZILIAN|BREMUX|CYPHER|FREDDIEGELLAR|DUAL-BiOMA|DUAL-C76|TOSSATO|C0RAL|DUAL-NOGROUP|DUAL-PIA|DUAL-XOR|DUAL-XAR|G4RIS|DUAL-SIGMA|ANDREHSA|RIPER|SiGLA|TONTOM|DUAL-ECK|1-SF|0-SF|RARBR|TUPAC|ALFAHD|DUAL-CZA|DUAL-7SPRITE7|POTATIN|DUAL-FLY|FRANCEIRA"/>
         <div class="info" style="margin-top:-8px;margin-bottom:12px">Cada palavra é verificada como termo completo. Separe por espaço para exigir múltiplas palavras.</div>
 
         <div class="g3">
@@ -301,7 +301,7 @@ hr{border:none;border-top:1px solid var(--bord);margin:14px 0}
           </div>
           <div>
             <label class="lbl">Máx/Indexer</label>
-            <input type="number" id="maxResultsPerIndexer" value="12" min="0" max="200" title="0 = sem limite"/>
+            <input type="number" id="maxResultsPerIndexer" value="8" min="0" max="200" title="0 = sem limite"/>
           </div>
         </div>
       </div>
@@ -389,15 +389,15 @@ hr{border:none;border-top:1px solid var(--bord);margin:14px 0}
           <div class="g2">
             <div>
               <label class="lbl">Qualidades bloqueadas</label>
-              <input type="text" id="rdExcludeQualities" placeholder="WEB-DL, WEBRip, DVDRip, AMZ"/>
+              <input type="text" id="rdExcludeQualities" placeholder="WEB-DL, WEBRip, DVDRip, AMZ"  value="WEB-DL, WEBRip, DVDRip, AMZ"/>
             </div>
             <div>
               <label class="lbl">Indexers bloqueados</label>
-              <input type="text" id="rdExcludeIndexers" placeholder="rartv, rarbg, eztv"/>
+              <input type="text" id="rdExcludeIndexers" placeholder="rartv, rarbg, eztv"  value="rartv, rarbg, eztv"/>
             </div>
             <div>
               <label class="lbl">Release groups bloqueados</label>
-              <input type="text" id="rdExcludeGroups" placeholder="YTS, Erai-raws"/>
+              <input type="text" id="rdExcludeGroups" placeholder="YTS, Erai-raws"  value="YTS, Erai-raws"/>
             </div>
             <div>
               <label class="lbl">Keywords gerais</label>
