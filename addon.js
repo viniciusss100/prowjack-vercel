@@ -1829,8 +1829,8 @@ app.delete("/api/metrics/:indexer", async (req, res) => {
 });
 app.get("/manifest.json", (_, res) => {
   res.json({
-    id: "org.prowjack.pro", version: "3.12.0", name: "ProwJack PRO",
-    description: "Configure os parametros pela URL.",
+    id: "org.prowjack.pro", version: "3.13.0", name: "ProwJack",
+    description: "Qbittorrent+Prowlarr/Jackett+Debrid+Filtros por keywords e remendo para RD",
     resources: ["stream", "meta"], types: ["movie", "series"],
     idPrefixes: ["tt", "kitsu:", "rssmovie:", "rssmeta:", "rssitem:"],
     catalogs: [], behaviorHints: { configurable: true, configurationRequired: true, p2p: true },
@@ -1862,8 +1862,8 @@ app.get("/:userConfig/manifest.json", async (req, res) => {
     if (enabledCats.includes("series")) catalogs.push({ type: "series", id: "prowjack_rss_series", name: `${name} — Lançamentos` });
   }
   res.json({
-    id: "org.prowjack.pro", version: "3.12.0", name,
-    description: `Jackett Otimizado · Prioridade PT-BR`,
+    id: "org.prowjack.pro", version: "3.13.0", name,
+    description: "Qbittorrent+Prowlarr/Jackett+Debrid+Filtros por keywords e remendo para RD",
     resources: [
       "catalog",
       { name: "meta",   types, idPrefixes: ["rssmovie:", "rssmeta:", "prowjack:", "rssitem:"] },
@@ -3279,7 +3279,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 });
 
 app.listen(ENV.port, () => {
-  console.log(`ProwJack PRO v3.12.0 -> http://localhost:${ENV.port}/configure`);
+  console.log(`ProwJack v3.13.0 -> http://localhost:${ENV.port}/configure`);
   console.log(`   Jackett : ${ENV.jackettUrl}`);
   console.log(`   Redis   : ${ENV.redisUrl}`);
   console.log(`   qBittorrent: ${isQbitConfigured() ? "ativo" : "desativado"}`);
