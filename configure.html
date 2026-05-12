@@ -109,6 +109,7 @@ input[type=number]{-moz-appearance:textfield}
 .ix-item.on{border-color:rgba(108,143,255,.4);background:var(--accent-glow)}
 .ix-item input[type=checkbox]{accent-color:var(--accent);cursor:pointer;flex-shrink:0}
 .ix-name{flex:1;font-size:11px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ix-id{font-family:var(--mono);font-size:9px;color:var(--dim);background:var(--sur2);padding:1px 4px;border-radius:4px;border:1px solid var(--bord)}
 .ix-flag{display:inline-flex;padding:1px 5px;border-radius:4px;font-size:9px;font-weight:600;letter-spacing:.5px;text-transform:uppercase}
 .ix-flag.private{background:rgba(251,146,60,.12);color:var(--tb);border:1px solid rgba(251,146,60,.2)}
 .ix-empty{padding:32px;text-align:center;color:var(--dim);font-size:12px}
@@ -711,6 +712,7 @@ function renderIndexers() {
     el.dataset.id = ix.id;
     el.dataset.name = ix.name.toLowerCase();
     el.innerHTML = `<input type="checkbox" ${checked?'checked':''}/>
+      <span class="ix-id">${ix.id}</span>
       <span class="ix-name" title="${ix.name}">${ix.name}</span>
       ${ix.private ? '<span class="ix-flag private">Privado</span>' : ''}`;
     const input = el.querySelector('input');
