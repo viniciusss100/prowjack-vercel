@@ -1,8 +1,8 @@
-# 🎬 ProwJack PRO
+# 🎬 ProwJack
 
-**Addon Stremio v3.12 otimizado para Jackett/Prowlarr com suporte a Debrid, StremThru, P2P e qBittorrent HTTP**
+**Addon Stremio v3.13 otimizado para Jackett/Prowlarr com suporte a Debrid, StremThru, P2P e qBittorrent HTTP**
 
-ProwJack PRO é um addon avançado para Stremio que integra indexadores Jackett/Prowlarr com serviços Debrid (Real-Debrid, TorBox), StremThru, P2P nativo e qBittorrent HTTP opcional, oferecendo streaming de alta qualidade com priorização inteligente de idioma PT-BR.
+ProwJack é um addon avançado para Stremio que integra indexadores Jackett/Prowlarr com serviços Debrid (Real-Debrid, TorBox), StremThru, P2P nativo e qBittorrent HTTP opcional, oferecendo streaming de alta qualidade com priorização inteligente de idioma PT-BR e bypass de filtros para indexadores privados.
 
 ---
 
@@ -10,6 +10,7 @@ ProwJack PRO é um addon avançado para Stremio que integra indexadores Jackett/
 
 ### 🎯 Core
 - **Integração Prowlarr**: Busca em múltiplos indexadores públicos e privados
+- **Filtro de Indexadores Prioritários**: IDs numéricos (Prowlarr) configurados na UI ignoram filtros de idioma/dublado e aparecem no topo dos resultados.
 - **Catálogo RSS**: Polling automático de indexers do Prowlarr/Jackett com catálogo de lançamentos recentes no Stremio
 - **Suporte Debrid**: Real-Debrid, TorBox e StremThru
 - **P2P nativo**: Magnet/infoHash direto no Stremio quando Debrid não está ativo
@@ -20,6 +21,8 @@ ProwJack PRO é um addon avançado para Stremio que integra indexadores Jackett/
 
 ### 🔍 Busca Inteligente
 - **Busca Estruturada**: Torznab com IMDb ID para precisão máxima
+- **Fase Rápida Otimizada**: Retorna resultados instantâneos enquanto buscas lentas continuam em background para atualizar o cache.
+- **RD Keywords**: Filtro de keywords para bloquear releases problemáticos no Real-Debrid (Ex: releases sem som, fakes, ou que dão erro no serviço).
 - **Fallback Texto**: Busca por título quando estruturada falha
 - **Deduplicação**: Remove releases duplicados por hash e título
 - **Filtros Avançados**: Qualidade, resolução, idioma, keywords
@@ -44,7 +47,7 @@ ProwJack PRO é um addon avançado para Stremio que integra indexadores Jackett/
 
 ## 📡 Catálogo RSS
 
-O ProwJack PRO inclui um sistema de catálogo automático baseado no feed RSS dos indexers configurados no **Prowlarr/Jackett**. Isso permite visualizar lançamentos recentes diretamente no Stremio, sem precisar buscar manualmente.
+O ProwJack inclui um sistema de catálogo automático baseado no feed RSS dos indexers configurados no **Prowlarr/Jackett**. Isso permite visualizar lançamentos recentes diretamente no Stremio, sem precisar buscar manualmente.
 
 ### Como funciona
 
@@ -462,6 +465,13 @@ Contribuições são bem-vindas! Por favor:
 
 ## 📝 Changelog
 
+### v3.13.0 (2026-05-12)
+- 🚀 **Busca Assíncrona Otimizada**: A fase rápida da busca agora retorna resultados instantâneos, permitindo que indexadores lentos completem em background sem travar a interface do Stremio.
+- 🎯 **Indexadores Prioritários**: IDs numéricos (Prowlarr) configurados na UI agora ignoram filtros de idioma e ano, aparecendo sempre no topo (Bypass de filtros PT-BR/Dublado para indexadores privados).
+- 🔍 **RD Keywords**: Adicionado suporte a `rdKeywords` para filtrar releases bloqueados ou problemáticos especificamente no Real-Debrid.
+- ⚡ **Performance de InfoHash**: Concorrência aumentada e timeouts reduzidos para extração de hashes de arquivos `.torrent`.
+- 🐛 **Correção de Seleção**: Melhoria na lógica de seleção de indexadores quando IDs específicos são fornecidos junto com a opção "Todos".
+
 ### v3.12.0 (2026-05-01)
 - ✨ **Configuração segura**: URLs de instalação novas usam `cfg_...` salvo no backend; chaves Debrid/qBit deixam de ir diretamente na URL
 - 🔒 **Validação server-side**: `/api/config` sanitiza campos, limita números, valida serviços Debrid/StremThru e aceita apenas opções conhecidas
@@ -515,14 +525,6 @@ Este projeto é distribuído sob a licença MIT. Veja o arquivo `LICENSE` para m
 - **Real-Debrid/TorBox**: Serviços de debrid
 - **qBittorrent**: Cliente torrent
 - **Comunidade**: Todos os contribuidores e usuários
-
----
-
-## 📞 Suporte
-
-- **Issues**: [GitHub Issues](https://github.com/seu-usuario/prowjack-pro/issues)
-- **Discussões**: [GitHub Discussions](https://github.com/seu-usuario/prowjack-pro/discussions)
-- **Discord**: [Link do servidor](https://discord.gg/seu-servidor)
 
 ---
 
