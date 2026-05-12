@@ -1,7 +1,7 @@
 {
-  "name": "prowjack-pro",
+  "name": "prowjack",
   "version": "3.12.0",
-  "description": "ProwJack PRO — Jackett Stremio Addon",
+  "description": "Qbittorrent+Prowlarr/Jackett+Debrid+Filtros por keywords e remendo para RD",
   "main": "addon.js",
   "scripts": {
     "start": "node addon.js",
