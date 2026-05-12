@@ -30,6 +30,12 @@ function buildMagnet(infoHash, existingMagnet, title) {
   return `magnet:?xt=urn:btih:${infoHash}${dn}${tr}`;
 }
 
+function logRdAddFailure(stage, res) {
+  const status = res?.status || "sem status";
+  const data = typeof res?.data === "string" ? res.data : JSON.stringify(res?.data || {});
+  console.log(`[RD] ${stage} falhou: HTTP ${status} ${data.slice(0, 500)}`);
+}
+
 // =========================
 // REAL-DEBRID FUNCTIONS
 // =========================
@@ -77,6 +83,7 @@ async function rdAddTorrent(magnet, key, buffer = null) {
           validateStatus: s => s < 500
         }
       );
+      if (!res.data?.id) logRdAddFailure("addTorrent", res);
       return !!res.data?.id;
     }
     
@@ -89,6 +96,7 @@ async function rdAddTorrent(magnet, key, buffer = null) {
         validateStatus: s => s < 500
       }
     );
+    if (!res.data?.id) logRdAddFailure("addMagnet", res);
     return !!res.data?.id;
   } catch {
     return false;
@@ -120,6 +128,36 @@ function chunkArray(items, size) {
   return out;
 }
 
+async function rdListDownloadedHashes(hashes, headersAuth) {
+  const resultMap = {};
+  const wanted = new Set((hashes || []).map(h => String(h || "").toLowerCase()).filter(Boolean));
+  if (!wanted.size) return resultMap;
+  try {
+    for (let page = 1; page <= 5; page++) {
+      const listRes = await axios.get("https://api.real-debrid.com/rest/1.0/torrents", {
+        headers: headersAuth,
+        params: { page, limit: 100 },
+        timeout: 8000,
+        validateStatus: s => s < 500,
+      });
+      if (listRes.status >= 400 || !Array.isArray(listRes.data)) {
+        console.log(`[RD] torrents list fallback falhou: HTTP ${listRes.status}`);
+        break;
+      }
+      for (const torrent of listRes.data) {
+        const hash = String(torrent.hash || "").toLowerCase();
+        if (wanted.has(hash) && (torrent.status === "downloaded" || Number(torrent.progress) >= 100 || torrent.links?.length)) {
+          resultMap[hash] = { rd: [{ all: { filename: torrent.filename || torrent.name || "", filesize: torrent.bytes || 0, __accountCached: true } }] };
+        }
+      }
+      if (listRes.data.length < 100) break;
+    }
+  } catch (err) {
+    console.log(`[RD] torrents list fallback falhou (${err.response?.status || err.message})`);
+  }
+  return resultMap;
+}
+
 // NOVA VERSÃO - Cache check otimizado
 async function rdBatchCheckCache(hashes, key, bufferMap = {}, privateHashes = new Set()) {
   if (!hashes || !hashes.length) return {};
@@ -141,15 +179,20 @@ async function rdBatchCheckCache(hashes, key, bufferMap = {}, privateHashes = ne
       );
       const data = res.data || {};
       for (const hash of group) {
-        const entry = data[hash.toLowerCase()] || data[hash];
-        if (entry?.rd?.length) resultMap[hash.toLowerCase()] = { rd: entry.rd };
+        const keyLower = String(hash || "").toLowerCase();
+        const entry = data[keyLower] || data[hash] || data[String(hash || "").toUpperCase()];
+        const rd = Array.isArray(entry?.rd) ? entry.rd : [];
+        if (rd.length) resultMap[keyLower] = { rd };
       }
     }
+    Object.assign(resultMap, await rdListDownloadedHashes(uniqueHashes.filter(hash => !resultMap[hash]), headersAuth));
     console.log(`[RD] instantAvailability: ${Object.keys(resultMap).length} cached`);
     return resultMap;
   } catch (e) {
-    console.log(`[RD] instantAvailability falhou (${e.response?.status || e.message}); cache check read-only retornando vazio`);
-    return {};
+    console.log(`[RD] instantAvailability falhou (${e.response?.status || e.message}); usando fallback da lista da conta`);
+    const resultMap = await rdListDownloadedHashes(uniqueHashes, headersAuth);
+    console.log(`[RD] fallback conta: ${Object.keys(resultMap).length} cached`);
+    return resultMap;
   }
 }
 
@@ -189,6 +232,7 @@ async function rdGetDirectLink(hash, magnet, fileIds, key, torrentBuffer = null)
           }
         );
         torrentId = addRes.data?.id;
+        if (!torrentId) logRdAddFailure("addMagnet", addRes);
       }
 
       if (!torrentId) return null;
@@ -359,12 +403,14 @@ async function torboxBatchCheckCache(hashes, key, privateHashes = new Set()) {
     const data = res.data?.data || {};
 
     for (const hash of hashes) {
-      const cached = data[hash];
-      if (cached && typeof cached === "object" && cached !== false) {
-        resultMap[hash.toLowerCase()] = cached;
+      const keyLower = String(hash || "").toLowerCase();
+      const cached = data[hash] ?? data[keyLower] ?? data[String(hash || "").toUpperCase()];
+      if (cached && cached !== false) {
+        resultMap[keyLower] = typeof cached === "object" ? cached : { cached: true };
       }
     }
 
+    console.log(`[TorBox] checkcached: ${Object.keys(resultMap).length} cached`);
     return resultMap;
   } catch (err) {
     console.error(`[TorBox] Erro no cache check: ${err.message}`);

@@ -2,6 +2,7 @@
 const axios  = require("axios");
 const https  = require("https");
 const crypto = require("crypto");
+const { enrichMetaPtBr } = require("./metadata");
 
 // Aumenta limite de listeners para evitar warnings com múltiplas conexões TLS simultâneas
 https.globalAgent.setMaxListeners(0);
@@ -340,6 +341,7 @@ async function updateCatalog(rc, newItems) {
             const stremioType = type === "movie" ? "movie" : "series";
             const r = await axios.get(`https://v3-cinemeta.strem.io/meta/${stremioType}/${imdbId}.json`, { timeout: 5000 });
             meta = r.data?.meta;
+            meta = await enrichMetaPtBr(meta, imdbId, stremioType);
           } catch {}
         }
 
@@ -348,6 +350,7 @@ async function updateCatalog(rc, newItems) {
           if (!clean || clean.length < 3) continue;
           const stremioType = type === "movie" ? "movie" : "series";
           meta = await resolveImdbByTitle(clean, year, stremioType);
+          meta = await enrichMetaPtBr(meta, imdbId || meta?.id || meta?.imdb_id, stremioType);
           if (meta) {
             imdbId = meta.id || meta.imdb_id;
             if (imdbId && !item.ImdbId) item.ImdbId = imdbId; // propaga de volta por referência

@@ -7,6 +7,7 @@ const path    = require("path");
 const fs      = require("fs");
 const { resolveDebridStream, buildMagnet } = require("./debrid");
 const { startRssPoller, buildRssCacheKey, CATALOG_KEY } = require("./rssPoller");
+const { enrichMetaPtBr } = require("./metadata");
 const { injectTrackers, extractTrackers, EXTRA_TRACKERS } = require("./torrentEnrich");
 const {
   isConfigured: isQbitConfigured,
@@ -148,7 +149,8 @@ const rc = {
   },
 };
 const CACHE_VERSION = "v12-native-debrid";
-const STREAM_CACHE_VERSION = "v14-stremthru-fast-proxy";
+const STREAM_CACHE_VERSION = "v19-bounded-hash-inflight";
+const streamWaiters = new Map();
 
 function getPublicBase(req) {
   if (ENV.addonPublicUrl) return ENV.addonPublicUrl;
@@ -379,8 +381,21 @@ async function getCachedIndexers(jUrl, jKey) {
 async function resolveSearchIndexers(prefs, isAnime) {
   const jUrl     = (prefs?.jackett?.url || ENV.jackettUrl).replace(/\/+$/, "");
   const jKey     = prefs?.jackett?.key || ENV.apiKey;
-  const selected = (Array.isArray(prefs.indexers) ? prefs.indexers : []).filter(Boolean);
+
+  // Normaliza: aceita array ou string separada por vírgula
+  const rawSelected = Array.isArray(prefs.indexers) ? prefs.indexers : String(prefs.indexers || "").split(",");
+  const selected = rawSelected.map(s => String(s || "").trim()).filter(Boolean);
   const useAll   = !selected.length || selected.includes("all");
+
+  // IDs numéricos = Prowlarr; IDs string = Jackett. Não precisa buscar lista completa se já temos os IDs.
+  const allNumeric = selected.every(s => /^\d+$/.test(s));
+  if (!useAll && allNumeric) {
+    // Prowlarr com IDs numéricos: usa direto sem precisar buscar lista de indexers
+    const pool = selected;
+    if (isAnime) return pool;
+    return pool;
+  }
+
   const allList  = await getCachedIndexers(jUrl, jKey);
   const pool     = useAll ? allList.map(ix => ix.id) : selected;
   if (isAnime) {
@@ -435,6 +450,11 @@ function defaultPrefs() {
     debrid:          false,
     debridConfig:    null,
     keywordBoost:           "",
+    priorityIndexers:       [],
+    rdExcludeKeywords:      "",
+    rdExcludeQualities:     "",
+    rdExcludeIndexers:      "",
+    rdExcludeGroups:        "",
     maxResultsPerIndexer:   0,
     enableP2P:       true,  // P2P ativo por padrão (necessário para StremThru)
     qbitMode:        "private",
@@ -498,7 +518,11 @@ function sanitizeUserPrefs(input = {}) {
   const src = input && typeof input === "object" && !Array.isArray(input) ? input : {};
   const out = {};
 
-  const indexers = cleanStringArray(src.indexers, 200, 120);
+  // Normaliza indexers: aceita array ou string separada por vírgula (ex: "3,25,27")
+  const rawIndexers = Array.isArray(src.indexers)
+    ? src.indexers
+    : String(src.indexers || "").split(",").map(s => s.trim()).filter(Boolean);
+  const indexers = cleanStringArray(rawIndexers, 200, 120);
   out.indexers = indexers.length ? indexers : ["all"];
   const categories = cleanStringArray(src.categories, 10, 20).filter(c => ["movie", "series", "anime"].includes(c));
   out.categories = categories.length ? [...new Set(categories)] : ["movie", "series"];
@@ -521,6 +545,14 @@ function sanitizeUserPrefs(input = {}) {
   out.dedupe = src.dedupe !== false;
   out.debrid = src.debrid === true;
   out.keywordBoost = cleanString(src.keywordBoost, 500);
+  const rawPriorityIndexers = Array.isArray(src.priorityIndexers)
+    ? src.priorityIndexers
+    : String(src.priorityIndexers || "").split(",").map(s => s.trim()).filter(Boolean);
+  out.priorityIndexers = cleanStringArray(rawPriorityIndexers, 100, 120);
+  out.rdExcludeKeywords = cleanString(src.rdExcludeKeywords, 500);
+  out.rdExcludeQualities = cleanString(src.rdExcludeQualities, 300);
+  out.rdExcludeIndexers = cleanString(src.rdExcludeIndexers, 300);
+  out.rdExcludeGroups = cleanString(src.rdExcludeGroups, 300);
   out.maxResultsPerIndexer = clampNumber(src.maxResultsPerIndexer, 0, 0, 200);
   out.enableP2P = src.enableP2P !== false;
   out.qbitMode = ["off", "private", "always"].includes(src.qbitMode) ? src.qbitMode : "off";
@@ -919,11 +951,13 @@ function dedupeWithCachePriority(withHashes, isDebridMode) {
     const cachedPrivate   = group.filter(r =>  r._isCached &&  isPrivate(r));
     const uncachedPublic  = group.filter(r => !r._isCached && !isPrivate(r));
     const uncachedPrivate = group.filter(r => !r._isCached &&  isPrivate(r));
+    const priority        = group.filter(r =>  r._priorityIndexer);
 
     const bySeeds = arr => arr.slice().sort((a, b) => (b.Seeders || 0) - (a.Seeders || 0));
 
     let winner;
-    if      (cachedPublic.length)    winner = bySeeds(cachedPublic)[0];
+    if      (priority.length)        winner = bySeeds(priority)[0];
+    else if (cachedPublic.length)    winner = bySeeds(cachedPublic)[0];
     else if (cachedPrivate.length)   winner = bySeeds(cachedPrivate)[0];
     else if (uncachedPublic.length)  winner = bySeeds(uncachedPublic)[0];
     else                             winner = bySeeds(uncachedPrivate)[0];
@@ -1198,6 +1232,50 @@ function matchesKeywordBoost(title, boostFilter) {
   } catch { return false; }
 }
 
+function splitFilterTerms(value) {
+  return String(value || "")
+    .split(/[,\n;|]+/)
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean)
+    .slice(0, 100);
+}
+
+function textHasAnyTerm(text, terms) {
+  const hay = String(text || "").toLowerCase();
+  return terms.some(term => {
+    if (!term) return false;
+    // IDs numéricos: match exato de palavra para evitar "3" bater em "13" ou "30"
+    if (/^\d+$/.test(term)) return new RegExp(`(?:^|\\s)${term}(?:\\s|$)`).test(hay);
+    return hay.includes(term);
+  });
+}
+
+function resultIndexerText(r, indexerName = "") {
+  return [r?._indexerName, r?.Tracker, r?.TrackerId, r?.Indexer, indexerName].filter(Boolean).join(" ");
+}
+
+function isPriorityIndexerResult(r, prefs = {}, indexerName = "") {
+  const raw = Array.isArray(prefs.priorityIndexers) ? prefs.priorityIndexers.join(",") : prefs.priorityIndexers;
+  const terms = splitFilterTerms(raw);
+  return terms.length ? textHasAnyTerm(resultIndexerText(r, indexerName), terms) : false;
+}
+
+function isRdExcludedResult(r, prefs = {}, indexerName = "") {
+  const title = String(r?.Title || "");
+  const indexerText = resultIndexerText(r, indexerName);
+  const group = extractGroup(title) || "";
+  return (
+    textHasAnyTerm(title, splitFilterTerms(prefs.rdExcludeKeywords)) ||
+    textHasAnyTerm(title, splitFilterTerms(prefs.rdExcludeQualities)) ||
+    textHasAnyTerm(indexerText, splitFilterTerms(prefs.rdExcludeIndexers)) ||
+    textHasAnyTerm(group || title, splitFilterTerms(prefs.rdExcludeGroups))
+  );
+}
+
+function hasDirectInfoHash(r) {
+  return !!(r?.InfoHash || (r?.MagnetUri && extractInfoHash(r.MagnetUri)));
+}
+
 function formatStream(r, indexerName, isAnime = false, prefs = {}, showSeeds = true, streamMeta = {}) {
   const t      = r.Title || "";
   const res    = first(RESOLUTION, t);
@@ -1373,10 +1451,10 @@ function parseProwlarrResults(items, indexer) {
   }).filter(r => r.Title && (r.Link || r.MagnetUri || r.Guid));
 }
 
-async function prowlarrSearch(query, indexer, limit = 50, jUrl, jKey) {
+async function prowlarrSearch(query, indexer, limit = 50, jUrl, jKey, timeout = 15000) {
   const res = await axios.get(`${jUrl}/api/v1/search`, {
     params: { apikey: jKey, query, type: "search", indexerIds: indexer, limit, offset: 0 },
-    timeout: 15000,
+    timeout,
     validateStatus: () => true,
   });
   if (res.status === 429) throw Object.assign(new Error("Rate limited"), { response: res });
@@ -1391,7 +1469,7 @@ async function jackettTextSearch(query, indexer, timeout, jUrl, jKey) {
     `${jUrl}/api/v2.0/indexers/${indexer}/results`,
     { params, timeout, validateStatus: () => true }
   );
-  if (res.status === 404 || res.status === 401) return prowlarrSearch(query, indexer, 50, jUrl, jKey);
+  if (res.status === 404 || res.status === 401) return prowlarrSearch(query, indexer, 50, jUrl, jKey, timeout);
   if (res.status === 429) throw Object.assign(new Error("Rate limited"), { response: res });
   if (res.status >= 400)  throw new Error(`HTTP ${res.status}`);
   return (res.data?.Results || []).map(r => ({ ...r, _structuredMatch: false }));
@@ -1417,10 +1495,12 @@ async function jackettStructuredSearch(search, indexer, timeout, jUrl, jKey) {
 async function jackettSearchOneIndexer(indexer, plan, timeout, fastTimeout, jUrl, jKey) {
   if (await isRateLimited(indexer)) return [];
   const t0 = Date.now();
+  // IDs numéricos = Prowlarr: vai direto para prowlarrSearch sem tentar endpoint Jackett
+  const isProwlarr = /^\d+$/.test(String(indexer));
   try {
     let results = [];
     const isSeries = plan.parsed?.type === 'series' || (plan.search?.season != null);
-    if (plan.search && !plan.parsed?.isAnime && !isSeries) {
+    if (!isProwlarr && plan.search && !plan.parsed?.isAnime && !isSeries) {
       try {
         results = await jackettStructuredSearch(plan.search, indexer, timeout, jUrl, jKey);
       } catch (err) {
@@ -1431,7 +1511,9 @@ async function jackettSearchOneIndexer(indexer, plan, timeout, fastTimeout, jUrl
     if (results.length === 0) {
       for (const query of plan.queries) {
         try {
-          const textResults = await jackettTextSearch(query, indexer, timeout, jUrl, jKey);
+          const textResults = isProwlarr
+            ? await prowlarrSearch(query, indexer, 50, jUrl, jKey, timeout)
+            : await jackettTextSearch(query, indexer, timeout, jUrl, jKey);
           results.push(...textResults);
           if (results.length > 0) break;
         } catch (err) {
@@ -1810,18 +1892,27 @@ app.get("/:userConfig/catalog/:type/:id.json", async (req, res) => {
 
     const raw   = await rc.get(`${CATALOG_KEY}:${catalogType}`);
     const items = raw ? JSON.parse(raw) : [];
-    const metas = items.filter(m => activeMetaIds.has(m.id)).map(m => ({
-      id:          m.id,
-      type:        m.type,
-      name:        m.name,
-      poster:      m.poster,
-      background:  m.background,
-      description: m.description,
-      releaseInfo: m.releaseInfo,
-      imdbRating:  m.imdbRating,
-      genres:      m.genres,
-    })).filter(m => m.id && m.poster);
-    res.json({ metas });
+    const metas = await Promise.all(items.filter(m => activeMetaIds.has(m.id)).map(async m => {
+      const imdbId = m.id?.startsWith("rssmovie:")
+        ? m.id.slice("rssmovie:".length)
+        : m.id?.startsWith("rssmeta:")
+          ? `tt${m.id.split(":").slice(2).join(":").replace(/^tt/i, "")}`
+          : null;
+      const enriched = await enrichMetaPtBr(m, imdbId, catalogType);
+      return {
+        id:          m.id,
+        type:        m.type,
+        name:        enriched.name,
+        poster:      enriched.poster,
+        background:  enriched.background,
+        description: enriched.description,
+        releaseInfo: enriched.releaseInfo,
+        imdbRating:  enriched.imdbRating,
+        genres:      enriched.genres,
+      };
+    }));
+    const filteredMetas = metas.filter(m => m.id && m.poster);
+    res.json({ metas: filteredMetas });
   } catch {
     res.json({ metas: [] });
   }
@@ -1837,7 +1928,7 @@ app.get("/:userConfig/meta/:type/:id.json", async (req, res) => {
     try {
       const r = await axios.get(`https://v3-cinemeta.strem.io/meta/movie/${ttId}.json`, { timeout: 6000 });
       const meta = r.data?.meta;
-      if (meta) return res.json({ meta: { ...meta, id } });
+      if (meta) return res.json({ meta: { ...(await enrichMetaPtBr(meta, ttId, "movie")), id } });
     } catch {}
     return res.json({ meta: null });
   }
@@ -1849,7 +1940,9 @@ app.get("/:userConfig/meta/:type/:id.json", async (req, res) => {
       const targetType = type === "movie" ? "movie" : "series";
       const cleanId = normalizeImdbId(id) || id;
       const r = await axios.get(`https://v3-cinemeta.strem.io/meta/${targetType}/${cleanId}.json`, { timeout: 5000 });
-      return res.json(r.data || { meta: null });
+      const payload = r.data || { meta: null };
+      if (payload.meta) payload.meta = await enrichMetaPtBr(payload.meta, cleanId, targetType);
+      return res.json(payload);
     } catch {
       return res.json({ meta: null });
     }
@@ -1870,6 +1963,7 @@ app.get("/:userConfig/meta/:type/:id.json", async (req, res) => {
       try {
         const r = await axios.get(`https://v3-cinemeta.strem.io/meta/series/${rssMeta.metaId}.json`, { timeout: 6000 });
         baseMeta = r.data?.meta || {};
+        baseMeta = await enrichMetaPtBr(baseMeta, rssMeta.metaId, "series");
         if (baseMeta.name) rc.set(metaCacheKey, JSON.stringify(baseMeta), 86400).catch(() => {});
       } catch {
         // Fallback: catálogo local
@@ -1879,6 +1973,7 @@ app.get("/:userConfig/meta/:type/:id.json", async (req, res) => {
         if (found) baseMeta = found;
       }
     }
+    baseMeta = await enrichMetaPtBr(baseMeta, rssMeta.metaId, "series");
 
     // ── PASSO 2: Construir set de episódios disponíveis a partir do cache RSS ──
     // Mesmo padrão do builder.js: availableEps determina quais episódios mostrar.
@@ -1982,8 +2077,8 @@ app.get("/:userConfig/meta/:type/:id.json", async (req, res) => {
 // ── ROTA DEBRID-ADD COM TRAVA REDIS (ANTI-SPAM) E DOWNLOAD DE .TORRENT ───
 app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
   const { provider, infoHash } = req.params;
-  const magnet  = req.query.magnet;
-  const linkUrl = req.query.link;
+  const magnet  = Array.isArray(req.query.magnet) ? req.query.magnet[0] : req.query.magnet;
+  const linkUrl = Array.isArray(req.query.link) ? req.query.link[0] : req.query.link;
   const prefs   = await resolvePrefs(req.params.userConfig);
   const config  = prefs.debridConfig;
 
@@ -1996,7 +2091,7 @@ app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
 
   // Download do .torrent se disponível
   let torrentBuffer = null;
-  if (linkUrl?.startsWith("http")) {
+  if (typeof linkUrl === "string" && linkUrl.startsWith("http")) {
     try {
       const dl = await axios.get(linkUrl, {
         responseType: "arraybuffer",
@@ -2291,15 +2386,35 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       }
     } catch {}
   }
+  if (streamWaiters.has(streamCacheKey)) {
+    console.log(`[Stream In-flight] aguardando resultado existente para ${id}`);
+    for (let i = 0; i < 120; i++) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      const waitedStreams = await rc.get(streamCacheKey).catch(() => null);
+      if (!waitedStreams) continue;
+      try {
+        const parsed = JSON.parse(waitedStreams);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          console.log(`[Stream In-flight HIT] ${parsed.length} streams para ${id}`);
+          console.log(`=========================================\n`);
+          return res.json({ streams: parsed });
+        }
+      } catch {}
+    }
+    console.log(`[Stream In-flight] timeout; retornando vazio temporario para ${id}`);
+    console.log(`=========================================\n`);
+    return res.json({ streams: [] });
+  }
+  streamWaiters.set(streamCacheKey, Date.now());
 
   try {
     const { parsed, displayTitle, aliases = [], queries, episode, year, search } = await buildQueries(type, id);
     const requestedImdbId = normalizeImdbId(search?.imdbId || parsed?.metaId);
 
     const enabledCats = Array.isArray(prefs.categories) && prefs.categories.length ? prefs.categories : ["movie", "series"];
-    if (parsed.isAnime && !enabledCats.includes("anime"))                       return res.json({ streams: [] });
-    if (!parsed.isAnime && type === "series" && !enabledCats.includes("series")) return res.json({ streams: [] });
-    if (type === "movie" && !enabledCats.includes("movie"))                      return res.json({ streams: [] });
+    if (parsed.isAnime && !enabledCats.includes("anime"))                       { streamWaiters.delete(streamCacheKey); return res.json({ streams: [] }); }
+    if (!parsed.isAnime && type === "series" && !enabledCats.includes("series")) { streamWaiters.delete(streamCacheKey); return res.json({ streams: [] }); }
+    if (type === "movie" && !enabledCats.includes("movie"))                      { streamWaiters.delete(streamCacheKey); return res.json({ streams: [] }); }
 
     if (isStremThruMode) {
       const maxOut = prefs.maxResults || 20;
@@ -2328,19 +2443,23 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         await rc.set(streamCacheKey, JSON.stringify(finalProxyStreams), 10800).catch(() => {});
         console.log(`StremThru listados: Enviando ${finalProxyStreams.length} streams!`);
         console.log(`=========================================\n`);
+        streamWaiters.delete(streamCacheKey);
         return res.json({ streams: finalProxyStreams });
       }
       console.log(`[STREMTHRU] Proxy não retornou streams para ${type}/${id}`);
       console.log(`=========================================\n`);
+      streamWaiters.delete(streamCacheKey);
       return res.json({ streams: [] });
     }
 
     const indexers     = await resolveSearchIndexers(prefs, parsed.isAnime);
 
     // Fast-path: tenta encontrar resultados no cache RSS antes de buscar nos indexers
-    let results;
+    let results = [];
+    let rssMatchedResults = [];
     const rssType = parsed.rssType || (parsed.isAnime ? "anime" : type === "movie" ? "movie" : "series");
     let usedRssFastPath = false;
+    const isOwnRssCatalogItem = parsed.source === "rssmovie" || parsed.source === "rssitem";
     const preferredRssIndexers = Array.isArray(prefs.rssIndexers) && prefs.rssIndexers.length
       ? prefs.rssIndexers
       : (Array.isArray(prefs.indexers) && prefs.indexers.length && !prefs.indexers.includes("all") ? prefs.indexers : null);
@@ -2355,6 +2474,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         usedRssFastPath = true;
         console.log(`[RSS Fast-path] ${results.length} resultados do cache RSS para ${parsed.metaId}`);
       } else {
+        streamWaiters.delete(streamCacheKey);
         return res.json({ streams: [] });
       }
     } else if (parsed.source === "rssitem" && parsed.rssToken) {
@@ -2364,6 +2484,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         results = [{ ...exactItem, _metaIdMatch: true, _titleMatchScore: 1, _rssPreferred: true, _rssOrder: 0 }];
         usedRssFastPath = true;
       } else {
+        streamWaiters.delete(streamCacheKey);
         return res.json({ streams: [] });
       }
     } else if (parsed.source === "rssitem") {
@@ -2380,6 +2501,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         results = exactItems.map((item, idx) => ({ ...item, _metaIdMatch: true, _titleMatchScore: 1, _rssPreferred: true, _rssOrder: idx }));
         usedRssFastPath = true;
       } else {
+        streamWaiters.delete(streamCacheKey);
         return res.json({ streams: [] });
       }
     } else if (requestedImdbId || aliases.length) {
@@ -2420,13 +2542,12 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
         if (matched.length > 0) {
           console.log(`[RSS Fast-path] ${matched.length} resultados do cache RSS para ${requestedImdbId || displayTitle}`);
-          results = matched;
-          usedRssFastPath = true;
+          rssMatchedResults = matched;
         }
       }
     }
 
-    if (!usedRssFastPath) {
+    if (!isOwnRssCatalogItem) {
       // Busca Jackett e scrap em paralelo
       const [jackettResults, scrapResults] = await Promise.all([
         jackettSearch({ parsed, queries, search }, indexers, prefs),
@@ -2434,13 +2555,16 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           ? Promise.all(ENV.scrapManifests.map(m => fetchScrapStreams(m, type, id)))
           : Promise.resolve([])
       ]);
-      results = jackettResults;
+      results = [...rssMatchedResults, ...jackettResults];
       // Guarda scrap para injetar depois em allStreams
       results._scrapStreams = scrapResults.flat();
+      if (rssMatchedResults.length) {
+        console.log(`[RSS + Live] ${rssMatchedResults.length} resultados RSS combinados com ${jackettResults.length} resultados ao vivo`);
+      }
     }
     const priorityLang = prefs.priorityLang ?? "pt-br";
 
-    console.log(`Filtros ativos: onlyDubbed=${prefs.onlyDubbed}, priorityLang=${priorityLang}, keywordBoost=${prefs.keywordBoost ? 'SIM' : 'NÃO'}`);
+    console.log(`Filtros ativos: onlyDubbed=${prefs.onlyDubbed}, priorityLang=${priorityLang}, keywordBoost=${prefs.keywordBoost ? 'SIM' : 'NÃO'}, priorityIndexers=[${(prefs.priorityIndexers||[]).join(",")}], maxPerIndexer=${prefs.maxResultsPerIndexer||0}`);
 
     const candidates = (bypassRssFilters && usedRssFastPath
       ? results
@@ -2457,14 +2581,19 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           })
       : results
           .filter(r => r?.InfoHash || r?.MagnetUri || r?.Link)
-          .filter(r => !prefs.skipBadReleases || !BAD_RE.test(r.Title || ""))
-          .filter(r => type !== "movie" || !looksLikeEpisodeRelease(r.Title || ""))
+          .filter(r => isPriorityIndexerResult(r, prefs) || !prefs.skipBadReleases || !BAD_RE.test(r.Title || ""))
+          .filter(r => isPriorityIndexerResult(r, prefs) || type !== "movie" || !looksLikeEpisodeRelease(r.Title || ""))
           .filter(r => {
             if (parsed.isAnime) return animeEpisodeMatches(r.Title || "", episode);
             if (type === "series") return seriesEpisodeMatches(r.Title || "", parsed.season, parsed.episode);
             return true;
           })
           .filter(r => {
+            if (isPriorityIndexerResult(r, prefs)) {
+              r._priorityIndexer = true;
+              r._titleMatchScore = Math.max(r._titleMatchScore || 0, 1);
+              return true;
+            }
             if (prefs.keywordBoost && matchesKeywordBoost(r.Title || "", prefs.keywordBoost)) {
               r._titleMatchScore = 1; r._keywordMatch = true; return true;
             }
@@ -2474,6 +2603,11 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             return hasLang;
           })
           .filter(r => {
+            if (r._priorityIndexer || isPriorityIndexerResult(r, prefs)) {
+              r._priorityIndexer = true;
+              r._titleMatchScore = Math.max(r._titleMatchScore || 0, 1);
+              return true;
+            }
             if (r._keywordMatch || r._metaIdMatch) return true;
             const resultImdbId = getResultImdbId(r);
             if (requestedImdbId && resultImdbId && resultImdbId === requestedImdbId) {
@@ -2492,14 +2626,16 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             r._titleMatchScore = Math.max(r._titleMatchScore || 0, finalScore);
             return finalScore >= minScore || (hasLang && finalScore > 0);
           })
-          .filter(r => { if (type !== "movie" || !year) return true; const ry = extractReleaseYear(r.Title || ""); return !ry || Math.abs(ry - year) <= 1; })
+          .filter(r => { if (r._priorityIndexer || isPriorityIndexerResult(r, prefs)) return true; if (type !== "movie" || !year) return true; const ry = extractReleaseYear(r.Title || ""); return !ry || Math.abs(ry - year) <= 1; })
           .map(r => {
             const t       = r.Title || "";
             const langs   = getLangs(t, parsed.isAnime);
             const hasLang = priorityLang ? langs.some(l => l.code === priorityLang) : false;
             const isMulti = /(multi)[-.\\s]?(audio)?/i.test(t);
             const langPriority = hasLang ? 3 : (prefs.keywordBoost && matchesKeywordBoost(t, prefs.keywordBoost) ? 2 : (isMulti ? 1 : 0));
-            r._originalScore = (langPriority * 100000) +
+            r._priorityIndexer = r._priorityIndexer || isPriorityIndexerResult(r, prefs);
+            r._originalScore = ((r._priorityIndexer ? 1 : 0) * 5000000) +
+              (langPriority * 100000) +
               ((r._metaIdMatch    ? 1 : 0) * 40000) +
               ((r._structuredMatch ? 1 : 0) * 20000) +
               (parsed.isAnime ? animeEpisodeMatchRank(r.Title || "", episode) : episodeMatchRank(r.Title || "", parsed.season, parsed.episode)) * 10000 +
@@ -2515,25 +2651,31 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       console.log(`Keywords: ${withKeywords.length}/${candidates.length} releases com boost`);
     }
 
-    let filteredCandidates = candidates;
-    if (!bypassRssFilters && prefs.maxResultsPerIndexer > 0) {
-      const countByIndexer = new Map();
-      filteredCandidates = candidates.filter(r => {
-        if (r._keywordMatch) return true;
-        const key = r.TrackerId || r.Tracker || "unknown";
-        const n   = (countByIndexer.get(key) || 0) + 1;
-        countByIndexer.set(key, n);
-        return n <= prefs.maxResultsPerIndexer;
-      });
-    }
+    // maxResultsPerIndexer é aplicado aqui apenas para limitar candidatos enviados ao cache check.
+    // O limite real por indexer na lista final é aplicado após a ordenação dos streams (abaixo).
+    const filteredCandidates = candidates;
 
     const maxOut              = prefs.maxResults || 20;
 
-    const cacheCheckCandidates = isDebridMode && !prefs.stConfig && !bypassRssFilters
-      ? filteredCandidates
-      : filteredCandidates.slice(0, maxOut);
+    const cacheCheckCandidates = (() => {
+      if (!isDebridMode || prefs.stConfig) return filteredCandidates.slice(0, maxOut);
+      const direct = filteredCandidates.filter(hasDirectInfoHash);
+      const httpOnly = filteredCandidates.filter(r => !hasDirectInfoHash(r));
+      const priorityHttp = httpOnly.filter(r => r._priorityIndexer || r._keywordMatch).slice(0, Math.max(8, maxOut));
+      const regularHttp = httpOnly.filter(r => !r._priorityIndexer && !r._keywordMatch).slice(0, Math.max(4, Math.ceil(maxOut / 3)));
+      const directLimit = Math.max(maxOut * 3, 80);
+      const selected = [...direct.slice(0, directLimit), ...priorityHttp, ...regularHttp];
+      const seen = new Set();
+      return selected.filter(r => {
+        const key = r.InfoHash || r.MagnetUri || r.Link || r.Guid || r.Title;
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    })();
     const topCandidates = cacheCheckCandidates;
-    console.log(`Extraindo InfoHashes de ${topCandidates.length} candidatos...`);
+    const directCount = topCandidates.filter(hasDirectInfoHash).length;
+    console.log(`Extraindo InfoHashes de ${topCandidates.length} candidatos (${directCount} diretos, ${topCandidates.length - directCount} via .torrent)...`);
 
     const withHashes = (await (async () => {
       const results = new Array(topCandidates.length).fill(null);
@@ -2553,8 +2695,8 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     let rdCacheMap = {};
     let tbCacheMap = {};
 
-    if (isDebridMode && !prefs.stConfig && withHashes.length > 0 && !bypassRssFilters) {
-      const allHashes   = [...new Set(withHashes.map(r => r._resolved.infoHash))];
+    if (isDebridMode && !prefs.stConfig && withHashes.length > 0) {
+      const allHashes   = [...new Set(withHashes.map(r => String(r._resolved.infoHash || "").toLowerCase()).filter(Boolean))];
       const { mode, torboxKey, rdKey } = prefs.debridConfig;
       const { rdBatchCheckCache, torboxBatchCheckCache } = require("./debrid");
 
@@ -2578,7 +2720,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       const debridCached = new Set();
       withHashes.forEach(r => {
         r._isCached = false;
-        const h = r._resolved.infoHash;
+        const h = String(r._resolved.infoHash || "").toLowerCase();
         if ((mode === "realdebrid" || mode === "dual") && rdCacheMap[h]?.rd?.length > 0) {
           r._isCached = true; debridCached.add(h);
         }
@@ -2596,6 +2738,40 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       const removed = withHashes.length - dedupedWithHashes.length;
       console.log(`[DEDUP] ${withHashes.length} → ${dedupedWithHashes.length} candidatos (-${removed} duplicatas, preferiu público cacheado)`);
     }
+    const candidateHasKeyword = r => !!(prefs.keywordBoost && matchesKeywordBoost(r.Title || "", prefs.keywordBoost));
+    const candidateHasPriorityLang = r => {
+      const t = r.Title || "";
+      const langs = getLangs(t, parsed.isAnime);
+      return !!(
+        (priorityLang && langs.some(l => l.code === priorityLang)) ||
+        (priorityLang === "pt-br" && /(dublado|pt[-.]?br|portugu[eê]s|portuguese|brazilian)/i.test(t))
+      );
+    };
+    const candidateBucket = r => {
+      if (r._priorityIndexer && r._isCached) return -2;
+      if (r._priorityIndexer) return -1;
+      if (r._isCached && candidateHasKeyword(r)) return 0;
+      if (r._isCached && candidateHasPriorityLang(r)) return 1;
+      if (!r._isCached && candidateHasKeyword(r)) return 2;
+      if (!r._isCached && candidateHasPriorityLang(r)) return 3;
+      const isMulti = /(multi|dual)[-.\\s]?(audio)?/i.test(r.Title || "");
+      if (r._isCached && isMulti) return 3.5;
+      if (!r._isCached && isMulti) return 3.8;
+      return 4;
+    };
+    const candidateResScore = r => { const rr = first(RESOLUTION, r.Title || ""); return rr ? rr.score : 0; };
+    const streamCandidates = dedupedWithHashes
+      .slice()
+      .sort((a, b) => {
+        const db = candidateBucket(a) - candidateBucket(b); if (db !== 0) return db;
+        const dr = candidateResScore(b) - candidateResScore(a); if (dr !== 0) return dr;
+        const dz = (b.Size || 0) - (a.Size || 0); if (dz !== 0) return dz;
+        return (b.Seeders || 0) - (a.Seeders || 0);
+      })
+      .slice(0, maxOut);
+    if (dedupedWithHashes.length > streamCandidates.length) {
+      console.log(`[LIMIT] resolvendo ${streamCandidates.length}/${dedupedWithHashes.length} candidatos após cache/prioridade`);
+    }
 
     const streamMeta = {
       title: displayTitle,
@@ -2606,10 +2782,11 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     };
 
     const resolvedAll = await Promise.all(
-      dedupedWithHashes.map(async r => {
+      streamCandidates.map(async r => {
         try {
           const resolved     = r._resolved;
           const indexerName  = r._indexerName || r.Tracker || r.TrackerId || r.Indexer || "Unknown";
+          const rdExcluded   = isRdExcludedResult(r, prefs, indexerName);
           const { name, description: descNoSeeds, resLabel } = formatStream(r, indexerName, parsed.isAnime, prefs, false, streamMeta);
           const { description } = formatStream(r, indexerName, parsed.isAnime, prefs, true, streamMeta);
           const matchedFile  = (type === "series" || parsed.isAnime)
@@ -2620,9 +2797,17 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           } else if (matchedFile) {
             console.log(`[FILE] Arquivo selecionado: "${matchedFile.name}" (idx=${matchedFile.idx}) para S${parsed.season}E${parsed.episode ?? episode}`);
           }
+          const displayFile = matchedFile || (Array.isArray(resolved.files) && resolved.files.length
+            ? resolved.files
+                .filter(f => /\.(mkv|mp4|avi|ts|m2ts|mov|wmv)$/i.test(f.name || ""))
+                .sort((a, b) => (b.size || 0) - (a.size || 0))[0]
+              || resolved.files.slice().sort((a, b) => (b.size || 0) - (a.size || 0))[0]
+            : null);
+          const displayFileName = displayFile?.name || r.Title || "";
+          const filenameLine = displayFileName ? `📂 ${displayFileName}` : "";
           const magnet      = buildMagnet(resolved.infoHash, r.MagnetUri, r.Title);
           const publicBase  = getPublicBase(req);
-          const localPlayable = !prefs.stConfig && isQbitConfigured(qbitCreds)
+          const localPlayable = !isDebridMode && !prefs.stConfig && isQbitConfigured(qbitCreds)
             ? await getPlayableLocalFile(resolved.infoHash, matchedFile?.idx ?? null, matchedFile?.name || null, qbitCreds).catch(() => null)
             : null;
 
@@ -2657,14 +2842,15 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
               : `${prefs.addonName || "ProwJack PRO"}\n⬇️ ${resLabel || "Links"} [QB]`;
             return {
               name: qbitName,
-              description: [description, matchedFile?.name ? `📂 ${matchedFile.name}` : "", isPrivateTracker ? "🔒 Tracker Privado" : ""].filter(Boolean).join("\n"),
+              description: [description, filenameLine, isPrivateTracker ? "🔒 Tracker Privado" : ""].filter(Boolean).join("\n"),
               url:   `${publicBase}/${req.params.userConfig}/qbit/${jobToken}`,
               indexer: renameIndexer(indexerName),
               _cached: !!localPlayable,
               _sourceType: "http",
+              _priorityIndexer: !!r._priorityIndexer,
               behaviorHints: {
-                filename:   matchedFile?.name || r.Title,
-                videoSize:  matchedFile?.size,
+                filename:   displayFileName,
+                videoSize:  displayFile?.size,
                 bingeGroup: `prowjack|qbit|${resolved.infoHash}`,
                 notWebReady: false,
               },
@@ -2674,6 +2860,14 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           };
 
           if (isDebridMode) {
+            const debridMode = prefs.debridConfig?.mode;
+            // No modo realdebrid puro, bloqueia o torrent inteiro se excluído
+            if (rdExcluded && debridMode === "realdebrid") {
+              console.log(`[RD Exclude] ${r.Title?.slice(0, 80)} (${indexerName})`);
+              return null;
+            }
+            // No modo torbox puro, rdExcluded não deve ter efeito algum
+            // No modo dual, rdExcluded só filtra o stream RD (dentro do resultsArray.filter abaixo)
             const debridData = await resolveDebridStream(
               resolved.infoHash,
               magnet,
@@ -2698,14 +2892,20 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             }
             const resultsArray = debridData.multi ? debridData.multi : [debridData];
 
-            return Promise.all(resultsArray.map(async resObj => {
+            return Promise.all(resultsArray.filter(resObj => {
+              if (rdExcluded && resObj.provider === "Real-Debrid") {
+                console.log(`[RD Exclude] ${r.Title?.slice(0, 80)} (${indexerName})`);
+                return false;
+              }
+              return true;
+            }).map(async resObj => {
               const addonName    = prefs.addonName || "ProwJack PRO";
               const resLabelStr  = resLabel || "Links";
               const isDual       = prefs.debridConfig?.mode === "dual";
               const providerTag  = resObj.provider === "TorBox" ? "[TB]" : "[RD]";
 
               if (resObj.url && !resObj.queued) {
-                const debridFilename = resObj.filename || matchedFile?.name;
+                const debridFilename = resObj.filename || displayFileName;
                 const streamName     = isDual
                   ? `${addonName}\n⚡️ ${resLabelStr} ${providerTag}`
                   : `${addonName}\n⚡️ ${resLabelStr}`;
@@ -2715,9 +2915,10 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
                   url:     resObj.url,
                   _cached: true,
                   _sourceType: "debrid",
+                  _priorityIndexer: !!r._priorityIndexer,
                   behaviorHints: {
-                    filename:   debridFilename || r.Title,
-                    videoSize:  matchedFile?.size,
+                    filename:   debridFilename || displayFileName,
+                    videoSize:  displayFile?.size,
                     bingeGroup: `prowjack|debrid|${resolved.infoHash}`,
                     notWebReady: false,
                   },
@@ -2736,11 +2937,12 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
                 const debridOption = {
                   name: streamName,
-                  description,
+                  description: [description, filenameLine].filter(Boolean).join("\n"),
                   url:     addUrl,
                   _cached: !!resObj.cached,
                   _sourceType: "debrid",
-                  behaviorHints: { notWebReady: true },
+                  _priorityIndexer: !!r._priorityIndexer,
+                  behaviorHints: { filename: displayFileName, videoSize: displayFile?.size, notWebReady: true },
                 };
 
                 if (!prefs.stConfig && prefs.enableP2P && isQbitConfigured(qbitCreds)) {
@@ -2783,13 +2985,14 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
             const p2pStream = {
               name,
-              description: [description, matchedFile?.name ? `📂 ${matchedFile.name}` : ""].filter(Boolean).join("\n"),
+              description: [description, filenameLine].filter(Boolean).join("\n"),
               infoHash: resolved.infoHash,
               sources,
               _sourceType: "p2p",
+              _priorityIndexer: !!r._priorityIndexer,
               behaviorHints: {
-                filename:   matchedFile?.name || r.Title,
-                videoSize:  matchedFile?.size || undefined,
+                filename:   displayFileName,
+                videoSize:  displayFile?.size || undefined,
                 bingeGroup: parsed.isAnime ? `prowjack|anime|${displayTitle}` : `prowjack|${resolved.infoHash}`,
               },
             };
@@ -2819,13 +3022,14 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
             const stream = {
               name,
-              description: [description, matchedFile?.name ? `📂 ${matchedFile.name}` : ""].filter(Boolean).join("\n"),
+              description: [description, filenameLine].filter(Boolean).join("\n"),
               infoHash: resolved.infoHash,
               sources,
               _sourceType: "p2p",
+              _priorityIndexer: !!r._priorityIndexer,
               behaviorHints: {
-                filename:   matchedFile?.name || r.Title,
-                videoSize:  matchedFile?.size || undefined,
+                filename:   displayFileName,
+                videoSize:  displayFile?.size || undefined,
                 bingeGroup: parsed.isAnime ? `prowjack|anime|${displayTitle}` : `prowjack|${resolved.infoHash}`,
               },
             };
@@ -2845,11 +3049,11 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             if (!sources.length) return null;
             
             const storeCodeMap = { torbox: "TB", realdebrid: "RD" };
-            const desc = [description, matchedFile?.name ? `📂 ${matchedFile.name}` : ""].filter(Boolean).join("\n");
-            const bh   = { filename: matchedFile?.name || r.Title, videoSize: matchedFile?.size, bingeGroup: `prowjack|${resolved.infoHash}`, notWebReady: true };
+            const desc = [description, filenameLine].filter(Boolean).join("\n");
+            const bh   = { filename: displayFileName, videoSize: displayFile?.size, bingeGroup: `prowjack|${resolved.infoHash}`, notWebReady: true };
             return prefs.stConfig.stores.map(s => {
               const tag = storeCodeMap[s.c] || s.c.toUpperCase();
-              return { name: `${name.split("\n")[0]}\n⬇️ ${resLabel || "Links"} [${tag}]`, description: desc, url: sources[0], _sourceType: "debrid", behaviorHints: bh };
+              return { name: `${name.split("\n")[0]}\n⬇️ ${resLabel || "Links"} [${tag}]`, description: desc, url: sources[0], _sourceType: "debrid", _priorityIndexer: !!r._priorityIndexer, behaviorHints: bh };
             });
           }
 
@@ -2912,6 +3116,12 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         s._title   = r.Title   || "";
         s._seeders = r.Seeders || 0;
         s._sizeGb  = (r.Size   || 0) / 1e9;
+        // Garante que _priorityIndexer do resultado Jackett seja propagado para o stream
+        if (r._priorityIndexer && !s._priorityIndexer) s._priorityIndexer = true;
+        // Propaga _isCached do resultado para _cached do stream (campos distintos)
+        if (r._isCached && s._cached == null) s._cached = true;
+        // Chave do indexer para maxResultsPerIndexer na ordenação final
+        s._indexerKey = r.TrackerId || r.Tracker || "unknown";
       }
     });
 
@@ -2953,35 +3163,84 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       return 3;
     };
 
-    const _langScore = (s) => {
-      const t    = s._title || "";
-      const langs = getLangs(t, parsed.isAnime);
-      if (priorityLang && langs.some(l => l.code === priorityLang)) return 3;
-      if (/(dublado|pt[-.]?br|portugu[eê]s|portuguese|brazilian)/i.test(t) && priorityLang === "pt-br") return 3;
-      if (prefs.keywordBoost && matchesKeywordBoost(t, prefs.keywordBoost)) return 2;
-      if (/(multi|dual)[-.\\s]?(audio)?/i.test(t)) return 1;
-      // Scrap sem info de idioma: score neutro (não penaliza por falta de keyword)
-      if (s._scrapSource && langs.length === 0) return 1;
-      return 0;
-    };
     const _resScore  = (s) => { const r = first(RESOLUTION, s._title || ""); return r ? r.score  : 0; };
     const _qualScore = (s) => { const q = first(QUALITY,    s._title || ""); return q ? q.score  : 0; };
 
+    const _hasKeyword = (s) => !!(prefs.keywordBoost && matchesKeywordBoost(s._title || "", prefs.keywordBoost));
+    const _hasPriorityLang = (s) => {
+      const t = s._title || "";
+      const langs = getLangs(t, parsed.isAnime);
+      return !!(
+        (priorityLang && langs.some(l => l.code === priorityLang)) ||
+        (priorityLang === "pt-br" && /(dublado|pt[-.]?br|portugu[eê]s|portuguese|brazilian)/i.test(t))
+      );
+    };
+    const _isMulti = (s) => /(multi|dual)[-.\\s]?(audio)?/i.test(s._title || "");
+    const _sizeScore = (s) => {
+      const size = Number(s._sizeGb || 0);
+      return size > 0 ? size : 0;
+    };
+
+    // Bucket de prioridade — determina a ordem principal dos streams:
+    // -2: indexador prioritário + cached
+    // -1: indexador prioritário
+    //  0: keyword boost + cached
+    //  1: idioma preferido + cached
+    //  2: keyword boost (não cached)
+    //  3: idioma preferido (não cached)
+    //  3.5: multi-audio + cached
+    //  3.8: multi-audio (não cached)
+    //  4: demais (sem idioma identificado)
+    // Nota: quando onlyDubbed=false, todos os buckets acima ainda se aplicam —
+    // idioma preferido continua tendo prioridade sobre multi e sobre sem-idioma.
+    const _priorityBucket = (s) => {
+      if (s._priorityIndexer && s._cached) return -2;
+      if (s._priorityIndexer) return -1;
+      const cached = !!s._cached;
+      if (cached && _hasKeyword(s)) return 0;
+      if (cached && _hasPriorityLang(s)) return 1;
+      if (!cached && _hasKeyword(s)) return 2;
+      if (!cached && _hasPriorityLang(s)) return 3;
+      if (cached && _isMulti(s)) return 3.5;
+      if (!cached && _isMulti(s)) return 3.8;
+      return 4;
+    };
+
     dedupedStreams.sort((a, b) => {
+      // 1º: bucket de prioridade (prioritário > idioma > multi > outros)
+      const db = _priorityBucket(a) - _priorityBucket(b); if (db !== 0) return db;
+      // 2º: dentro do mesmo bucket, debrid/http antes de p2p
       const dsr = _sourceRank(a) - _sourceRank(b); if (dsr !== 0) return dsr;
-      const dl = _langScore(b) - _langScore(a); if (dl !== 0) return dl;
-      const ca = a._cached ? 1 : 0, cb = b._cached ? 1 : 0;
-      if (ca !== cb) return cb - ca;
+      // 3º: resolução
       const dr = _resScore(b)  - _resScore(a);  if (dr !== 0) return dr;
+      // 4º: qualidade (BluRay > WEB-DL etc)
       const dq = _qualScore(b) - _qualScore(a); if (dq !== 0) return dq;
-      const ds = (b._seeders || 0) - (a._seeders || 0); if (ds !== 0) return ds;
-      return Math.abs((a._sizeGb || 0) - 10) - Math.abs((b._sizeGb || 0) - 10);
+      // 5º: tamanho
+      const dz = _sizeScore(b) - _sizeScore(a); if (dz !== 0) return dz;
+      // 6º: seeders
+      return (b._seeders || 0) - (a._seeders || 0);
     });
 
-    const finalStreams = dedupedStreams.slice(0, maxOut);
+    const finalStreams = (() => {
+      // Aplica maxResultsPerIndexer após ordenação final para respeitar a prioridade correta
+      if (!bypassRssFilters && prefs.maxResultsPerIndexer > 0) {
+        const countByIndexer = new Map();
+        const limited = dedupedStreams.filter(s => {
+          if (s._priorityIndexer) return true;
+          // Usa o indexer do stream (campo indexer foi deletado — usa _title como fallback)
+          // O indexer real está no campo description; usamos _indexerKey salvo abaixo
+          const key = s._indexerKey || "unknown";
+          const n = (countByIndexer.get(key) || 0) + 1;
+          countByIndexer.set(key, n);
+          return n <= prefs.maxResultsPerIndexer;
+        });
+        return limited.slice(0, maxOut);
+      }
+      return dedupedStreams.slice(0, maxOut);
+    })();
     if (dedupedStreams.length > 0) {
       const top = dedupedStreams.slice(0, Math.min(5, dedupedStreams.length));
-      console.log(`[ORDEM] top${top.length}: ` + top.map(s => `[cache=${s._cached?1:0} lang=${_langScore(s)} res=${_resScore(s).toFixed(1)}] ${(s._title||s.name||"").slice(0,50)}`).join(" | "));
+      console.log(`[ORDEM] top${top.length}: ` + top.map(s => `[bucket=${_priorityBucket(s)} cache=${s._cached?1:0} prio=${s._priorityIndexer?1:0} lang=${_hasPriorityLang(s)?1:0} multi=${_isMulti(s)?1:0} res=${_resScore(s).toFixed(1)} ix=${s._indexerKey||"?"}] ${(s._title||"").slice(0,40)}`).join(" | "));
     }
     finalStreams.forEach(s => {
       delete s._cached;
@@ -2989,6 +3248,12 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       delete s._title;
       delete s._seeders;
       delete s._sizeGb;
+      delete s._priorityIndexer;
+      delete s._indexerKey;
+      delete s._sourceType;
+      delete s._scrapSource;
+      delete s._stremThruProxy;
+      delete s._sizeBytes;
       delete s.indexer; // Campo não usado pelo Stremio
     });
 
@@ -3004,9 +3269,11 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     if (finalStreams.length > 0) {
       rc.set(streamCacheKey, JSON.stringify(finalStreams), 10800).catch(() => {});
     }
+    streamWaiters.delete(streamCacheKey);
     res.json({ streams: finalStreams });
   } catch (err) {
     console.log(`Erro no processamento: ${err.message}`);
+    streamWaiters.delete(streamCacheKey);
     res.json({ streams: [] });
   }
 });

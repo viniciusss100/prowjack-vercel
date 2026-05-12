@@ -1,0 +1,34 @@
+services:
+  prowjack:
+    build: .
+    container_name: prowjack
+    restart: unless-stopped
+    network_mode: "service:protonvpn"
+#    networks:
+#      - npm-net
+#    ports:
+#      - "7014:7014"
+    env_file:
+      - ./.env
+    environment:
+      - PORT=7014
+      - ADDON_PUBLIC_URL=http://localhost:7014
+    volumes:
+      - C:\Users\vinic\Downloads\torrents:/downloads             # ← compartilhado com qBittorrent
+
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    network_mode: "service:protonvpn"
+    command: redis-server --appendonly yes
+    volumes:
+      - ./redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+

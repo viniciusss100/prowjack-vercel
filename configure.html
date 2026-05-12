@@ -287,8 +287,8 @@ hr{border:none;border-top:1px solid var(--bord);margin:14px 0}
         <div class="info" style="margin-top:-4px;margin-bottom:12px">Catálogo RSS requer uma instância persistente (VPS/Docker) ou worker/cron externo alimentando o Redis. Em Vercel/serverless, o poller interno não roda de forma confiável.</div>
 
         <label class="lbl">⭐ Boost por Keywords</label>
-        <input type="text" id="keywordBoost" placeholder="ex: dual-bioma  ou  brremux  (palavras inteiras)" value="DUBLADO|PORTUGUES|POR-BR|BRAZILIAN|BREMUX|CYPHER|FREDDIEGELLAR|DUAL-BiOMA|DUAL-C76|TOSSATO|C0RAL|DUAL-NOGROUP|DUAL-PIA|DUAL-XOR|DUAL-XAR|G4RIS|DUAL-SIGMA|ANDREHSA|RIPER|SiGLA|TONTOM|DUAL-ECK|1-SF|0-SF|RARBR|TUPAC|ALFAHD|DUAL-CZA|DUAL-7SPRITE7|POTATIN|DUAL-FLY|FRANCEIRA"/>
-        <div class="info" style="margin-top:-8px;margin-bottom:12px">Funciona como inclusão: com "Apenas idioma" ativo, itens que baterem nas keywords também entram. Aceita regex (<code>\bremux\b|cypher|dual-bioma</code>) ou lista por espaço/vírgula (<code>remux, cypher, dual-bioma</code>).</div>
+        <input type="text" id="keywordBoost" placeholder="ex: dual-bioma  ou  brremux  (palavras inteiras)" value="(\bremux\b|cypher|freddiegellar|dual-bioma|dual-c76|tossato|c0ral|dual-nogroup|dual-pia|dual-xor|dual-xar|g4ris|dual-sigma|andrehsa|riper|sigla|tontom|dual-eck|1-sf|0-sf|por-br|RARBR|TupaC|alfaHD|DUAL-cza|DUAL-7sprite7|potatin|Dual-fly|Brazilian|franceira)"/>
+        <div class="info" style="margin-top:-8px;margin-bottom:12px">Cada palavra é verificada como termo completo. Separe por espaço para exigir múltiplas palavras.</div>
 
         <div class="g3">
           <div>
@@ -331,6 +331,11 @@ hr{border:none;border-top:1px solid var(--bord);margin:14px 0}
         </div>
         <div class="ix-grid" id="ix-grid">
           <div class="ix-empty loading">⏳ Carregando indexers…</div>
+        </div>
+        <div class="mt12">
+          <label class="lbl">Indexers Prioritários sem Filtros</label>
+          <input type="text" id="priorityIndexers" placeholder="IDs ou nomes separados por vírgula"/>
+          <div class="info" style="margin-top:-8px">Resultados desses indexers furam filtros de idioma/título/ano e sobem na ordenação.</div>
         </div>
         <div class="info mt12">Os indexers RSS são configurados via <code>RSS_CATALOG_INDEXERS</code> no <code>.env</code> do servidor.</div>
       </div>
@@ -379,6 +384,27 @@ hr{border:none;border-top:1px solid var(--bord);margin:14px 0}
             </div>
           </div>
           <div class="info mt8">Configure ao menos uma das chaves acima.</div>
+          <hr/>
+          <div class="panel-title rd">Exclusões Real-Debrid</div>
+          <div class="g2">
+            <div>
+              <label class="lbl">Qualidades bloqueadas</label>
+              <input type="text" id="rdExcludeQualities" placeholder="WEB-DL, WEBRip, DVDRip, AMZ"/>
+            </div>
+            <div>
+              <label class="lbl">Indexers bloqueados</label>
+              <input type="text" id="rdExcludeIndexers" placeholder="rartv, rarbg, eztv"/>
+            </div>
+            <div>
+              <label class="lbl">Release groups bloqueados</label>
+              <input type="text" id="rdExcludeGroups" placeholder="YTS, Erai-raws"/>
+            </div>
+            <div>
+              <label class="lbl">Keywords gerais</label>
+              <input type="text" id="rdExcludeKeywords" placeholder="infringing, termo1, termo2"/>
+            </div>
+          </div>
+          <div class="info mt8">Aplicado somente aos streams do Real-Debrid. TorBox continua usando os mesmos resultados.</div>
         </div>
 
         <label style="display:flex;align-items:center;gap:9px;cursor:pointer;margin-bottom:10px">
@@ -429,7 +455,7 @@ hr{border:none;border-top:1px solid var(--bord);margin:14px 0}
         </div>
 
         <label style="display:flex;align-items:center;gap:9px;cursor:pointer;margin-bottom:10px">
-          <input type="checkbox" id="enableP2P" style="width:15px;height:15px;accent-color:var(--amber)" onchange="toggleQbitMode()"/>
+          <input type="checkbox" id="enableP2P" checked style="width:15px;height:15px;accent-color:var(--amber)" onchange="toggleQbitMode()"/>
           <span style="font-size:13px;font-weight:500">qBittorrent HTTP</span>
         </label>
         <div class="info" style="margin-left:24px;margin-bottom:10px">Opcional. Só funciona em instância auto-hospedada com <code>QBIT_URL</code>, <code>QBIT_USER</code> e <code>QBIT_PASS</code> no <code>.env</code>. Magnet links nativos continuam ativos sem qBittorrent quando não há Debrid.</div>
@@ -538,6 +564,11 @@ function applyPrefsToForm(prefs) {
   document.getElementById('dedupeBtn').classList.toggle('on', prefs.dedupe !== false);
   document.getElementById('enableCatalogBtn').classList.toggle('on', prefs.enableCatalog !== false);
   document.getElementById('keywordBoost').value = prefs.keywordBoost || '';
+  document.getElementById('priorityIndexers').value = Array.isArray(prefs.priorityIndexers) ? prefs.priorityIndexers.join(', ') : (prefs.priorityIndexers || '');
+  document.getElementById('rdExcludeKeywords').value = prefs.rdExcludeKeywords || '';
+  document.getElementById('rdExcludeQualities').value = prefs.rdExcludeQualities || '';
+  document.getElementById('rdExcludeIndexers').value = prefs.rdExcludeIndexers || '';
+  document.getElementById('rdExcludeGroups').value = prefs.rdExcludeGroups || '';
   document.getElementById('maxResults').value = prefs.maxResults || 20;
   document.getElementById('slowThreshold').value = prefs.slowThreshold || 8000;
   document.getElementById('maxResultsPerIndexer').value = prefs.maxResultsPerIndexer || 0;
@@ -735,6 +766,11 @@ function buildPrefs() {
     enableP2P: true,
     qbitMode: document.getElementById('enableP2P').checked ? (document.getElementById('qbitMode').value || 'private') : 'off',
     keywordBoost: document.getElementById('keywordBoost').value.trim(),
+    priorityIndexers: document.getElementById('priorityIndexers').value.split(/[,\n;|]+/).map(s => s.trim()).filter(Boolean),
+    rdExcludeKeywords: document.getElementById('rdExcludeKeywords').value.trim(),
+    rdExcludeQualities: document.getElementById('rdExcludeQualities').value.trim(),
+    rdExcludeIndexers: document.getElementById('rdExcludeIndexers').value.trim(),
+    rdExcludeGroups: document.getElementById('rdExcludeGroups').value.trim(),
     maxResultsPerIndexer: +document.getElementById('maxResultsPerIndexer').value || 0,
   };
 
