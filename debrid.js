@@ -158,7 +158,7 @@ async function rdListDownloadedHashes(hashes, headersAuth) {
   return resultMap;
 }
 
-// NOVA VERSÃO - Cache check otimizado
+// NOVA VERSÃO - Cache check: apenas lista da conta (instantAvailability foi descontinuado pelo RD)
 async function rdBatchCheckCache(hashes, key, bufferMap = {}, privateHashes = new Set()) {
   if (!hashes || !hashes.length) return {};
 
@@ -167,33 +167,9 @@ async function rdBatchCheckCache(hashes, key, bufferMap = {}, privateHashes = ne
   if (!uniqueHashes.length) return {};
 
   const headersAuth = { Authorization: `Bearer ${key}` };
-
-  // instantAvailability é read-only. Não use addMagnet aqui: isso cria itens na
-  // conta do usuário e pode deixar o RD aguardando seleção/confirmação no site.
-  try {
-    const resultMap = {};
-    for (const group of chunkArray(uniqueHashes, 80)) {
-      const res = await axios.get(
-        `https://api.real-debrid.com/rest/1.0/torrents/instantAvailability/${group.join("/")}`,
-        { headers: headersAuth, timeout: 15000 }
-      );
-      const data = res.data || {};
-      for (const hash of group) {
-        const keyLower = String(hash || "").toLowerCase();
-        const entry = data[keyLower] || data[hash] || data[String(hash || "").toUpperCase()];
-        const rd = Array.isArray(entry?.rd) ? entry.rd : [];
-        if (rd.length) resultMap[keyLower] = { rd };
-      }
-    }
-    Object.assign(resultMap, await rdListDownloadedHashes(uniqueHashes.filter(hash => !resultMap[hash]), headersAuth));
-    console.log(`[RD] instantAvailability: ${Object.keys(resultMap).length} cached`);
-    return resultMap;
-  } catch (e) {
-    console.log(`[RD] instantAvailability falhou (${e.response?.status || e.message}); usando fallback da lista da conta`);
-    const resultMap = await rdListDownloadedHashes(uniqueHashes, headersAuth);
-    console.log(`[RD] fallback conta: ${Object.keys(resultMap).length} cached`);
-    return resultMap;
-  }
+  const resultMap = await rdListDownloadedHashes(uniqueHashes, headersAuth);
+  console.log(`[RD] conta: ${Object.keys(resultMap).length} cached`);
+  return resultMap;
 }
 
 async function rdGetDirectLink(hash, magnet, fileIds, key, torrentBuffer = null) {
@@ -472,76 +448,66 @@ async function resolveDebridStream(
 }
 
 async function resolveRDStream(infoHash, magnet, season, episode, isAnime, key, files, cache, buffer) {
+  const headersAuth = { Authorization: `Bearer ${key}` };
+
+  // Sem cache na conta — tracker privado (buffer sem magnet): não gera stream on-demand.
+  // Evita adicionar em massa para checar cache, causando rate limit.
   if (!cache || !cache.rd || !cache.rd.length) {
+    const isPrivate = buffer && !magnet;
+    if (isPrivate) return null;
     return { queued: true, cached: false };
   }
 
+  // Cache confirmado na conta — gera link direto
   const variant = cache.rd[0];
-  const fileIds = Object.keys(variant);
 
   if (season != null && episode != null) {
-    // Encontrar arquivo específico do episódio
     const matchedFile = findBestFileMatch(variant, season, episode, isAnime);
     if (!matchedFile) return { queued: true, cached: true };
-
     const link = await rdGetDirectLink(infoHash, magnet, [matchedFile.id], key, buffer);
-    if (link?.download) {
-      return { url: link.download, filename: matchedFile.filename };
-    }
+    if (link?.download) return { url: link.download, filename: matchedFile.filename };
     return { queued: true, cached: true };
   }
 
-  // Filme: pega o maior arquivo
   const largestFile = Object.entries(variant)
     .sort((a, b) => (b[1].filesize || 0) - (a[1].filesize || 0))[0];
-
   if (!largestFile) return { queued: true, cached: true };
 
   const link = await rdGetDirectLink(infoHash, magnet, [largestFile[0]], key, buffer);
-  if (link?.download) {
-    return { url: link.download, filename: largestFile[1].filename };
-  }
-
+  if (link?.download) return { url: link.download, filename: largestFile[1].filename };
   return { queued: true, cached: true };
 }
 
 async function resolveTBStream(infoHash, magnet, season, episode, isAnime, key, files, cache, buffer) {
+  // Tracker privado (buffer sem magnet) sem cache confirmado: não gera stream on-demand.
+  // Adicionar em massa para checar cache causa rate limit no TorBox.
   if (!cache || typeof cache !== "object" || cache === false) {
+    const isPrivate = buffer && !magnet;
+    if (isPrivate) return null;
     return { queued: true, cached: false };
   }
 
-  // TorBox 'cache' pode ser:
-  // 1. O objeto torrent completo (vindo do on-demand polling em addon.js)
-  // 2. A lista de arquivos (vindo do batchCheckCache)
-  
+  // cache pode ser:
+  // 1. Objeto torrent completo da conta (vindo do on-demand polling em addon.js)
+  // 2. Dados do checkcached (lista de arquivos — cache global confirmado)
+
   const torrentId = cache.id || cache.torrent_id;
   const filesList = cache.files || (Array.isArray(cache) ? cache : null);
-
-  // Caso 1: Torrent já está no painel e finalizado
   const isReady = cache.download_finished === true || cache.download_present === true || cache.download_state === "cached";
 
+  // Caso 1: torrent já na conta e pronto
   if (torrentId && isReady && filesList) {
     const variant = {};
-    filesList.forEach(f => {
-      variant[f.id] = { filename: f.name, filesize: f.size };
-    });
+    filesList.forEach(f => { variant[f.id] = { filename: f.name, filesize: f.size }; });
 
-    let matchedFile;
-    if (season != null && episode != null) {
-      matchedFile = findBestFileMatch(variant, season, episode, isAnime);
-    } else {
-      const largest = Object.entries(variant)
-        .sort((a, b) => (b[1].filesize || 0) - (a[1].filesize || 0))[0];
-      if (largest) matchedFile = { id: largest[0], ...largest[1] };
-    }
-
+    const matchedFile = pickTBFile(variant, season, episode, isAnime);
     if (matchedFile) {
       const url = `https://api.torbox.app/v1/api/torrents/requestdl?token=${key}&torrent_id=${torrentId}&file_id=${matchedFile.id}&redirect=true`;
       return { url, filename: matchedFile.filename };
     }
   }
 
-  // Caso 2: Apenas dados de cache check (lista de arquivos)
+  // Caso 2: checkcached confirmou cache global — adiciona para obter torrent_id e gera link
   if (filesList) {
     const variant = {};
     filesList.forEach((f, idx) => {
@@ -549,18 +515,10 @@ async function resolveTBStream(infoHash, magnet, season, episode, isAnime, key, 
       variant[fid] = { filename: f.name || f.filename, filesize: f.size || f.filesize };
     });
 
-    let matchedFile;
-    if (season != null && episode != null) {
-      matchedFile = findBestFileMatch(variant, season, episode, isAnime);
-    } else {
-      const largest = Object.entries(variant)
-        .sort((a, b) => (b[1].filesize || 0) - (a[1].filesize || 0))[0];
-      if (largest) matchedFile = { id: largest[0], ...largest[1] };
-    }
-
+    const matchedFile = pickTBFile(variant, season, episode, isAnime);
     if (!matchedFile) return { queued: true, cached: true };
 
-    // Adicionamos agora (instantâneo se estiver cacheado no TorBox)
+    // Adiciona o torrent (instantâneo pois está em cache global no TorBox)
     const added = await torboxAddTorrent(magnet || buildMagnet(infoHash, null, infoHash), key, false, buffer);
     if (added && (added.id || added.torrent_id)) {
       const tid = added.id || added.torrent_id;
@@ -570,6 +528,15 @@ async function resolveTBStream(infoHash, magnet, season, episode, isAnime, key, 
   }
 
   return { queued: true, cached: true };
+}
+
+function pickTBFile(variant, season, episode, isAnime) {
+  if (season != null && episode != null) {
+    return findBestFileMatch(variant, season, episode, isAnime);
+  }
+  const largest = Object.entries(variant)
+    .sort((a, b) => (b[1].filesize || 0) - (a[1].filesize || 0))[0];
+  return largest ? { id: largest[0], ...largest[1] } : null;
 }
 
 function findBestFileMatch(variant, season, episode, isAnime) {
