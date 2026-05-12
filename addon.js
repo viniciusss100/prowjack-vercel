@@ -384,16 +384,18 @@ async function resolveSearchIndexers(prefs, isAnime) {
 
   // Normaliza: aceita array ou string separada por vírgula
   const rawSelected = Array.isArray(prefs.indexers) ? prefs.indexers : String(prefs.indexers || "").split(",");
-  const selected = rawSelected.map(s => String(s || "").trim()).filter(Boolean);
-  const useAll   = !selected.length || selected.includes("all");
+  let selected = rawSelected.map(s => String(s || "").trim()).filter(Boolean);
+  
+  // Se houver IDs específicos e 'all', remove 'all' para respeitar a seleção do usuário
+  if (selected.length > 1 && selected.includes("all")) {
+    selected = selected.filter(s => s !== "all");
+  }
+  const useAll = !selected.length || selected.includes("all");
 
   // IDs numéricos = Prowlarr; IDs string = Jackett. Não precisa buscar lista completa se já temos os IDs.
   const allNumeric = selected.every(s => /^\d+$/.test(s));
   if (!useAll && allNumeric) {
-    // Prowlarr com IDs numéricos: usa direto sem precisar buscar lista de indexers
-    const pool = selected;
-    if (isAnime) return pool;
-    return pool;
+    return selected;
   }
 
   const allList  = await getCachedIndexers(jUrl, jKey);
@@ -1152,7 +1154,7 @@ async function resolveInfoHash(r) {
     let _magnetRedirect = null;
     try {
       const res = await axios.get(httpLink, {
-        timeout: 10000, maxRedirects: 10, responseType: "arraybuffer",
+        timeout: 5000, maxRedirects: 10, responseType: "arraybuffer",
         maxContentLength: 8 * 1024 * 1024, validateStatus: s => s < 400,
         headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
         beforeRedirect: (options) => {
@@ -1551,8 +1553,8 @@ async function trackMetrics(indexer, ms, count, ok) {
 }
 
 async function jackettSearch(plan, indexers, prefs) {
-  const jUrl     = (prefs?.jackett?.url || ENV.jackettUrl).replace(/\/+$/, "");
-  const jKey     = prefs?.jackett?.key  || ENV.apiKey;
+  const jUrl      = (prefs?.jackett?.url || ENV.jackettUrl).replace(/\/+$/, "");
+  const jKey      = prefs?.jackett?.key  || ENV.apiKey;
   const queryList = uniq(Array.isArray(plan?.queries) ? plan.queries : [plan?.queries].filter(Boolean));
   const cacheKey  = `search:${CACHE_VERSION}:${Buffer.from(JSON.stringify({ queryList, search: plan?.search || null, parsed: plan?.parsed || null })).toString("base64")}:${indexers.join(",")}`;
   const cached    = await rc.get(cacheKey);
@@ -1565,13 +1567,37 @@ async function jackettSearch(plan, indexers, prefs) {
   console.log(`Jackett iniciando busca: "${queryList[0] || plan?.search?.title || "sem titulo"}" em [${indexers.length} indexers]`);
   console.log(`Fase rapida: aguardando respostas... (${FAST_TIMEOUT}ms max)`);
 
-  const fastFlat    = (await Promise.all(indexers.map(indexer => jackettSearchOneIndexer(indexer, plan, FAST_TIMEOUT, FAST_TIMEOUT, jUrl, jKey)))).flat();
+  const resultsByIndexer = new Map();
+  let fastPhaseActive = true;
+
+  // Inicia todas as buscas simultaneamente com o timeout longo
+  const searchPromises = indexers.map(async (indexer) => {
+    try {
+      const res = await jackettSearchOneIndexer(indexer, plan, SLOW_TIMEOUT, FAST_TIMEOUT, jUrl, jKey);
+      if (fastPhaseActive) {
+        resultsByIndexer.set(indexer, res);
+      }
+      return res;
+    } catch {
+      return [];
+    }
+  });
+
+  // Aguarda até o FAST_TIMEOUT ou até que todos terminem
+  await Promise.race([
+    Promise.all(searchPromises),
+    new Promise(resolve => setTimeout(resolve, FAST_TIMEOUT))
+  ]);
+
+  fastPhaseActive = false;
+  const fastFlat    = [...resultsByIndexer.values()].flat();
   const fastDeduped = prefs.dedupe !== false ? dedupeResults(fastFlat) : fastFlat;
   console.log(`Conclusao da janela rapida: ${fastFlat.length} brutos -> ${fastDeduped.length} ${prefs.dedupe !== false ? 'deduplicados' : 'resultados'}`);
 
-  setImmediate(async () => {
+  // Processamento em background do que sobrar
+  Promise.all(searchPromises).then(async (allResults) => {
     try {
-      const slowFlat    = (await Promise.all(indexers.map(indexer => jackettSearchOneIndexer(indexer, plan, SLOW_TIMEOUT, FAST_TIMEOUT, jUrl, jKey)))).flat();
+      const slowFlat    = allResults.flat();
       const slowDeduped = prefs.dedupe !== false ? dedupeResults(slowFlat) : slowFlat;
       if (slowDeduped.length > fastDeduped.length) {
         console.log(`[Background] Cache atualizado: ${fastDeduped.length} -> ${slowDeduped.length}`);
@@ -1580,7 +1606,8 @@ async function jackettSearch(plan, indexers, prefs) {
         if (fastDeduped.length > 0) await rc.set(cacheKey, JSON.stringify(fastDeduped), 10800);
       }
     } catch {}
-  });
+  }).catch(() => {});
+
   return fastDeduped;
 }
 
@@ -2581,16 +2608,19 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           })
       : results
           .filter(r => r?.InfoHash || r?.MagnetUri || r?.Link)
-          .filter(r => isPriorityIndexerResult(r, prefs) || !prefs.skipBadReleases || !BAD_RE.test(r.Title || ""))
-          .filter(r => isPriorityIndexerResult(r, prefs) || type !== "movie" || !looksLikeEpisodeRelease(r.Title || ""))
+          .filter(r => {
+            const isPrio = isPriorityIndexerResult(r, prefs);
+            if (isPrio) r._priorityIndexer = true;
+            return isPrio || !prefs.skipBadReleases || !BAD_RE.test(r.Title || "");
+          })
+          .filter(r => r._priorityIndexer || type !== "movie" || !looksLikeEpisodeRelease(r.Title || ""))
           .filter(r => {
             if (parsed.isAnime) return animeEpisodeMatches(r.Title || "", episode);
             if (type === "series") return seriesEpisodeMatches(r.Title || "", parsed.season, parsed.episode);
             return true;
           })
           .filter(r => {
-            if (isPriorityIndexerResult(r, prefs)) {
-              r._priorityIndexer = true;
+            if (r._priorityIndexer) {
               r._titleMatchScore = Math.max(r._titleMatchScore || 0, 1);
               return true;
             }
@@ -2603,11 +2633,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             return hasLang;
           })
           .filter(r => {
-            if (r._priorityIndexer || isPriorityIndexerResult(r, prefs)) {
-              r._priorityIndexer = true;
-              r._titleMatchScore = Math.max(r._titleMatchScore || 0, 1);
-              return true;
-            }
+            if (r._priorityIndexer) return true;
             if (r._keywordMatch || r._metaIdMatch) return true;
             const resultImdbId = getResultImdbId(r);
             if (requestedImdbId && resultImdbId && resultImdbId === requestedImdbId) {
@@ -2626,14 +2652,13 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             r._titleMatchScore = Math.max(r._titleMatchScore || 0, finalScore);
             return finalScore >= minScore || (hasLang && finalScore > 0);
           })
-          .filter(r => { if (r._priorityIndexer || isPriorityIndexerResult(r, prefs)) return true; if (type !== "movie" || !year) return true; const ry = extractReleaseYear(r.Title || ""); return !ry || Math.abs(ry - year) <= 1; })
+          .filter(r => { if (r._priorityIndexer) return true; if (type !== "movie" || !year) return true; const ry = extractReleaseYear(r.Title || ""); return !ry || Math.abs(ry - year) <= 1; })
           .map(r => {
             const t       = r.Title || "";
             const langs   = getLangs(t, parsed.isAnime);
             const hasLang = priorityLang ? langs.some(l => l.code === priorityLang) : false;
             const isMulti = /(multi)[-.\\s]?(audio)?/i.test(t);
             const langPriority = hasLang ? 3 : (prefs.keywordBoost && matchesKeywordBoost(t, prefs.keywordBoost) ? 2 : (isMulti ? 1 : 0));
-            r._priorityIndexer = r._priorityIndexer || isPriorityIndexerResult(r, prefs);
             r._originalScore = ((r._priorityIndexer ? 1 : 0) * 5000000) +
               (langPriority * 100000) +
               ((r._metaIdMatch    ? 1 : 0) * 40000) +
@@ -2679,7 +2704,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
     const withHashes = (await (async () => {
       const results = new Array(topCandidates.length).fill(null);
-      const CONCURRENCY = 5;
+      const CONCURRENCY = 10;
       let idx = 0;
       async function worker() {
         while (idx < topCandidates.length) {
@@ -2696,7 +2721,6 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     let tbCacheMap = {};
 
     if (isDebridMode && !prefs.stConfig && withHashes.length > 0) {
-      const allHashes   = [...new Set(withHashes.map(r => String(r._resolved.infoHash || "").toLowerCase()).filter(Boolean))];
       const { mode, torboxKey, rdKey } = prefs.debridConfig;
       const { rdBatchCheckCache, torboxBatchCheckCache } = require("./debrid");
 
@@ -2708,11 +2732,30 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         if (r._resolved?.buffer) bufferMap[r._resolved.infoHash] = r._resolved.buffer;
       }
 
+      // Pré-filtra hashes excluídos pelo RD antes do cache check para reduzir chamadas à API
+      const rdExcludedHashes = new Set(
+        (mode === "realdebrid" || mode === "dual")
+          ? withHashes
+              .filter(r => isRdExcludedResult(r, prefs, r._indexerName || r.Tracker || r.TrackerId || r.Indexer || ""))
+              .map(r => r._resolved.infoHash)
+          : []
+      );
+      if (rdExcludedHashes.size) console.log(`[RD Exclude] ${rdExcludedHashes.size} hashes excluídos antes do cache check`);
+
+      const allHashes = [...new Set(
+        withHashes
+          .filter(r => mode === "torbox" || !rdExcludedHashes.has(r._resolved.infoHash))
+          .map(r => String(r._resolved.infoHash || "").toLowerCase())
+          .filter(Boolean)
+      )];
+      // Para TorBox no modo dual, inclui todos (RD excluído não afeta TB)
+      const allHashesForTB = [...new Set(withHashes.map(r => String(r._resolved.infoHash || "").toLowerCase()).filter(Boolean))];
+
       const [rdResult, tbResult] = await Promise.all([
-        (mode === "realdebrid" || mode === "dual") && rdKey
+        (mode === "realdebrid" || mode === "dual") && rdKey && allHashes.length
           ? rdBatchCheckCache(allHashes, rdKey, bufferMap, privateHashes) : Promise.resolve({}),
         (mode === "torbox"     || mode === "dual") && torboxKey
-          ? torboxBatchCheckCache(allHashes, torboxKey, privateHashes)    : Promise.resolve({}),
+          ? torboxBatchCheckCache(allHashesForTB, torboxKey, privateHashes) : Promise.resolve({}),
       ]);
       rdCacheMap = rdResult;
       tbCacheMap = tbResult;
