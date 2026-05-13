@@ -2443,40 +2443,39 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     if (!parsed.isAnime && type === "series" && !enabledCats.includes("series")) { streamWaiters.delete(streamCacheKey); return res.json({ streams: [] }); }
     if (type === "movie" && !enabledCats.includes("movie"))                      { streamWaiters.delete(streamCacheKey); return res.json({ streams: [] }); }
 
+    let proxyStreams = [];
     if (isStremThruMode) {
-      const maxOut = prefs.maxResults || 20;
       const proxyManifestUrl = await buildStremThruProxyManifestUrl(req, prefs);
-      const proxyStreams = proxyManifestUrl
-        ? await fetchScrapStreams(proxyManifestUrl, type, id, { timeout: 45000, label: "STREMTHRU" })
-        : [];
-      if (proxyStreams.length) {
-        proxyStreams.forEach(s => {
-          if (!s.name || /^ProwJack\b/i.test(s.name)) {
-            s.name = `${prefs.addonName || "ProwJack"}\n${s.name?.split("\n").slice(1).join("\n") || "⚡ Links [ST]"}`;
-          }
-        });
-        console.log(`[STREMTHRU] ${proxyStreams.length} streams do proxy retornados`);
-        const finalProxyStreams = proxyStreams.slice(0, maxOut).map(s => {
-          delete s._cached;
-          delete s._sourceType;
-          delete s._scrapSource;
-          delete s._stremThruProxy;
-          delete s._title;
-          delete s._seeders;
-          delete s._sizeGb;
-          delete s._sizeBytes;
-          return s;
-        });
-        await rc.set(streamCacheKey, JSON.stringify(finalProxyStreams), 10800).catch(() => {});
-        console.log(`StremThru listados: Enviando ${finalProxyStreams.length} streams!`);
-        console.log(`=========================================\n`);
-        streamWaiters.delete(streamCacheKey);
-        return res.json({ streams: finalProxyStreams });
+      if (proxyManifestUrl) {
+        console.log(`[STREMTHRU] Aguardando proxy: ${id}`);
+        proxyStreams = await fetchScrapStreams(proxyManifestUrl, type, id, { timeout: 45000, label: "STREMTHRU" });
+        if (proxyStreams.length > 0) {
+          proxyStreams.forEach(s => {
+            s._sourceType = "debrid";
+            s._scrapSource = true;
+            s._stremThruProxy = true;
+            s._cached = true;
+            if (!s.name || /^ProwJack\b/i.test(s.name)) {
+              s.name = `${prefs.addonName || "ProwJack"}\n${s.name?.split("\n").slice(1).join("\n") || "⚡ Links [ST]"}`;
+            }
+          });
+          console.log(`[STREMTHRU] ${proxyStreams.length} streams retornados do proxy para ${id}`);
+          
+          // Se o proxy retornou resultados, encerra aqui para evitar busca local duplicada
+          const maxOut = prefs.maxResults || 20;
+          const finalProxyStreams = proxyStreams.slice(0, maxOut).map(s => {
+            delete s._cached; delete s._sourceType; delete s._scrapSource; delete s._stremThruProxy;
+            delete s._title; delete s._seeders; delete s._sizeGb; delete s._sizeBytes;
+            return s;
+          });
+          await rc.set(streamCacheKey, JSON.stringify(finalProxyStreams), 10800).catch(() => {});
+          console.log(`StremThru listados: Enviando ${finalProxyStreams.length} streams!`);
+          console.log(`=========================================\n`);
+          streamWaiters.delete(streamCacheKey);
+          return res.json({ streams: finalProxyStreams });
+        }
+        console.log(`[STREMTHRU] Proxy vazio para ${id}, seguindo para busca local...`);
       }
-      console.log(`[STREMTHRU] Proxy não retornou streams para ${type}/${id}`);
-      console.log(`=========================================\n`);
-      streamWaiters.delete(streamCacheKey);
-      return res.json({ streams: [] });
     }
 
     const indexers     = await resolveSearchIndexers(prefs, parsed.isAnime);
@@ -3106,26 +3105,6 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     );
 
     const allStreams = resolvedAll.flat(2).filter(Boolean);
-
-    if (prefs.stConfig) {
-      const proxyManifestUrl = await buildStremThruProxyManifestUrl(req, prefs);
-      const proxyStreams = proxyManifestUrl ? await fetchScrapStreams(proxyManifestUrl, type, id) : [];
-      if (proxyStreams.length) {
-        proxyStreams.forEach(s => {
-          s._sourceType = "debrid";
-          s._scrapSource = true;
-          s._stremThruProxy = true;
-          s._cached = true;
-          if (!s.name || /^ProwJack\b/i.test(s.name)) {
-            s.name = `${prefs.addonName || "ProwJack"}\n${s.name?.split("\n").slice(1).join("\n") || "⚡ Links [ST]"}`;
-          }
-        });
-        console.log(`[STREMTHRU] ${proxyStreams.length} streams do proxy local ordenados pelo ProwJack`);
-        allStreams.push(...proxyStreams);
-      } else {
-        console.log(`[STREMTHRU] Proxy não retornou streams para ${type}/${id}`);
-      }
-    }
 
     // Scrap: injeta streams externos já resolvidos — passam pela mesma ordenação que os do Jackett
     const pendingScrap = results._scrapStreams || [];
