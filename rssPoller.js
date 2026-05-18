@@ -123,7 +123,17 @@ function parseRssItems(xml, indexerId, indexerName) {
 
     // Classifica categoria pelo título
     const isAnime  = /\b(anime|animes)\b/i.test(attrs.category || "") || /\[SubsPlease\]|\[Erai-raws\]|\[HorribleSubs\]/i.test(title);
-    const isSeries = !isAnime && (/\bS\d{1,2}E\d{1,3}\b|\bSeason\b|\bTemporada\b/i.test(title) || /\b\d{1,2}x\d{1,3}\b/.test(title));
+    const isSeries = !isAnime && (
+      /\bS\d{1,2}E\d{1,3}\b/i.test(title) ||
+      /\b\d{1,2}x\d{1,3}\b/.test(title) ||
+      /\bSeason\s?\d{1,2}\b/i.test(title) ||
+      /\bTemporada\s?\d{1,2}\b/i.test(title) ||
+      /\bEpisode\s?\d{1,3}\b/i.test(title) ||
+      /\bEp\s?\d{1,3}\b/i.test(title) ||
+      /\bS\d{2}\b/i.test(title) ||
+      /\bcap[ií]tulo\s?\d{1,3}\b/i.test(title) ||
+      /\b(TV Series|TV Show|Serie|Series)\b/i.test(attrs.category || "")
+    );
     const type     = isAnime ? "anime" : isSeries ? "series" : "movie";
 
     return {
@@ -224,32 +234,38 @@ function parseTorrentTitle(raw) {
 async function resolveImdbByTitle(title, year, type) {
   try {
     const query = encodeURIComponent(title);
-    const stremioType = type === "movie" ? "movie" : "series";
-    const res = await axios.get(
-      `https://v3-cinemeta.strem.io/catalog/${stremioType}/top/search=${query}.json`,
-      { timeout: 6000 }
-    );
-    const metas = res.data?.metas || [];
-    if (!metas.length) return null;
+    // Para séries, tenta primeiro como series; para filmes, tenta movie
+    const typesToTry = type === "series" ? ["series", "movie"] : ["movie", "series"];
+    for (const stremioType of typesToTry) {
+      try {
+        const res = await axios.get(
+          `https://v3-cinemeta.strem.io/catalog/${stremioType}/top/search=${query}.json`,
+          { timeout: 6000 }
+        );
+        const metas = res.data?.metas || [];
+        if (!metas.length) continue;
 
-    const normalize = s => (s || "").toLowerCase().replace(/[^a-z0-9]/g, " ").replace(/\s+/g, " ").trim();
-    const queryNorm = normalize(title);
+        const normalize = s => (s || "").toLowerCase().replace(/[^a-z0-9]/g, " ").replace(/\s+/g, " ").trim();
+        const queryNorm = normalize(title);
 
-    // Só aceita se o título do Cinemeta bater com o título buscado
-    const candidates = metas.filter(m => {
-      const metaNorm = normalize(m.name || m.title || "");
-      return metaNorm === queryNorm || metaNorm.includes(queryNorm) || queryNorm.includes(metaNorm);
-    });
-    if (!candidates.length) return null;
+        // Só aceita se o título do Cinemeta bater com o título buscado
+        const candidates = metas.filter(m => {
+          const metaNorm = normalize(m.name || m.title || "");
+          return metaNorm === queryNorm || metaNorm.includes(queryNorm) || queryNorm.includes(metaNorm);
+        });
+        if (!candidates.length) continue;
 
-    if (year) {
-      const match = candidates.find(m => {
-        const my = parseInt((m.releaseInfo || m.year || "").toString().slice(0, 4), 10);
-        return Math.abs(my - year) <= 1;
-      });
-      if (match) return match;
+        if (year) {
+          const match = candidates.find(m => {
+            const my = parseInt((m.releaseInfo || m.year || "").toString().slice(0, 4), 10);
+            return Math.abs(my - year) <= 1;
+          });
+          if (match) return match;
+        }
+        return candidates[0];
+      } catch {}
     }
-    return candidates[0];
+    return null;
   } catch {
     return null;
   }
