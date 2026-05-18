@@ -830,7 +830,16 @@ function episodeMatchRank(title, season, episode) {
   }
   const seasonOnly = new RegExp(`\\bs0*${sRaw}\\b|\\bseason\\s?0*${sRaw}\\b|\\btemporada\\s?0*${sRaw}\\b`, "i");
   if (seasonOnly.test(t) && !hasAnyEpisodeMarker(t)) return 2;
-  if (isCompletePack(t)) return seasonOnly.test(t) ? 1 : 0;
+  // Complete pack: só aceita se a temporada correta estiver no título (ou sem nenhuma temporada)
+  if (isCompletePack(t)) {
+    if (seasonOnly.test(t)) return 1;
+    // Se tem marcador de OUTRA temporada, rejeitar
+    if (/\bs\d{1,2}\b|\bseason\s?\d{1,2}\b|\btemporada\s?\d{1,2}\b/i.test(t)) return 0;
+    // Sem marcador de temporada: aceitar como pack genérico
+    return 1;
+  }
+  // Se tem marcador de episódio de outra temporada/episódio, rejeitar explicitamente
+  if (hasAnyEpisodeMarker(t)) return 0;
   return 0;
 }
 function animeEpisodeMatchRank(title, ep) {
@@ -2651,16 +2660,20 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             if (type === "series") {
               // Resultados de busca estruturada (tvsearch com season/ep) já foram filtrados
               // pelo indexador — não descartar por falta de marcador no título.
-              // Mas ainda verifica se o título não é claramente de outra temporada.
+              // Mas ainda verifica se o título não é claramente de outra temporada/episódio.
               if (r._structuredMatch) {
                 const rank = episodeMatchRank(r.Title || "", parsed.season, parsed.episode);
                 // rank=0 significa que o título tem marcador de OUTRA temporada/episódio — descartar
-                // rank>0 ou sem marcador (rank=2 para season-only, rank=1 para complete pack) — aceitar
+                // rank>=2: season-only, complete pack da temporada certa, ou episódio exato — aceitar
+                // rank=1: complete pack sem marcador de temporada — aceitar (pack genérico)
                 return rank !== 0;
               }
-              // Resultados com ImdbId correspondente: confiar no indexador
+              // Resultados com ImdbId correspondente: ainda verifica episódio para evitar
+              // retornar S05E05 quando pediu S05E07
               const resultImdbId = getResultImdbId(r);
-              if (requestedImdbId && resultImdbId && resultImdbId === requestedImdbId) return true;
+              if (requestedImdbId && resultImdbId && resultImdbId === requestedImdbId) {
+                return seriesEpisodeMatches(r.Title || "", parsed.season, parsed.episode);
+              }
               return seriesEpisodeMatches(r.Title || "", parsed.season, parsed.episode);
             }
             return true;
@@ -2683,6 +2696,10 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             if (r._keywordMatch || r._metaIdMatch) return true;
             const resultImdbId = getResultImdbId(r);
             if (requestedImdbId && resultImdbId && resultImdbId === requestedImdbId) {
+              // ImdbId bate: ainda verifica episódio para séries
+              if (type === "series") {
+                if (!seriesEpisodeMatches(r.Title || "", parsed.season, parsed.episode)) return false;
+              }
               r._titleMatchScore = Math.max(r._titleMatchScore || 0, 1);
               r._metaIdMatch = true; return true;
             }
