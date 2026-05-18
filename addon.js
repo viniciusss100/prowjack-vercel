@@ -821,16 +821,53 @@ function hasAnyEpisodeMarker(title) {
 }
 function episodeMatchRank(title, season, episode) {
   if (season == null || episode == null) return 1;
+
   const t    = (title || "").toLowerCase();
-  const sRaw = parseInt(season,  10);
+  const sRaw = parseInt(season, 10);
   const eRaw = parseInt(episode, 10);
-  if (new RegExp(`\\bs0*${sRaw}[\\s._-]*e0*${eRaw}\\b|\\b0*${sRaw}x0*${eRaw}\\b`, "i").test(t)) return 4;
-  for (const range of parseEpisodeRanges(t, sRaw)) {
-    if (eRaw >= range.lo && eRaw <= range.hi) return 3;
+
+  // Episódio exato
+  if (
+    new RegExp(
+      `\\bs0*${sRaw}[\\s._-]*e0*${eRaw}\\b|\\b0*${sRaw}x0*${eRaw}\\b`,
+      "i"
+    ).test(t)
+  ) {
+    return 4;
   }
-  const seasonOnly = new RegExp(`\\bs0*${sRaw}\\b|\\bseason\\s?0*${sRaw}\\b|\\btemporada\\s?0*${sRaw}\\b`, "i");
-  if (seasonOnly.test(t) && !hasAnyEpisodeMarker(t)) return 2;
-  if (isCompletePack(t)) return seasonOnly.test(t) ? 1 : 0;
+
+  // Range de episódios
+  for (const range of parseEpisodeRanges(t, sRaw)) {
+    if (eRaw >= range.lo && eRaw <= range.hi) {
+      return 3;
+    }
+  }
+
+  // Match de temporada
+  const seasonOnly = new RegExp(
+    `\\bs0*${sRaw}\\b|\\bseason\\s?0*${sRaw}\\b|\\btemporada\\s?0*${sRaw}\\b|\\b${sRaw}ª\\s*temporada\\b`,
+    "i"
+  );
+
+  // Season pack explícito
+  if (seasonOnly.test(t) && isCompletePack(t)) {
+    return 2;
+  }
+
+  // NOVO:
+  // Aceita packs de temporada sem palavras como COMPLETE/BATCH
+  // desde que:
+  // - tenha referência clara à temporada
+  // - não tenha episódio específico
+  if (seasonOnly.test(t) && !hasAnyEpisodeMarker(t)) {
+    return 2;
+  }
+
+  // Pack genérico completo
+  if (isCompletePack(t)) {
+    return seasonOnly.test(t) ? 1 : 0;
+  }
+
   return 0;
 }
 function animeEpisodeMatchRank(title, ep) {
