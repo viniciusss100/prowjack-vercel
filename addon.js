@@ -1464,6 +1464,27 @@ async function prowlarrSearch(query, indexer, limit = 50, jUrl, jKey, timeout = 
   return parseProwlarrResults(res.data, indexer);
 }
 
+async function prowlarrStructuredSearch(search, indexer, jUrl, jKey, timeout = 15000) {
+  if (!search?.mode || !search?.imdbId) return [];
+  const params = {
+    apikey: jKey,
+    query: search.title || "",
+    type: search.mode === "movie" ? "movie" : "tvsearch",
+    indexerIds: indexer,
+    limit: 50,
+    offset: 0,
+  };
+  if (search.imdbId) params.imdbId = search.imdbId.replace(/^tt/i, "");
+  if (search.season  != null) params.season  = search.season;
+  if (search.episode != null) params.episode = search.episode;
+  const res = await axios.get(`${jUrl}/api/v1/search`, {
+    params, timeout, validateStatus: () => true,
+  });
+  if (res.status === 429) throw Object.assign(new Error("Rate limited"), { response: res });
+  if (res.status >= 400) throw new Error(`HTTP ${res.status}`);
+  return parseProwlarrResults(res.data, indexer).map(r => ({ ...r, _structuredMatch: true }));
+}
+
 async function jackettTextSearch(query, indexer, timeout, jUrl, jKey) {
   const params = { Query: query };
   if (jKey) params.apikey = jKey;
@@ -1501,12 +1522,19 @@ async function jackettSearchOneIndexer(indexer, plan, timeout, fastTimeout, jUrl
   const isProwlarr = /^\d+$/.test(String(indexer));
   try {
     let results = [];
-    const isSeries = plan.parsed?.type === 'series' || (plan.search?.season != null);
-    if (!isProwlarr && plan.search && !plan.parsed?.isAnime && !isSeries) {
+    if (!isProwlarr && plan.search && !plan.parsed?.isAnime) {
       try {
         results = await jackettStructuredSearch(plan.search, indexer, timeout, jUrl, jKey);
       } catch (err) {
         console.log(`  ${indexer}: erro na busca estruturada: ${err.message}`);
+        if (err.response?.status === 429) throw err;
+      }
+    }
+    if (results.length === 0 && isProwlarr && plan.search && !plan.parsed?.isAnime) {
+      try {
+        results = await prowlarrStructuredSearch(plan.search, indexer, jUrl, jKey, timeout);
+      } catch (err) {
+        console.log(`  ${indexer}: erro na busca estruturada Prowlarr: ${err.message}`);
         if (err.response?.status === 429) throw err;
       }
     }
@@ -1736,11 +1764,15 @@ async function buildQueries(type, id) {
       `${t} S${String(parsed.season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`,
     ]));
   } else if (type === "series" && parsed.season != null && parsed.episode != null) {
+    const sStr = String(parsed.season).padStart(2, "0");
+    const eStr = String(parsed.episode).padStart(2, "0");
     queries = uniq([
-      `${meta.title} S${String(parsed.season).padStart(2, "0")}E${String(parsed.episode).padStart(2, "0")}`,
-      ...meta.aliases.slice(0, 2).map(a =>
-        `${a} S${String(parsed.season).padStart(2, "0")}E${String(parsed.episode).padStart(2, "0")}`
-      ),
+      `${meta.title} S${sStr}E${eStr}`,
+      ...meta.aliases.slice(0, 2).map(a => `${a} S${sStr}E${eStr}`),
+      // Fallback: só temporada (para season packs e indexers que não usam SxxExx)
+      `${meta.title} S${sStr}`,
+      // Fallback: título puro (para indexers com nomenclatura diferente)
+      meta.title,
     ]);
   } else {
     queries = [meta.title];
@@ -2443,39 +2475,40 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     if (!parsed.isAnime && type === "series" && !enabledCats.includes("series")) { streamWaiters.delete(streamCacheKey); return res.json({ streams: [] }); }
     if (type === "movie" && !enabledCats.includes("movie"))                      { streamWaiters.delete(streamCacheKey); return res.json({ streams: [] }); }
 
-    let proxyStreams = [];
     if (isStremThruMode) {
+      const maxOut = prefs.maxResults || 20;
       const proxyManifestUrl = await buildStremThruProxyManifestUrl(req, prefs);
-      if (proxyManifestUrl) {
-        console.log(`[STREMTHRU] Aguardando proxy: ${id}`);
-        proxyStreams = await fetchScrapStreams(proxyManifestUrl, type, id, { timeout: 45000, label: "STREMTHRU" });
-        if (proxyStreams.length > 0) {
-          proxyStreams.forEach(s => {
-            s._sourceType = "debrid";
-            s._scrapSource = true;
-            s._stremThruProxy = true;
-            s._cached = true;
-            if (!s.name || /^ProwJack\b/i.test(s.name)) {
-              s.name = `${prefs.addonName || "ProwJack"}\n${s.name?.split("\n").slice(1).join("\n") || "⚡ Links [ST]"}`;
-            }
-          });
-          console.log(`[STREMTHRU] ${proxyStreams.length} streams retornados do proxy para ${id}`);
-          
-          // Se o proxy retornou resultados, encerra aqui para evitar busca local duplicada
-          const maxOut = prefs.maxResults || 20;
-          const finalProxyStreams = proxyStreams.slice(0, maxOut).map(s => {
-            delete s._cached; delete s._sourceType; delete s._scrapSource; delete s._stremThruProxy;
-            delete s._title; delete s._seeders; delete s._sizeGb; delete s._sizeBytes;
-            return s;
-          });
-          await rc.set(streamCacheKey, JSON.stringify(finalProxyStreams), 10800).catch(() => {});
-          console.log(`StremThru listados: Enviando ${finalProxyStreams.length} streams!`);
-          console.log(`=========================================\n`);
-          streamWaiters.delete(streamCacheKey);
-          return res.json({ streams: finalProxyStreams });
-        }
-        console.log(`[STREMTHRU] Proxy vazio para ${id}, seguindo para busca local...`);
+      const proxyStreams = proxyManifestUrl
+        ? await fetchScrapStreams(proxyManifestUrl, type, id, { timeout: 45000, label: "STREMTHRU" })
+        : [];
+      if (proxyStreams.length) {
+        proxyStreams.forEach(s => {
+          if (!s.name || /^ProwJack\b/i.test(s.name)) {
+            s.name = `${prefs.addonName || "ProwJack"}\n${s.name?.split("\n").slice(1).join("\n") || "⚡ Links [ST]"}`;
+          }
+        });
+        console.log(`[STREMTHRU] ${proxyStreams.length} streams do proxy retornados`);
+        const finalProxyStreams = proxyStreams.slice(0, maxOut).map(s => {
+          delete s._cached;
+          delete s._sourceType;
+          delete s._scrapSource;
+          delete s._stremThruProxy;
+          delete s._title;
+          delete s._seeders;
+          delete s._sizeGb;
+          delete s._sizeBytes;
+          return s;
+        });
+        await rc.set(streamCacheKey, JSON.stringify(finalProxyStreams), 10800).catch(() => {});
+        console.log(`StremThru listados: Enviando ${finalProxyStreams.length} streams!`);
+        console.log(`=========================================\n`);
+        streamWaiters.delete(streamCacheKey);
+        return res.json({ streams: finalProxyStreams });
       }
+      console.log(`[STREMTHRU] Proxy não retornou streams para ${type}/${id}`);
+      console.log(`=========================================\n`);
+      streamWaiters.delete(streamCacheKey);
+      return res.json({ streams: [] });
     }
 
     const indexers     = await resolveSearchIndexers(prefs, parsed.isAnime);
@@ -2615,7 +2648,21 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           .filter(r => r._priorityIndexer || type !== "movie" || !looksLikeEpisodeRelease(r.Title || ""))
           .filter(r => {
             if (parsed.isAnime) return animeEpisodeMatches(r.Title || "", episode);
-            if (type === "series") return seriesEpisodeMatches(r.Title || "", parsed.season, parsed.episode);
+            if (type === "series") {
+              // Resultados de busca estruturada (tvsearch com season/ep) já foram filtrados
+              // pelo indexador — não descartar por falta de marcador no título.
+              // Mas ainda verifica se o título não é claramente de outra temporada.
+              if (r._structuredMatch) {
+                const rank = episodeMatchRank(r.Title || "", parsed.season, parsed.episode);
+                // rank=0 significa que o título tem marcador de OUTRA temporada/episódio — descartar
+                // rank>0 ou sem marcador (rank=2 para season-only, rank=1 para complete pack) — aceitar
+                return rank !== 0;
+              }
+              // Resultados com ImdbId correspondente: confiar no indexador
+              const resultImdbId = getResultImdbId(r);
+              if (requestedImdbId && resultImdbId && resultImdbId === requestedImdbId) return true;
+              return seriesEpisodeMatches(r.Title || "", parsed.season, parsed.episode);
+            }
             return true;
           })
           .filter(r => {
@@ -3105,6 +3152,26 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     );
 
     const allStreams = resolvedAll.flat(2).filter(Boolean);
+
+    if (prefs.stConfig) {
+      const proxyManifestUrl = await buildStremThruProxyManifestUrl(req, prefs);
+      const proxyStreams = proxyManifestUrl ? await fetchScrapStreams(proxyManifestUrl, type, id) : [];
+      if (proxyStreams.length) {
+        proxyStreams.forEach(s => {
+          s._sourceType = "debrid";
+          s._scrapSource = true;
+          s._stremThruProxy = true;
+          s._cached = true;
+          if (!s.name || /^ProwJack\b/i.test(s.name)) {
+            s.name = `${prefs.addonName || "ProwJack"}\n${s.name?.split("\n").slice(1).join("\n") || "⚡ Links [ST]"}`;
+          }
+        });
+        console.log(`[STREMTHRU] ${proxyStreams.length} streams do proxy local ordenados pelo ProwJack`);
+        allStreams.push(...proxyStreams);
+      } else {
+        console.log(`[STREMTHRU] Proxy não retornou streams para ${type}/${id}`);
+      }
+    }
 
     // Scrap: injeta streams externos já resolvidos — passam pela mesma ordenação que os do Jackett
     const pendingScrap = results._scrapStreams || [];
