@@ -572,11 +572,11 @@ function sanitizeUserPrefs(input = {}) {
     const torboxKey = cleanString(src.debridConfig.torboxKey, 600);
     const rdKey = cleanString(src.debridConfig.rdKey, 600);
     if (torboxKey || rdKey) {
-      out.debridConfig = {
-        mode: torboxKey && rdKey ? "dual" : torboxKey ? "realdebrid",
-        torboxKey,
-        rdKey,
-      };
+      outout.debridConfig = {
+  mode: torboxKey && rdKey ? "dual" : (torboxKey ? "torbox" : "realdebrid"), // ✅ CORRETO
+  torboxKey,
+  rdKey,
+};
       out.debrid = true;
     }
   }
