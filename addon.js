@@ -572,11 +572,11 @@ function sanitizeUserPrefs(input = {}) {
     const torboxKey = cleanString(src.debridConfig.torboxKey, 600);
     const rdKey = cleanString(src.debridConfig.rdKey, 600);
     if (torboxKey || rdKey) {
-      outout.debridConfig = {
-  mode: torboxKey && rdKey ? "dual" : (torboxKey ? "torbox" : "realdebrid"), // ✅ CORRETO
-  torboxKey,
-  rdKey,
-};
+      out.debridConfig = {
+        mode: torboxKey && rdKey ? "dual" : torboxKey ? "torbox" : "realdebrid",
+        torboxKey,
+        rdKey,
+      };
       out.debrid = true;
     }
   }
@@ -821,53 +821,16 @@ function hasAnyEpisodeMarker(title) {
 }
 function episodeMatchRank(title, season, episode) {
   if (season == null || episode == null) return 1;
-
   const t    = (title || "").toLowerCase();
-  const sRaw = parseInt(season, 10);
+  const sRaw = parseInt(season,  10);
   const eRaw = parseInt(episode, 10);
-
-  // Episódio exato
-  if (
-    new RegExp(
-      `\\bs0*${sRaw}[\\s._-]*e0*${eRaw}\\b|\\b0*${sRaw}x0*${eRaw}\\b`,
-      "i"
-    ).test(t)
-  ) {
-    return 4;
-  }
-
-  // Range de episódios
+  if (new RegExp(`\\bs0*${sRaw}[\\s._-]*e0*${eRaw}\\b|\\b0*${sRaw}x0*${eRaw}\\b`, "i").test(t)) return 4;
   for (const range of parseEpisodeRanges(t, sRaw)) {
-    if (eRaw >= range.lo && eRaw <= range.hi) {
-      return 3;
-    }
+    if (eRaw >= range.lo && eRaw <= range.hi) return 3;
   }
-
-  // Match de temporada
-  const seasonOnly = new RegExp(
-    `\\bs0*${sRaw}\\b|\\bseason\\s?0*${sRaw}\\b|\\btemporada\\s?0*${sRaw}\\b|\\b${sRaw}ª\\s*temporada\\b`,
-    "i"
-  );
-
-  // Season pack explícito
-  if (seasonOnly.test(t) && isCompletePack(t)) {
-    return 2;
-  }
-
-  // NOVO:
-  // Aceita packs de temporada sem palavras como COMPLETE/BATCH
-  // desde que:
-  // - tenha referência clara à temporada
-  // - não tenha episódio específico
-  if (seasonOnly.test(t) && !hasAnyEpisodeMarker(t)) {
-    return 2;
-  }
-
-  // Pack genérico completo
-  if (isCompletePack(t)) {
-    return seasonOnly.test(t) ? 1 : 0;
-  }
-
+  const seasonOnly = new RegExp(`\\bs0*${sRaw}\\b|\\bseason\\s?0*${sRaw}\\b|\\btemporada\\s?0*${sRaw}\\b`, "i");
+  if (seasonOnly.test(t) && !hasAnyEpisodeMarker(t)) return 2;
+  if (isCompletePack(t)) return seasonOnly.test(t) ? 1 : 0;
   return 0;
 }
 function animeEpisodeMatchRank(title, ep) {
@@ -2681,41 +2644,11 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
             const sc           = titleMatchScore(r.Title || "", [displayTitle, ...aliases]);
             const relaxedScore = relaxedTitleMatchScore(r.Title || "", [displayTitle, ...aliases]);
-
-            const episodeRank = parsed.isAnime
-              ? animeEpisodeMatchRank(r.Title || "", episode)
-              : episodeMatchRank(r.Title || "", parsed.season, parsed.episode);
-
-            const finalScore = Math.max(
-              sc,
-              type === "series" ? relaxedScore * 0.9 : 0
-            );
-
-            // MATCH FORTE DE EPISÓDIO/TEMPORADA
-            // bypass do filtro de alias/título
-            if (type === "series" && episodeRank >= 2) {
-              r._structuredMatch = true;
-              r._titleMatchScore = Math.max(r._titleMatchScore || 0, finalScore, 0.6);
-              return true;
-            }
-
-            if (parsed.isAnime && episodeRank >= 2) {
-              r._structuredMatch = true;
-              r._titleMatchScore = Math.max(r._titleMatchScore || 0, finalScore, 0.6);
-              return true;
-            }
-
-            const minScore = parsed.isAnime ? 0.25 : 0.35;
-
-            if (hasLang && finalScore > 0) {
-              r._titleMatchScore = Math.max(r._titleMatchScore || 0, 1);
-            }
-
-            r._titleMatchScore = Math.max(
-              r._titleMatchScore || 0,
-              finalScore
-            );
-
+            const episodeRank  = parsed.isAnime ? animeEpisodeMatchRank(r.Title || "", episode) : episodeMatchRank(r.Title || "", parsed.season, parsed.episode);
+            const minScore     = parsed.isAnime ? 0.34 : (type === "series" && episodeRank >= 2 ? 0.2 : 0.45);
+            const finalScore   = Math.max(sc, type === "series" ? relaxedScore * 0.8 : 0);
+            if (hasLang && finalScore > 0) r._titleMatchScore = Math.max(r._titleMatchScore || 0, 1);
+            r._titleMatchScore = Math.max(r._titleMatchScore || 0, finalScore);
             return finalScore >= minScore || (hasLang && finalScore > 0);
           })
           .filter(r => { if (r._priorityIndexer) return true; if (type !== "movie" || !year) return true; const ry = extractReleaseYear(r.Title || ""); return !ry || Math.abs(ry - year) <= 1; })
