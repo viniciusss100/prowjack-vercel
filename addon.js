@@ -62,6 +62,8 @@ const ENV = {
   addonPublicUrl:  (process.env.ADDON_PUBLIC_URL || "").trim().replace(/\/+$/, ""),
   accessToken:     (process.env.ACCESS_TOKEN || "").trim(),
   scrapManifests:  (process.env.SCRAP_MANIFEST_URLS || "").split(",").map(s => s.trim()).filter(Boolean),
+  configDbUrl:     (process.env.CONFIG_DATABASE_URL || process.env.POSTGRES_URL || process.env.DATABASE_URL || "").trim(),
+  configDbTable:   (/^[A-Za-z_][A-Za-z0-9_]*$/.test(process.env.CONFIG_DATABASE_TABLE || "") ? process.env.CONFIG_DATABASE_TABLE : "prowjack_configs"),
 };
 let redis = null;
 const memoryStore = new Map();
@@ -149,7 +151,7 @@ const rc = {
   },
 };
 const CACHE_VERSION = "v12-native-debrid";
-const STREAM_CACHE_VERSION = "v19-bounded-hash-inflight";
+const STREAM_CACHE_VERSION = "v20-scrap-debrid-names";
 const streamWaiters = new Map();
 
 function getPublicBase(req) {
@@ -171,8 +173,70 @@ async function loadQbitJob(token) {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
-// Configs persistidas em arquivo JSON no volume montado (/data)
-// Redis é usado apenas para cache de buscas — dados de config sobrevivem reinicializações
+let configPgPool = null;
+let configPgInit = null;
+
+function shouldUseConfigDb() {
+  return !!ENV.configDbUrl;
+}
+
+function getConfigPgPool() {
+  if (!shouldUseConfigDb()) return null;
+  if (configPgPool) return configPgPool;
+  let Pool;
+  try {
+    ({ Pool } = require("pg"));
+  } catch (err) {
+    throw new Error("CONFIG_DATABASE_URL/POSTGRES_URL configurado, mas a dependência 'pg' não está instalada. Rode npm install.");
+  }
+  const ssl = /^postgres/i.test(ENV.configDbUrl) && !/localhost|127\.0\.0\.1/i.test(ENV.configDbUrl)
+    ? { rejectUnauthorized: false }
+    : undefined;
+  configPgPool = new Pool({ connectionString: ENV.configDbUrl, ssl });
+  return configPgPool;
+}
+
+async function ensureConfigDb() {
+  const pool = getConfigPgPool();
+  if (!pool) return null;
+  if (!configPgInit) {
+    const table = ENV.configDbTable;
+    configPgInit = pool.query(`
+      CREATE TABLE IF NOT EXISTS ${table} (
+        id TEXT PRIMARY KEY,
+        payload JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+  }
+  await configPgInit;
+  return pool;
+}
+
+async function cfgDbLoad(id) {
+  const pool = await ensureConfigDb();
+  if (!pool) return null;
+  const r = await pool.query(`SELECT payload FROM ${ENV.configDbTable} WHERE id = $1`, [id]);
+  const payload = r.rows[0]?.payload;
+  return payload && typeof payload === "object" && !Array.isArray(payload) ? payload : null;
+}
+
+async function cfgDbSave(id, prefs) {
+  const pool = await ensureConfigDb();
+  if (!pool) return false;
+  await pool.query(
+    `INSERT INTO ${ENV.configDbTable} (id, payload, updated_at)
+     VALUES ($1, $2::jsonb, NOW())
+     ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`,
+    [id, JSON.stringify(prefs)]
+  );
+  return true;
+}
+
+// Configs persistidas em Postgres quando CONFIG_DATABASE_URL/POSTGRES_URL/DATABASE_URL existir.
+// Sem banco, mantém o arquivo JSON no volume montado (/data), como no VPS atual.
+// Redis é usado apenas para cache de buscas — não para configs permanentes.
 const CONFIG_FILE = (() => {
   const fs = require("fs");
   const path = require("path");
@@ -206,6 +270,10 @@ function cfgStore() {
 
 async function saveStoredConfig(prefs) {
   const id = crypto.randomBytes(24).toString("base64url");
+  if (shouldUseConfigDb()) {
+    await cfgDbSave(id, prefs);
+    return `cfg_${id}`;
+  }
   const store = cfgStore();
   store[id] = JSON.stringify(prefs);
   cfgFileSave(store);
@@ -464,6 +532,10 @@ async function loadStoredUserCfg(str) {
   if (!str || typeof str !== "string" || !str.startsWith("cfg_")) return null;
   const id = str.slice(4);
   if (!/^[A-Za-z0-9_-]{20,80}$/.test(id)) return null;
+  if (shouldUseConfigDb()) {
+    const dbPayload = await cfgDbLoad(id);
+    if (dbPayload) return dbPayload;
+  }
   const raw = cfgStore()[id];
   if (!raw) return null;
   try {
@@ -2502,7 +2574,7 @@ async function fetchScrapStreams(manifestUrl, type, id, options = {}) {
         // Combina name + description para que os filtros de idioma/qualidade encontrem as tags
         const titleForFilters = [rawName, desc].filter(Boolean).join(" ");
         const size = s.behaviorHints?.videoSize || 0;
-        return {
+        return renameScrapStreamForNativeDebrid({
           ...s,
           _sourceType:  "debrid",
           _scrapSource: true,
@@ -2512,12 +2584,37 @@ async function fetchScrapStreams(manifestUrl, type, id, options = {}) {
           _sizeBytes:   size,
           _seeders:     0,
           _sizeGb:      size / 1e9,
-        };
+        }, options.prefs);
       });
   } catch (err) {
     if (options.label) console.log(`[${options.label}] Falha ao buscar streams externos: ${err.message}`);
     return [];
   }
+}
+
+function renameScrapStreamForNativeDebrid(stream, prefs = {}) {
+  if (!stream || !prefs?.debridConfig || prefs.stConfig) return stream;
+  const hasNativeDebrid = !!(prefs.debrid && (prefs.debridConfig.torboxKey || prefs.debridConfig.rdKey));
+  if (!hasNativeDebrid) return stream;
+
+  const addonName = prefs.addonName || "ProwJack";
+  const rawName = String(stream.name || "").trim();
+  const lines = rawName.split(/\n+/).map(s => s.trim()).filter(Boolean);
+  const detailLines = lines
+    .slice(1)
+    .map(line => line
+      .replace(/\b(P2P|Torrent|Torrentio|Comet)\b/gi, "")
+      .replace(/\[\s*\]/g, "")
+      .replace(/\s*[|/-]\s*$/g, "")
+      .replace(/^\s*[|/-]\s*/g, "")
+      .replace(/\s{2,}/g, " ")
+      .trim())
+    .filter(Boolean);
+  const fallback = stream.externalUrl && !stream.url && !stream.infoHash ? "Links externos" : "Links";
+  const label = detailLines.length ? detailLines.join("\n") : `⚡ ${fallback}`;
+
+  stream.name = `${addonName}\n${label}`;
+  return stream;
 }
 
 const BAD_RE = /\b(cam|hdcam|camrip|workprint)\b/i;
@@ -2713,7 +2810,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     // Busca scrap sempre (independente de catalog ou busca normal)
     const scrapResults = ENV.scrapManifests.length
       ? await Promise.all(ENV.scrapManifests.map(async (m, idx) => {
-          const streams = await fetchScrapStreams(m, type, id);
+          const streams = await fetchScrapStreams(m, type, id, { prefs });
           console.log(`[SCRAP ${idx}] ${m.slice(0, 60)}... → ${streams.length} streams`);
           return streams;
         }))

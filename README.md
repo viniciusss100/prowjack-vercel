@@ -63,6 +63,8 @@ O ProwJack PRO inclui um sistema de catálogo automático baseado no feed RSS do
 
 > **Importante sobre Vercel/serverless:** Redis configurado não basta para o catálogo RSS funcionar. O Redis só armazena os dados; quem popula esses dados é o poller RSS (`startRssPoller`) rodando em processo persistente. Em Vercel, a função pode ser encerrada antes do intervalo rodar ou não ficar viva para manter o catálogo atualizado. Streams sob demanda funcionam melhor em serverless; catálogo RSS exige VPS/Docker ou um job externo chamando uma rotina de polling.
 
+> **Configurações no Vercel:** URLs novas usam `cfg_...` salvo no backend. Em VPS/Docker, isso continua indo para `CONFIG_DATA_DIR/prowjack_configs.json`. Em Vercel/serverless, configure `CONFIG_DATABASE_URL` (ou `POSTGRES_URL`/`DATABASE_URL`) com um Postgres do Marketplace para as configurações sobreviverem a cold starts e redeploys.
+
 ### Configuração
 
 No `.env`:
@@ -170,6 +172,13 @@ ACCESS_TOKEN=
 
 # Redis (Recomendado)
 REDIS_URL=redis://localhost:6379
+
+# Persistência das configurações cfg_...
+# VPS/Docker sem banco: usa CONFIG_DATA_DIR/prowjack_configs.json
+# Vercel/serverless: use uma URL Postgres do Marketplace
+CONFIG_DATABASE_URL=
+CONFIG_DATABASE_TABLE=prowjack_configs
+CONFIG_DATA_DIR=/data
 
 # Real-Debrid / TorBox (Opcional - configurado via interface)
 STREMTHRU_URL=https://st.omcx.ddns.net/v0/torznab/api
