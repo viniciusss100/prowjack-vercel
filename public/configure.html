@@ -563,7 +563,7 @@ function applyPrefsToForm(prefs) {
   document.getElementById('skipBadBtn').classList.toggle('on', prefs.skipBadReleases !== false);
   document.getElementById('onlyLangBtn').classList.toggle('on', !!prefs.onlyDubbed);
   document.getElementById('dedupeBtn').classList.toggle('on', prefs.dedupe !== false);
-  document.getElementById('enableCatalogBtn').classList.toggle('off', prefs.enableCatalog !== false);
+  document.getElementById('enableCatalogBtn').classList.toggle('on', prefs.enableCatalog !== false);
   document.getElementById('keywordBoost').value = prefs.keywordBoost || '';
   document.getElementById('priorityIndexers').value = Array.isArray(prefs.priorityIndexers) ? prefs.priorityIndexers.join(', ') : (prefs.priorityIndexers || '');
   document.getElementById('rdExcludeKeywords').value = prefs.rdExcludeKeywords || '';
