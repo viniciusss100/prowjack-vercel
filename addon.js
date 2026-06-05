@@ -3034,10 +3034,10 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     const resolvedAll = await Promise.all(
       streamCandidates.map(async r => {
         try {
-          // Candidato do scrap: retorna o stream original direto (já está resolvido)
-          if (r._scrapSource && r._scrapStream) {
-            return r._scrapStream;
-          }
+          // Candidato do scrap sem infoHash (link direto, usenet, etc): retorna direto
+          if (r._scrapSource && r._scrapStream && !r._resolved?.infoHash) {
+          return r._scrapStream;
+    }
           
           const resolved     = r._resolved;
           const indexerName  = r._indexerName || r.Tracker || r.TrackerId || r.Indexer || "Unknown";
