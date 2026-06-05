@@ -151,7 +151,7 @@ const rc = {
   },
 };
 const CACHE_VERSION = "v12-native-debrid";
-const STREAM_CACHE_VERSION = "v20-scrap-debrid-names";
+const STREAM_CACHE_VERSION = "v21-cache-scope-seed-filter";
 const streamWaiters = new Map();
 
 function getPublicBase(req) {
@@ -1330,11 +1330,24 @@ function fmtBytes(bytes) {
 }
 function renameIndexer(name) {
   if (!name) return name;
-  return name
-    .replace(/\[TORRENT🧲?\]\s*/gi, '')
+  return stripSourceBadges(name)
     .replace(/🇧🇷\s*Rede/gi, 'Rede Torrent')
     .replace(/🇧🇷\s*TorrentFilmes/gi, 'TorrentFilmes')
     .trim();
+}
+
+function stripSourceBadges(value) {
+  if (value == null) return value;
+  return String(value)
+    .replace(/\[\s*TORRENT\s*🧲?\s*\]\s*/giu, "")
+    .replace(/\[\s*P2P\s*🧲?\s*\]\s*/giu, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function visibleSeedCount(result) {
+  const n = result?._displaySeeds ?? result?.Seeders ?? result?._seeders ?? 0;
+  return Number.isFinite(Number(n)) ? Number(n) : 0;
 }
 
 function matchesKeywordBoost(title, boostFilter) {
@@ -1406,7 +1419,7 @@ function formatStream(r, indexerName, isAnime = false, prefs = {}, showSeeds = t
   const size = fmtBytes(r.Size);
   const seeds = r._displaySeeds ?? r.Seeders ?? 0;
   const cleanIndexer = renameIndexer(indexerName);
-  const addonName = prefs.addonName || "ProwJack PRO";
+  const addonName = prefs.addonName || "ProwJack";
 
   const resMap = {
     "2160p": "🟣 4K",
@@ -1712,7 +1725,15 @@ async function jackettSearch(plan, indexers, prefs) {
   const jUrl      = (prefs?.jackett?.url || ENV.jackettUrl).replace(/\/+$/, "");
   const jKey      = prefs?.jackett?.key  || ENV.apiKey;
   const queryList = uniq(Array.isArray(plan?.queries) ? plan.queries : [plan?.queries].filter(Boolean));
-  const cacheKey  = `search:${CACHE_VERSION}:${Buffer.from(JSON.stringify({ queryList, search: plan?.search || null, parsed: plan?.parsed || null })).toString("base64")}:${indexers.join(",")}`;
+  const sourceHash = crypto.createHash("sha256").update(`${jUrl}\n${jKey}`).digest("hex").slice(0, 16);
+  const cacheKey  = `search:${CACHE_VERSION}:${Buffer.from(JSON.stringify({
+    queryList,
+    search: plan?.search || null,
+    parsed: plan?.parsed || null,
+    sourceHash,
+    indexers,
+    dedupe: prefs.dedupe !== false,
+  })).toString("base64url")}`;
   const cached    = await rc.get(cacheKey);
   if (cached) {
     console.log(`Cache HIT para buscas: ${JSON.stringify(queryList)}`);
@@ -2016,7 +2037,7 @@ app.delete("/api/metrics/:indexer", async (req, res) => {
 });
 app.get("/manifest.json", (_, res) => {
   res.json({
-    id: "org.prowjack.pro", version: "3.13.0", name: "ProwJack",
+    id: "org.prowjack.pro", version: "3.2.0", name: "ProwJack",
     description: "Qbittorrent+Prowlarr/Jackett+Debrid+Filtros por keywords e remendo para RD",
     resources: ["stream", "meta"], types: ["movie", "series"],
     idPrefixes: ["tt", "kitsu:", "rssmovie:", "rssmeta:", "rssitem:"],
@@ -2037,7 +2058,7 @@ app.get("/", (_, res) => res.redirect("/configure"));
 app.get("/:userConfig/manifest.json", async (req, res) => {
   const prefs  = await resolvePrefs(req.params.userConfig);
   const types  = [...new Set((prefs.categories || ["movie","series"]).map(c => c==="movies"?"movie":c==="anime"?"series":c))];
-  const name   = prefs.addonName || "ProwJack PRO";
+  const name   = prefs.addonName || "ProwJack";
   const isDebridActive = prefs.debrid && prefs.debridConfig &&
     (prefs.debridConfig.torboxKey || prefs.debridConfig.rdKey);
   const hasP2P = !!prefs.stConfig || (!isDebridActive && prefs.enableP2P !== false);
@@ -2052,7 +2073,7 @@ app.get("/:userConfig/manifest.json", async (req, res) => {
   // Catálogos dos addons de scrap: instale o addon externo separadamente no Stremio.
   // O ProwJack fornecerá streams filtrados para qualquer conteúdo que você acessar.
   res.json({
-    id: "org.prowjack.pro", version: "3.13.0", name,
+    id: "org.prowjack.pro", version: "3.2.0", name,
     description: "Qbittorrent+Prowlarr/Jackett+Debrid+Filtros por keywords e remendo para RD",
     resources: [
       "catalog",
@@ -2291,7 +2312,14 @@ app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
     return res.status(400).send("Configuração ou magnet/link ausente");
   }
 
-  const lockKey      = `addlock:${provider}:${infoHash}`;
+  const providerLower = provider.toLowerCase();
+  const providerSecret = providerLower === "realdebrid"
+    ? config.rdKey
+    : providerLower === "torbox"
+      ? config.torboxKey
+      : JSON.stringify(config || {});
+  const accountHash = crypto.createHash("sha256").update(String(providerSecret || req.params.userConfig || "")).digest("hex").slice(0, 16);
+  const lockKey      = `addlock:${providerLower}:${accountHash}:${infoHash}`;
   const alreadyAdded = await rc.get(lockKey);
 
   // Download do .torrent se disponível
@@ -2320,8 +2348,8 @@ app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
     }
   }
 
-  const isRD = provider.toLowerCase() === "realdebrid";
-  const isTB = provider.toLowerCase() === "torbox";
+  const isRD = providerLower === "realdebrid";
+  const isTB = providerLower === "torbox";
 
   if (!alreadyAdded) {
     await rc.set(lockKey, "1", 3600);
@@ -2568,19 +2596,29 @@ async function fetchScrapStreams(manifestUrl, type, id, options = {}) {
     return streams
       .filter(s => s.infoHash || s.externalUrl || (s.url && !s.url.startsWith("magnet:")))
       .map(s => {
+        const cleanStream = {
+          ...s,
+          name: stripSourceBadges(s.name || ""),
+          title: stripSourceBadges(s.title || ""),
+          description: stripSourceBadges(s.description || ""),
+          behaviorHints: {
+            ...(s.behaviorHints || {}),
+            filename: stripSourceBadges(s.behaviorHints?.filename || ""),
+          },
+        };
         // Extrai título do campo name ou title para scoring de idioma/resolução
-        const rawName = s.name || "";
-        const desc    = s.description || s.title || "";
+        const rawName = cleanStream.name || "";
+        const desc    = cleanStream.description || cleanStream.title || "";
         // Combina name + description para que os filtros de idioma/qualidade encontrem as tags
         const titleForFilters = [rawName, desc].filter(Boolean).join(" ");
-        const size = s.behaviorHints?.videoSize || 0;
+        const size = cleanStream.behaviorHints?.videoSize || 0;
         return renameScrapStreamForNativeDebrid({
-          ...s,
+          ...cleanStream,
           _sourceType:  "debrid",
           _scrapSource: true,
           _cached:      true,   // streams do scrap já estão resolvidos no debrid
           _title:       titleForFilters,
-          _filename:    s.behaviorHints?.filename || "",
+          _filename:    cleanStream.behaviorHints?.filename || "",
           _sizeBytes:   size,
           _seeders:     0,
           _sizeGb:      size / 1e9,
@@ -2602,8 +2640,8 @@ function renameScrapStreamForNativeDebrid(stream, prefs = {}) {
   const lines = rawName.split(/\n+/).map(s => s.trim()).filter(Boolean);
   const detailLines = lines
     .slice(1)
-    .map(line => line
-      .replace(/\b(P2P|Torrent|Torrentio|Comet)\b/gi, "")
+      .map(line => line
+      .replace(/\b(P2P|Torrentio|Comet)\b/gi, "")
       .replace(/\[\s*\]/g, "")
       .replace(/\s*[|/-]\s*$/g, "")
       .replace(/^\s*[|/-]\s*/g, "")
@@ -3081,9 +3119,21 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       console.log(`[STREMTHRU] Proxy ativo - cache check desabilitado`);
     }
 
+    const availabilityFiltered = (() => {
+      if (!isDebridMode && !prefs.stConfig) return withHashes;
+      const filtered = withHashes.filter(r => {
+        const cached = r._isCached === true || r._scrapStream?._cached === true;
+        return cached || visibleSeedCount(r) > 0;
+      });
+      if (filtered.length < withHashes.length) {
+        console.log(`[Seeds] ${withHashes.length - filtered.length} candidato(s) sem seeds removidos por não estarem em cache`);
+      }
+      return filtered;
+    })();
+
     const dedupedWithHashes = (bypassRssFilters || prefs.dedupe === false)
-      ? withHashes
-      : dedupeWithCachePriority(withHashes, isDebridMode && !prefs.stConfig);
+      ? availabilityFiltered
+      : dedupeWithCachePriority(availabilityFiltered, isDebridMode && !prefs.stConfig);
     if (!bypassRssFilters && prefs.dedupe !== false && dedupedWithHashes.length < withHashes.length) {
       const removed = withHashes.length - dedupedWithHashes.length;
       console.log(`[DEDUP] ${withHashes.length} → ${dedupedWithHashes.length} candidatos (-${removed} duplicatas, preferiu público cacheado)`);
@@ -3190,8 +3240,8 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
               torrentB64,
             });
             const qbitName = localPlayable
-              ? `${prefs.addonName || "ProwJack PRO"}\n⚡️ ${resLabel || "Links"} [QB]`
-              : `${prefs.addonName || "ProwJack PRO"}\n⬇️ ${resLabel || "Links"} [QB]`;
+              ? `${prefs.addonName || "ProwJack"}\n⚡️ ${resLabel || "Links"} [QB]`
+              : `${prefs.addonName || "ProwJack"}\n⬇️ ${resLabel || "Links"} [QB]`;
             return {
               name: qbitName,
               description: [description, filenameLine, isPrivateTracker ? "🔒 Tracker Privado" : ""].filter(Boolean).join("\n"),
@@ -3251,7 +3301,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
               }
               return true;
             }).map(async resObj => {
-              const addonName    = prefs.addonName || "ProwJack PRO";
+              const addonName    = prefs.addonName || "ProwJack";
               const resLabelStr  = resLabel || "Links";
               const isDual       = prefs.debridConfig?.mode === "dual";
               const providerTag  = resObj.provider === "TorBox" ? "[TB]" : "[RD]";
@@ -3591,7 +3641,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 });
 
 app.listen(ENV.port, () => {
-  console.log(`ProwJack v3.13.0 -> http://localhost:${ENV.port}/configure`);
+  console.log(`ProwJack v3.2.0 -> http://localhost:${ENV.port}/configure`);
   console.log(`   Jackett : ${ENV.jackettUrl}`);
   console.log(`   Redis   : ${ENV.redisUrl}`);
   console.log(`   qBittorrent: ${isQbitConfigured() ? "ativo" : "desativado"}`);

@@ -1,6 +1,6 @@
 {
   "name": "prowjack",
-  "version": "3.13.0",
+  "version": "3.2.0",
   "description": "Qbittorrent+Prowlarr/Jackett+Debrid+Filtros por keywords e remendo para RD",
   "main": "addon.js",
   "scripts": {
