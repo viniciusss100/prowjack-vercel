@@ -1,8 +1,8 @@
-# 🎬 ProwJack
+# 🎬 ProwJack PRO
 
-**Addon Stremio v3.13 otimizado para Jackett/Prowlarr com suporte a Debrid, StremThru, P2P e qBittorrent HTTP**
+**Addon Stremio v3.12 otimizado para Jackett/Prowlarr com suporte a Debrid, StremThru, P2P e qBittorrent HTTP**
 
-ProwJack é um addon avançado para Stremio que integra indexadores Jackett/Prowlarr com serviços Debrid (Real-Debrid, TorBox), StremThru, P2P nativo e qBittorrent HTTP opcional, oferecendo streaming de alta qualidade com priorização inteligente de idioma PT-BR e bypass de filtros para indexadores privados.
+ProwJack PRO é um addon avançado para Stremio que integra indexadores Jackett/Prowlarr com serviços Debrid (Real-Debrid, TorBox), StremThru, P2P nativo e qBittorrent HTTP opcional, oferecendo streaming de alta qualidade com priorização inteligente de idioma PT-BR.
 
 ---
 
@@ -10,7 +10,6 @@ ProwJack é um addon avançado para Stremio que integra indexadores Jackett/Prow
 
 ### 🎯 Core
 - **Integração Prowlarr**: Busca em múltiplos indexadores públicos e privados
-- **Filtro de Indexadores Prioritários**: IDs numéricos (Prowlarr) configurados na UI ignoram filtros de idioma/dublado e aparecem no topo dos resultados.
 - **Catálogo RSS**: Polling automático de indexers do Prowlarr/Jackett com catálogo de lançamentos recentes no Stremio
 - **Suporte Debrid**: Real-Debrid, TorBox e StremThru
 - **P2P nativo**: Magnet/infoHash direto no Stremio quando Debrid não está ativo
@@ -21,8 +20,6 @@ ProwJack é um addon avançado para Stremio que integra indexadores Jackett/Prow
 
 ### 🔍 Busca Inteligente
 - **Busca Estruturada**: Torznab com IMDb ID para precisão máxima
-- **Fase Rápida Otimizada**: Retorna resultados instantâneos enquanto buscas lentas continuam em background para atualizar o cache.
-- **RD Keywords**: Filtro de keywords para bloquear releases problemáticos no Real-Debrid (Ex: releases sem som, fakes, ou que dão erro no serviço).
 - **Fallback Texto**: Busca por título quando estruturada falha
 - **Deduplicação**: Remove releases duplicados por hash e título
 - **Filtros Avançados**: Qualidade, resolução, idioma, keywords
@@ -47,7 +44,7 @@ ProwJack é um addon avançado para Stremio que integra indexadores Jackett/Prow
 
 ## 📡 Catálogo RSS
 
-O ProwJack inclui um sistema de catálogo automático baseado no feed RSS dos indexers configurados no **Prowlarr/Jackett**. Isso permite visualizar lançamentos recentes diretamente no Stremio, sem precisar buscar manualmente.
+O ProwJack PRO inclui um sistema de catálogo automático baseado no feed RSS dos indexers configurados no **Prowlarr/Jackett**. Isso permite visualizar lançamentos recentes diretamente no Stremio, sem precisar buscar manualmente.
 
 ### Como funciona
 
@@ -174,22 +171,20 @@ ACCESS_TOKEN=
 # Redis (Recomendado)
 REDIS_URL=redis://localhost:6379
 
-# RSS Catalog — Indexers que terão catálogo gerado (IDs ou nomes separados por vírgula)
-# Deixe vazio para incluir todos os indexers privados no catálogo
-# Exemplo: RSS_CATALOG_INDEXERS=5,11,CapybaraBR
-RSS_CATALOG_INDEXERS=
-# Scrap — Manifests de addons externos para busca adicional (separados por vírgula)
-# Streams desses addons têm prioridade sobre trackers privados, mas não sobre debrid
-# Exemplo: SCRAP_MANIFEST_URLS=https://torrentio.strem.fun/manifest.json,https://outro.addon/manifest.json
-SCRAP_MANIFEST_URLS=
+# Real-Debrid / TorBox (Opcional - configurado via interface)
+STREMTHRU_URL=https://st.omcx.ddns.net/v0/torznab/api
+STREMTHRU_API_KEY=sua_key_aqui
 
 # qBittorrent (Opcional - para torrents privados)
 QBIT_URL=http://localhost:8080
 QBIT_USER=admin
 QBIT_PASS=sua_senha_aqui
 QBIT_SAVE_DIR=/data/prowjack
-QBIT_MIN_PROGRESS=0.02
-QBIT_BUFFER_TIMEOUT=120
+QBIT_MIN_PROGRESS=0.01
+QBIT_BUFFER_TIMEOUT=180
+
+# Segurança (Opcional)
+ALLOWED_ORIGINS=https://app.strem.io,https://web.stremio.com
 
 # Porta do servidor
 PORT=7014
@@ -465,13 +460,6 @@ Contribuições são bem-vindas! Por favor:
 
 ## 📝 Changelog
 
-### v3.13.0 (2026-05-12)
-- 🚀 **Busca Assíncrona Otimizada**: A fase rápida da busca agora retorna resultados instantâneos, permitindo que indexadores lentos completem em background sem travar a interface do Stremio.
-- 🎯 **Indexadores Prioritários**: IDs numéricos (Prowlarr) configurados na UI agora ignoram filtros de idioma e ano, aparecendo sempre no topo (Bypass de filtros PT-BR/Dublado para indexadores privados).
-- 🔍 **RD Keywords**: Adicionado suporte a `rdKeywords` para filtrar releases bloqueados ou problemáticos especificamente no Real-Debrid.
-- ⚡ **Performance de InfoHash**: Concorrência aumentada e timeouts reduzidos para extração de hashes de arquivos `.torrent`.
-- 🐛 **Correção de Seleção**: Melhoria na lógica de seleção de indexadores quando IDs específicos são fornecidos junto com a opção "Todos".
-
 ### v3.12.0 (2026-05-01)
 - ✨ **Configuração segura**: URLs de instalação novas usam `cfg_...` salvo no backend; chaves Debrid/qBit deixam de ir diretamente na URL
 - 🔒 **Validação server-side**: `/api/config` sanitiza campos, limita números, valida serviços Debrid/StremThru e aceita apenas opções conhecidas
@@ -482,6 +470,7 @@ Contribuições são bem-vindas! Por favor:
 - 🐛 **Real-Debrid**: cache check ficou read-only e não usa `addMagnet`; torrents existentes passam por `selectFiles` antes de unrestrict
 - 🐛 **Catálogo RSS**: catálogo retornado é filtrado pelos indexers da configuração atual, evitando dados de indexers anteriores
 - 🧹 **Formatação**: removida a tag visual `P2P` dos streams para evitar confusão quando Debrid/StremThru está ativo
+- 📚 **Hospedagem**: documentação e UI agora alertam sobre limitações de Vercel/serverless para catálogo RSS e qBittorrent
 
 ### v3.11.0 (2026-04-24)
 - ✨ **Catálogo RSS**: Polling automático de indexers privados do Prowlarr com catálogo de lançamentos no Stremio
@@ -525,6 +514,14 @@ Este projeto é distribuído sob a licença MIT. Veja o arquivo `LICENSE` para m
 - **Real-Debrid/TorBox**: Serviços de debrid
 - **qBittorrent**: Cliente torrent
 - **Comunidade**: Todos os contribuidores e usuários
+
+---
+
+## 📞 Suporte
+
+- **Issues**: [GitHub Issues](https://github.com/seu-usuario/prowjack-pro/issues)
+- **Discussões**: [GitHub Discussions](https://github.com/seu-usuario/prowjack-pro/discussions)
+- **Discord**: [Link do servidor](https://discord.gg/seu-servidor)
 
 ---
 

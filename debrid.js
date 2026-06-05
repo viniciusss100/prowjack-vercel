@@ -296,7 +296,7 @@ async function rdGetDirectLink(hash, magnet, fileIds, key, torrentBuffer = null)
 // TORBOX FUNCTIONS
 // =========================
 
-async function torboxAddTorrent(magnet, key, waitForReady = false, buffer = null) {
+async function torboxAddTorrent(magnet, key, waitForReady = false, buffer = null, options = {}) {
   try {
     const FormData = require('form-data');
     const form = new FormData();
@@ -312,6 +312,7 @@ async function torboxAddTorrent(magnet, key, waitForReady = false, buffer = null
     // Configurações padrão
     form.append('seed', '1');
     form.append('allow_zip', 'false');
+    if (options.addOnlyIfCached) form.append('add_only_if_cached', 'true');
 
     const res = await axios.post(
       "https://api.torbox.app/v1/api/torrents/createtorrent",
@@ -369,16 +370,20 @@ async function torboxBatchCheckCache(hashes, key, privateHashes = new Set()) {
   if (!hashes || !hashes.length) return {};
 
   try {
-    const res = await axios.get("https://api.torbox.app/v1/api/torrents/checkcached", {
-      params: { hash: hashes.join(","), format: "object", list_files: "true" },
-      headers: { Authorization: `Bearer ${key}` },
-      timeout: 10000
-    });
+    const uniqueHashes = [...new Set(hashes.map(h => String(h || "").toLowerCase()).filter(Boolean))];
+    const res = await axios.post("https://api.torbox.app/v1/api/torrents/checkcached",
+      { hashes: uniqueHashes },
+      {
+        params: { format: "object", list_files: "true" },
+        headers: { Authorization: `Bearer ${key}` },
+        timeout: 10000
+      }
+    );
 
     const resultMap = {};
     const data = res.data?.data || {};
 
-    for (const hash of hashes) {
+    for (const hash of uniqueHashes) {
       const keyLower = String(hash || "").toLowerCase();
       const cached = data[hash] ?? data[keyLower] ?? data[String(hash || "").toUpperCase()];
       if (cached && cached !== false) {
@@ -507,7 +512,8 @@ async function resolveTBStream(infoHash, magnet, season, episode, isAnime, key, 
     }
   }
 
-  // Caso 2: checkcached confirmou cache global — adiciona para obter torrent_id e gera link
+  // Caso 2: checkcached confirmou cache global. Nao cria torrent na conta aqui;
+  // apenas preserva o file_id para o clique on-demand criar/baixar explicitamente.
   if (filesList) {
     const variant = {};
     filesList.forEach((f, idx) => {
@@ -517,14 +523,7 @@ async function resolveTBStream(infoHash, magnet, season, episode, isAnime, key, 
 
     const matchedFile = pickTBFile(variant, season, episode, isAnime);
     if (!matchedFile) return { queued: true, cached: true };
-
-    // Adiciona o torrent (instantâneo pois está em cache global no TorBox)
-    const added = await torboxAddTorrent(magnet || buildMagnet(infoHash, null, infoHash), key, false, buffer);
-    if (added && (added.id || added.torrent_id)) {
-      const tid = added.id || added.torrent_id;
-      const url = `https://api.torbox.app/v1/api/torrents/requestdl?token=${key}&torrent_id=${tid}&file_id=${matchedFile.id}&redirect=true`;
-      return { url, filename: matchedFile.filename };
-    }
+    return { queued: true, cached: true, fileId: matchedFile.id, filename: matchedFile.filename };
   }
 
   return { queued: true, cached: true };
