@@ -180,6 +180,26 @@ function shouldUseConfigDb() {
   return !!ENV.configDbUrl;
 }
 
+function buildConfigPgOptions(rawUrl) {
+  let connectionString = rawUrl;
+  let sslMode = "";
+  let hostname = "";
+  try {
+    const parsed = new URL(rawUrl);
+    hostname = parsed.hostname;
+    sslMode = String(parsed.searchParams.get("sslmode") || "").toLowerCase();
+    parsed.searchParams.delete("sslmode");
+    parsed.searchParams.delete("uselibpqcompat");
+    connectionString = parsed.toString();
+  } catch {}
+
+  const isRemote = /^postgres/i.test(rawUrl) && !/^(localhost|127\.0\.0\.1|::1)$/i.test(hostname);
+  const ssl = isRemote && sslMode !== "disable"
+    ? { rejectUnauthorized: false }
+    : undefined;
+  return { connectionString, ssl };
+}
+
 function getConfigPgPool() {
   if (!shouldUseConfigDb()) return null;
   if (configPgPool) return configPgPool;
@@ -189,10 +209,7 @@ function getConfigPgPool() {
   } catch (err) {
     throw new Error("CONFIG_DATABASE_URL/POSTGRES_URL configurado, mas a dependência 'pg' não está instalada. Rode npm install.");
   }
-  const ssl = /^postgres/i.test(ENV.configDbUrl) && !/localhost|127\.0\.0\.1/i.test(ENV.configDbUrl)
-    ? { rejectUnauthorized: false }
-    : undefined;
-  configPgPool = new Pool({ connectionString: ENV.configDbUrl, ssl });
+  configPgPool = new Pool(buildConfigPgOptions(ENV.configDbUrl));
   return configPgPool;
 }
 
