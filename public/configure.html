@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>ProwJack PRO — Configurar</title>
+<title>ProwJack — Configurar</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet"/>
 <style>
@@ -288,7 +288,7 @@ hr{border:none;border-top:1px solid var(--bord);margin:14px 0}
         <div class="info" style="margin-top:-4px;margin-bottom:12px">Catálogo RSS requer uma instância persistente (VPS/Docker) ou worker/cron externo alimentando o Redis. Em Vercel/serverless, o poller interno não roda de forma confiável.</div>
 
         <label class="lbl">⭐ Boost por Keywords</label>
-        <input type="text" id="keywordBoost" placeholder="ex: dual-bioma  ou  brremux  (palavras inteiras)" value="DUBLADO|PORTUGUES|POR-BR|BRAZILIAN|BRREMUX|CYPHER|FREDDIEGELLAR|DUAL-BiOMA|DUAL-C76|TOSSATO|C0RAL|DUAL-NOGROUP|DUAL-PIA|DUAL-XOR|DUAL-XAR|G4RIS|DUAL-SIGMA|ANDREHSA|RIPER|SiGLA|TONTOM|DUAL-ECK|1-SF|0-SF|RARBR|TUPAC|ALFAHD|DUAL-CZA|DUAL-7SPRITE7|POTATIN|DUAL-FLY|FRANCEIRA"/>
+        <input type="text" id="keywordBoost" placeholder="ex: dual-bioma  ou  brremux  (palavras inteiras)" value="DUBLADO|PORTUGUES|POR-BR|BRAZILIAN|BREMUX|CYPHER|FREDDIEGELLAR|DUAL-BiOMA|DUAL-C76|TOSSATO|C0RAL|DUAL-NOGROUP|DUAL-PIA|DUAL-XOR|DUAL-XAR|G4RIS|DUAL-SIGMA|ANDREHSA|RIPER|SiGLA|TONTOM|DUAL-ECK|1-SF|0-SF|RARBR|TUPAC|ALFAHD|DUAL-CZA|DUAL-7SPRITE7|POTATIN|DUAL-FLY|FRANCEIRA"/>
         <div class="info" style="margin-top:-8px;margin-bottom:12px">Cada palavra é verificada como termo completo. Separe por espaço para exigir múltiplas palavras.</div>
 
         <div class="g3">
@@ -810,12 +810,12 @@ function buildPrefs() {
 
   // Nome do addon
   if (isNative && prefs.debridConfig) {
-    const nameMap = { torbox: 'ProwJack [TB]', realdebrid: 'ProwJack [RD]', dual: 'ProwJack PRO' };
-    prefs.addonName = nameMap[prefs.debridConfig.mode] || 'ProwJack PRO';
+    const nameMap = { torbox: 'ProwJack [TB]', realdebrid: 'ProwJack [RD]', dual: 'ProwJack' };
+    prefs.addonName = nameMap[prefs.debridConfig.mode] || 'ProwJack';
   } else if (isStremThru) {
     prefs.addonName = 'ProwJack [ST]';
   } else {
-    prefs.addonName = 'ProwJack PRO';
+    prefs.addonName = 'ProwJack';
   }
 
   return prefs;
