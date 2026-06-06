@@ -152,6 +152,8 @@ const rc = {
 };
 const CACHE_VERSION = "v12-native-debrid";
 const STREAM_CACHE_VERSION = "v21-cache-scope-seed-filter";
+const TORRENT_DOWNLOAD_TIMEOUT_MS = 8000;
+const TORRENT_FAILURE_TTL = 10 * 60;
 const streamWaiters = new Map();
 
 function getPublicBase(req) {
@@ -1265,6 +1267,42 @@ function relaxedTitleMatchScore(title, aliases = []) {
   return best;
 }
 
+function normalizeTorrentLink(link) {
+  if (!link) return "";
+  try {
+    const url = new URL(String(link));
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return String(link).trim().split("#")[0];
+  }
+}
+
+function torrentFailureKeys(link) {
+  const normalized = normalizeTorrentLink(link);
+  if (!normalized) return [];
+  return [
+    "torrent:fail:" + crypto.createHash("sha1").update(normalized).digest("hex"),
+  ];
+}
+
+async function torrentDownloadRecentlyFailed(link) {
+  const keys = torrentFailureKeys(link);
+  if (!keys.length) return false;
+  for (const key of keys) {
+    try {
+      if (await rc.get(key)) return true;
+    } catch {}
+  }
+  return false;
+}
+
+async function markTorrentDownloadFailed(link) {
+  const keys = torrentFailureKeys(link);
+  if (!keys.length) return;
+  await Promise.allSettled(keys.map(key => rc.set(key, "1", TORRENT_FAILURE_TTL)));
+}
+
 async function resolveInfoHash(r) {
   let fallbackHash = r.InfoHash ? r.InfoHash.toLowerCase() : null;
   let magnetHash   = r.MagnetUri ? extractInfoHash(r.MagnetUri) : null;
@@ -1284,10 +1322,14 @@ async function resolveInfoHash(r) {
   }
 
   if (httpLink) {
+    if (await torrentDownloadRecentlyFailed(httpLink)) {
+      return null;
+    }
+
     let _magnetRedirect = null;
     try {
       const res = await axios.get(httpLink, {
-        timeout: 15000, maxRedirects: 10, responseType: "arraybuffer",
+        timeout: TORRENT_DOWNLOAD_TIMEOUT_MS, maxRedirects: 10, responseType: "arraybuffer",
         maxContentLength: 8 * 1024 * 1024, validateStatus: s => s < 400,
         headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
         beforeRedirect: (options) => {
@@ -1327,6 +1369,7 @@ async function resolveInfoHash(r) {
         const h   = src ? extractInfoHash(src) : null;
         if (h) return { infoHash: h, files: null, buffer: null };
       } else {
+        await markTorrentDownloadFailed(httpLink);
         console.warn(`[WARN] Falha ao baixar torrent: ${err.message}`);
       }
     }
@@ -2343,23 +2386,26 @@ app.get("/:userConfig/debrid-add/:provider/:infoHash", async (req, res) => {
   let torrentBuffer = null;
   if (typeof linkUrl === "string" && linkUrl.startsWith("http")) {
     try {
-      const dl = await axios.get(linkUrl, {
-        responseType: "arraybuffer",
-        timeout: 10000,
-        maxRedirects: 5,
-        validateStatus: s => s < 400,
-        headers: { "User-Agent": "Mozilla/5.0" },
-        beforeRedirect: (options) => {
-          if (options.href?.startsWith("magnet:")) {
-            throw new Error("Redirect para magnet detectado");
-          }
-        },
-      });
-      if (dl.data && Buffer.from(dl.data)[0] === 0x64) {
-        torrentBuffer = Buffer.from(dl.data);
+      if (!(await torrentDownloadRecentlyFailed(linkUrl))) {
+        const dl = await axios.get(linkUrl, {
+          responseType: "arraybuffer",
+          timeout: TORRENT_DOWNLOAD_TIMEOUT_MS,
+          maxRedirects: 5,
+          validateStatus: s => s < 400,
+          headers: { "User-Agent": "Mozilla/5.0" },
+          beforeRedirect: (options) => {
+            if (options.href?.startsWith("magnet:")) {
+              throw new Error("Redirect para magnet detectado");
+            }
+          },
+        });
+        if (dl.data && Buffer.from(dl.data)[0] === 0x64) {
+          torrentBuffer = Buffer.from(dl.data);
+        }
       }
     } catch(e) {
       if (!e.message.includes("magnet")) {
+        await markTorrentDownloadFailed(linkUrl);
         console.log(`[ON-DEMAND] Falha ao baixar .torrent: ${e.message}`);
       }
     }
@@ -2546,21 +2592,26 @@ app.get("/:userConfig/qbit/:jobToken", async (req, res) => {
       if (!torrentBuffer && job.link && !job.link.startsWith("magnet:")) {
         // Fallback: tenta re-download do link do Jackett
         try {
-          const dl = await axios.get(job.link, {
-            responseType: "arraybuffer", timeout: 15000, maxRedirects: 5,
-            maxContentLength: 8 * 1024 * 1024, headers: { "User-Agent": "Mozilla/5.0" },
-            validateStatus: s => s < 400,
-            beforeRedirect: (options) => {
-              if (options.href?.startsWith("magnet:")) throw new Error("Redirect para magnet");
-            },
-          });
-          if (dl.data && Buffer.from(dl.data)[0] === 0x64) {
-            const raw = Buffer.from(dl.data);
-            try { torrentBuffer = injectTrackers(raw); } catch { torrentBuffer = raw; }
-            console.log(`[qBit] .torrent re-baixado do link: ${torrentBuffer.length} bytes`);
+          if (!(await torrentDownloadRecentlyFailed(job.link))) {
+            const dl = await axios.get(job.link, {
+              responseType: "arraybuffer", timeout: TORRENT_DOWNLOAD_TIMEOUT_MS, maxRedirects: 5,
+              maxContentLength: 8 * 1024 * 1024, headers: { "User-Agent": "Mozilla/5.0" },
+              validateStatus: s => s < 400,
+              beforeRedirect: (options) => {
+                if (options.href?.startsWith("magnet:")) throw new Error("Redirect para magnet");
+              },
+            });
+            if (dl.data && Buffer.from(dl.data)[0] === 0x64) {
+              const raw = Buffer.from(dl.data);
+              try { torrentBuffer = injectTrackers(raw); } catch { torrentBuffer = raw; }
+              console.log(`[qBit] .torrent re-baixado do link: ${torrentBuffer.length} bytes`);
+            }
           }
         } catch (e) {
-          if (!e.message.includes("magnet")) console.log(`[qBit] Falha ao re-baixar .torrent: ${e.message}`);
+          if (!e.message.includes("magnet")) {
+            await markTorrentDownloadFailed(job.link);
+            console.log(`[qBit] Falha ao re-baixar .torrent: ${e.message}`);
+          }
         }
       }
 
