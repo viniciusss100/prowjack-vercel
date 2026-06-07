@@ -3030,8 +3030,8 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       }
     }
 
-    // Busca scrap sempre (independente de catalog ou busca normal)
-    const scrapResults = ENV.scrapManifests.length
+    // Busca scrap sempre, exceto no modo ST (que já busca via proxyManifest)
+    const scrapResults = !prefs.stConfig && ENV.scrapManifests.length
       ? await Promise.all(ENV.scrapManifests.map(async (m, idx) => {
           const streams = await fetchScrapStreams(m, type, id, { prefs });
           console.log(`[SCRAP ${idx}] ${m.slice(0, 60)}... → ${streams.length} streams`);
