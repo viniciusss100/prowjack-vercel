@@ -3035,7 +3035,14 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       ? await Promise.all(ENV.scrapManifests.map(async (m, idx) => {
           const streams = await fetchScrapStreams(m, type, id, { prefs });
           console.log(`[SCRAP ${idx}] ${m.slice(0, 60)}... → ${streams.length} streams`);
-          return streams;
+          let scrapName = "Scrap Externo";
+          try {
+            const host = new URL(m).hostname;
+            const parts = host.split('.');
+            let rawName = parts.length >= 2 ? (parts[0] === 'www' || parts[0] === 'api' ? parts[1] : parts[0]) : host;
+            scrapName = rawName.charAt(0).toUpperCase() + rawName.slice(1);
+          } catch {}
+          return streams.map(s => ({ ...s, _scrapName: scrapName }));
         }))
       : [];
 
@@ -3071,10 +3078,10 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         Seeders: s._seeders || 0,
         _scrapStream: s,
         _scrapSource: true,
-        _indexerName: 'Scrap Externo',
-        Tracker: 'Scrap Externo',
+        _indexerName: s._scrapName || 'Scrap Externo',
+        Tracker: s._scrapName || 'Scrap Externo',
         TrackerId: 'scrap',
-        Indexer: 'Scrap Externo'
+        Indexer: s._scrapName || 'Scrap Externo'
       };
     });
     
