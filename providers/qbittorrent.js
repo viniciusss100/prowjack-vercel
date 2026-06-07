@@ -79,7 +79,8 @@ async function login(force = false, creds = null) {
     body: body.toString(),
   }, creds);
   const text = await res.text();
-  if (text !== "Ok.") throw new Error(`qBittorrent login falhou: ${text}`);
+  // qBit >= 5.x retorna 204 com body vazio; versões anteriores retornam "Ok."
+  if (text !== "Ok." && text.trim() !== "" && res.status !== 204) throw new Error(`qBittorrent login falhou: ${text}`);
 }
 
 async function qbitApi(endpoint, options = {}, creds = null) {
