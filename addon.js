@@ -6,7 +6,7 @@ const Redis   = require("ioredis");
 const path    = require("path");
 const fs      = require("fs");
 const { resolveDebridStream, buildMagnet } = require("./debrid");
-const { startRssPoller, buildRssCacheKey, CATALOG_KEY } = require("./rssPoller");
+const { startRssPoller, pollOnce, buildRssCacheKey, CATALOG_KEY } = require("./rssPoller");
 const { enrichMetaPtBr } = require("./metadata");
 const { injectTrackers, extractTrackers, EXTRA_TRACKERS } = require("./torrentEnrich");
 const {
@@ -2113,6 +2113,15 @@ app.get("/api/metrics", async (_, res) => {
 });
 app.delete("/api/metrics/:indexer", async (req, res) => {
   await rc.del(`metrics:${req.params.indexer}`); res.json({ ok: true });
+});
+app.get("/api/cron/rss", async (req, res) => {
+  console.log("[CRON] Iniciando polling via cron (Vercel ou manual)...");
+  try {
+    await pollOnce(ENV.jackettUrl, ENV.apiKey, rc);
+    res.json({ ok: true, message: "RSS polling concluído." });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 app.get("/manifest.json", (_, res) => {
   res.json({

@@ -472,4 +472,4 @@ function startRssPoller(jUrl, jKey, rc, redisClient) {
   console.log(`[RSS] Poller agendado (intervalo: ${POLL_INTERVAL_MS / 60000} min)`);
 }
 
-module.exports = { startRssPoller, buildRssCacheKey, CATALOG_KEY, updateCatalog };
+module.exports = { startRssPoller, pollOnce, buildRssCacheKey, CATALOG_KEY, updateCatalog };
