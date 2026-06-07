@@ -3071,10 +3071,10 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         Seeders: s._seeders || 0,
         _scrapStream: s,
         _scrapSource: true,
-        _indexerName: 'Scrap',
-        Tracker: 'Scrap',
+        _indexerName: 'Scrap Externo',
+        Tracker: 'Scrap Externo',
         TrackerId: 'scrap',
-        Indexer: 'Scrap'
+        Indexer: 'Scrap Externo'
       };
     });
     
@@ -3374,14 +3374,9 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           const resolved     = r._resolved;
           const indexerName  = r._indexerName || r.Tracker || r.TrackerId || r.Indexer || "Unknown";
           const rdExcluded   = isRdExcludedResult(r, prefs, indexerName);
-          // Scrap com infoHash: usa name/description originais do stream (já formatados pelo addon externo)
-          const isScrap = !!(r._scrapSource && r._scrapStream);
-          const { name, description: descNoSeeds, resLabel } = isScrap
-            ? { name: r._scrapStream.name || "", description: r._scrapStream.description || "", resLabel: "" }
-            : formatStream(r, indexerName, parsed.isAnime, prefs, false, streamMeta);
-          const { description } = isScrap
-            ? { description: r._scrapStream.description || "" }
-            : formatStream(r, indexerName, parsed.isAnime, prefs, true, streamMeta);
+          // Scrap com infoHash: formata usando a formatação nativa do addon (Scrap Externo)
+          const { name, description: descNoSeeds, resLabel } = formatStream(r, indexerName, parsed.isAnime, prefs, false, streamMeta);
+          const { description } = formatStream(r, indexerName, parsed.isAnime, prefs, true, streamMeta);
           const matchedFile  = (type === "series" || parsed.isAnime)
             ? pickEpisodeFile(resolved.files, parsed.season, parsed.episode ?? episode, parsed.isAnime)
             : null;
