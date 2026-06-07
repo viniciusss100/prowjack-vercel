@@ -3391,7 +3391,8 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
                 .sort((a, b) => (b.size || 0) - (a.size || 0))[0]
               || resolved.files.slice().sort((a, b) => (b.size || 0) - (a.size || 0))[0]
             : null);
-          const displayFileName = displayFile?.name || r.Title || "";
+          const fallbackTitle = (r.Title && !r.Title.includes('\n')) ? r.Title : "";
+          const displayFileName = displayFile?.name || r._scrapStream?._filename || fallbackTitle;
           const filenameLine = displayFileName ? `📂 ${displayFileName}` : "";
           // Descarta streams cujo arquivo selecionado não é reproduzível (iso, rar, zip, etc.)
           if (displayFile?.name && BAD_EXT_RE.test(displayFile.name)) return null;
