@@ -342,9 +342,21 @@ async function updateCatalog(rc, newItems) {
     }
 
     // Carrega catálogo existente, filtrando apenas itens ainda presentes no cache RSS
+    // ATENÇÃO: m.id tem formato "rssmovie:tt1234" ou "rssmeta:series:1234",
+    // mas activeIds contém "tt1234". Precisamos extrair o imdbId do m.id para comparar.
+    const extractImdbFromCatalogId = (id) => {
+      if (!id) return null;
+      if (id.startsWith("rssmovie:")) return id.slice("rssmovie:".length);
+      if (id.startsWith("rssmeta:")) {
+        const parts = id.split(":");
+        const rawId = parts.slice(2).join(":");
+        return /^\d+$/.test(rawId) ? `tt${rawId}` : rawId;
+      }
+      return id;
+    };
     const rawCatalog = await rc.get(`${CATALOG_KEY}:${type}`);
     const existing   = rawCatalog
-      ? JSON.parse(rawCatalog).filter(m => !activeIds.size || activeIds.has(m.id))
+      ? JSON.parse(rawCatalog).filter(m => !activeIds.size || activeIds.has(extractImdbFromCatalogId(m.id)))
       : [];
 
     const resolved = [];
@@ -395,10 +407,32 @@ async function updateCatalog(rc, newItems) {
     }
     await Promise.all(Array.from({ length: 5 }, resolveWorker));
 
-    if (!resolved.length) continue;
+    console.log(`[RSS Catalog] ${type}: ${items.length} itens RSS processados, ${resolved.length} resolvidos com meta`);
+
+    if (!resolved.length) {
+      // Mesmo sem novos itens resolvidos, mantém o catálogo existente se houver
+      if (existing.length) {
+        console.log(`[RSS Catalog] ${type}: mantendo ${existing.length} itens existentes no catálogo`);
+      } else {
+        console.log(`[RSS Catalog] ${type}: sem meta resolvida e sem catálogo existente — catálogo vazio`);
+      }
+      continue;
+    }
 
     // Merge: novos na frente + existentes ainda no cache RSS, limita 200
-    const existingFiltered = existing.filter(m => !seenIds.has(m.id));
+    // FIX: seenIds contém imdbId (tt1234) mas m.id tem prefixo (rssmovie:tt1234)
+    // Extrai o imdbId do m.id antes de comparar com seenIds
+    const extractImdbFromId = (id) => {
+      if (!id) return id;
+      if (id.startsWith("rssmovie:")) return id.slice("rssmovie:".length);
+      if (id.startsWith("rssmeta:")) {
+        const parts = id.split(":");
+        const rawId = parts.slice(2).join(":");
+        return /^\d+$/.test(rawId) ? `tt${rawId}` : rawId;
+      }
+      return id;
+    };
+    const existingFiltered = existing.filter(m => !seenIds.has(extractImdbFromId(m.id)));
     const merged = [...resolved, ...existingFiltered].slice(0, 200);
     await rc.set(`${CATALOG_KEY}:${type}`, JSON.stringify(merged), CATALOG_TTL);
     console.log(`[RSS Catalog] ${type}: +${resolved.length} novos (total ${merged.length})`);
