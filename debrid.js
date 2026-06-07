@@ -334,7 +334,9 @@ async function torboxAddTorrent(magnet, key, waitForReady = false, buffer = null
     // Detecção de duplicata conforme Jackio
     const detail = res.data?.detail || "";
     if (detail.includes("exists") || detail.includes("already") || detail.includes("duplicate")) {
-       const infoHash = magnet?.match(/btih:([a-f0-9]+)/i)?.[1];
+       // Valida formato do infoHash antes de usar
+       const rawHash = magnet?.match(/btih:([a-f0-9]{40})/i)?.[1];
+       const infoHash = rawHash && /^[a-f0-9]{40}$/i.test(rawHash) ? rawHash : null;
        if (infoHash) {
          const myTorrents = await axios.get("https://api.torbox.app/v1/api/torrents/mylist", {
            headers: { Authorization: `Bearer ${key}` },
@@ -453,6 +455,7 @@ async function resolveDebridStream(
 }
 
 async function resolveRDStream(infoHash, magnet, season, episode, isAnime, key, files, cache, buffer) {
+  if (!infoHash) return null; // guard: infoHash null não pode ser resolvido
   const headersAuth = { Authorization: `Bearer ${key}` };
 
   // Sem cache na conta — tracker privado (buffer sem magnet): não gera stream on-demand.
@@ -484,6 +487,7 @@ async function resolveRDStream(infoHash, magnet, season, episode, isAnime, key, 
 }
 
 async function resolveTBStream(infoHash, magnet, season, episode, isAnime, key, files, cache, buffer) {
+  if (!infoHash && !cache?.id) return null; // guard: sem hash e sem torrent na conta
   // Tracker privado (buffer sem magnet) sem cache confirmado: não gera stream on-demand.
   // Adicionar em massa para checar cache causa rate limit no TorBox.
   if (!cache || typeof cache !== "object" || cache === false) {
@@ -507,6 +511,7 @@ async function resolveTBStream(infoHash, magnet, season, episode, isAnime, key, 
 
     const matchedFile = pickTBFile(variant, season, episode, isAnime);
     if (matchedFile) {
+      // Não loga a URL completa pois contém a API key no query param 'token'
       const url = `https://api.torbox.app/v1/api/torrents/requestdl?token=${key}&torrent_id=${torrentId}&file_id=${matchedFile.id}&redirect=true`;
       return { url, filename: matchedFile.filename };
     }

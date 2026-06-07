@@ -4,9 +4,10 @@ const https  = require("https");
 const crypto = require("crypto");
 const { enrichMetaPtBr } = require("./metadata");
 
-// Aumenta limite de listeners para evitar warnings com múltiplas conexões TLS simultâneas
-https.globalAgent.setMaxListeners(0);
-require("events").EventEmitter.defaultMaxListeners = 0;
+// Define limite alto (não infinito) para suportar múltiplas conexões TLS simultâneas
+// sem silenciar completamente os avisos reais de memory leak
+https.globalAgent.setMaxListeners(50);
+require("events").EventEmitter.defaultMaxListeners = 50;
 
 const POLL_INTERVAL_MS = 45 * 60 * 1000;
 const RSS_CACHE_TTL    = 24 * 3600; // 24h
@@ -144,7 +145,9 @@ function parseRssItems(xml, indexerId, indexerName) {
       Size:        Number.isFinite(size) ? size : 0,
       Seeders:     seedersRaw ?? 1,
       _displaySeeds: seedersRaw ?? 0,
-      InfoHash:    attrs.infohash ? attrs.infohash.toLowerCase() : null,
+      InfoHash:    (attrs.infohash && /^[a-f0-9]{40}$/i.test(attrs.infohash))
+        ? attrs.infohash.toLowerCase()
+        : null,
       Tracker:     String(indexerId),
       TrackerId:   String(indexerId),
       _indexerName: indexerName || String(indexerId),

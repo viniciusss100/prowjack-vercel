@@ -1,6 +1,6 @@
 # 🎬 ProwJack
 
-**Addon Stremio v3.2.0 otimizado para Jackett/Prowlarr com suporte a Debrid, StremThru, P2P e qBittorrent HTTP**
+**Addon Stremio v3.2.1 otimizado para Jackett/Prowlarr com suporte a Debrid, StremThru, P2P e qBittorrent HTTP**
 
 ProwJack é um addon avançado para Stremio que integra indexadores Jackett/Prowlarr com serviços Debrid (Real-Debrid, TorBox), StremThru, P2P nativo e qBittorrent HTTP opcional, oferecendo streaming de alta qualidade com priorização inteligente de idioma PT-BR.
 
@@ -473,8 +473,25 @@ Contribuições são bem-vindas! Por favor:
 - Atualize o README se necessário
 
 ---
+## Changelog
 
-## 📝 Changelog
+### v3.2.1 (2026-06-07)
+
+- **Race condition no `streamWaiters`**: substituído `Map.has/set` não-atômico por lock baseado em `Promise` — elimina buscas duplicadas simultâneas para o mesmo conteúdo (ex: 3 buscas paralelas para o mesmo filme).
+- **Modo StremThru — streams não apareciam no Stremio**: manifest com `stConfig` agora redireciona `302` direto para a URL do proxy StremThru. O Stremio instala o addon StremThru nativamente, eliminando problemas de campos inválidos e `notWebReady`.
+- **`notWebReady: true` em streams StremThru**: `fetchScrapStreams` agora força `notWebReady: false` em todos os streams recebidos de addons externos.
+- **ID de config não-determinístico**: `saveStoredConfig` substituiu `randomBytes` por `sha256(JSON.stringify(prefs))` — mesmas configurações sempre geram o mesmo URL, evitando que o upstream mude a cada geração e invalide o cache.
+- **qBittorrent no modo StremThru**: upstream preserva `qbitMode` original — retorna P2P + qBit juntos; o StremThru converte os P2P em debrid e repassa os HTTP.
+- **Trackers privados sem P2P no upstream StremThru**: `isPrivateTracker` agora retorna `[qbitStream, p2pPrivate]` usando `EXTRA_TRACKERS` em vez de apenas `qbitStream` — permite ao StremThru converter para debrid.
+- **Formatação dupla em streams do scrap**: streams de addons externos com `infoHash` usam `name`/`description` originais em vez de `formatStream` do ProwJack.
+- **Links não reproduzíveis do scrap no modo debrid**: streams sem `infoHash` (links diretos, usenet) são descartados no modo debrid nativo.
+- **Arquivos não reproduzíveis (`.iso`, `.rar`, etc.)**: adicionado filtro `BAD_EXT_RE` — streams cujo arquivo selecionado tem extensão não-reproduzível são descartados.
+- **Login qBittorrent v5.x**: qBit >= 5 retorna HTTP 204 com body vazio no login em vez de `"Ok."` — aceita ambos os formatos.
+- **Logs de performance**: adicionados `[PERF] search=Xms`, `[PERF] debrid=Xms`, `[PERF] stremthru=Xms`, `[PERF] total=Xms`.
+- **Logs de pipeline**: adicionado `[DEBUG] Provider retornou: N | Candidatos: N | Com hash: N | Dedupe: N | Final: N`.
+- **UI — StremThru destacado e acima do Debrid Nativo**: seção StremThru com badge "Recomendado" e posicionada antes do Debrid Nativo na página de configuração.
+
+---
 
 ### v3.2.0 (2026-06-05)
 - **Persistência opcional em Postgres**: `cfg_...` pode ser salvo em `CONFIG_DATABASE_URL`, `POSTGRES_URL` ou `DATABASE_URL`, útil para Vercel/serverless sem volume persistente
@@ -540,11 +557,7 @@ Este projeto é distribuído sob a licença MIT. Veja o arquivo `LICENSE` para m
 
 ---
 
-## 📞 Suporte
 
-- **Issues**: [GitHub Issues](https://github.com/seu-usuario/prowjack-pro/issues)
-- **Discussões**: [GitHub Discussions](https://github.com/seu-usuario/prowjack-pro/discussions)
-- **Discord**: [Link do servidor](https://discord.gg/seu-servidor)
 
 ---
 

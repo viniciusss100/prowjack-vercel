@@ -154,6 +154,12 @@ const CACHE_VERSION = "v12-native-debrid";
 const STREAM_CACHE_VERSION = "v21-cache-scope-seed-filter";
 const TORRENT_DOWNLOAD_TIMEOUT_MS = 8000;
 const TORRENT_FAILURE_TTL = 10 * 60;
+const STREMTHRU_PROXY_TIMEOUT_MS = Math.max(3000, parseInt(process.env.STREMTHRU_PROXY_TIMEOUT_MS || "12000", 10) || 12000);
+
+// streamWaiters: Map de Promise (lock atômico).
+// Cada entrada é uma Promise que resolve com os streams finais.
+// Requests concorrentes para o mesmo cache key aguardam a Promise em andamento
+// em vez de disparar novas buscas — elimina a race condition do has/set não-atômico.
 const streamWaiters = new Map();
 
 function getPublicBase(req) {
@@ -288,7 +294,9 @@ function cfgStore() {
 }
 
 async function saveStoredConfig(prefs) {
-  const id = crypto.randomBytes(24).toString("base64url");
+  // ID determinístico baseado no hash do conteúdo — mesmas prefs sempre geram mesmo ID,
+  // evitando que o URL do upstream mude a cada geração no configure.html.
+  const id = crypto.createHash("sha256").update(JSON.stringify(prefs)).digest("base64url").slice(0, 32);
   if (shouldUseConfigDb()) {
     await cfgDbSave(id, prefs);
     return `cfg_${id}`;
@@ -305,7 +313,6 @@ async function buildStremThruProxyManifestUrl(req, prefs) {
   }
   const { stConfig, debrid, debridConfig, ...upstreamPrefs } = prefs;
   upstreamPrefs.enableP2P = true;
-  upstreamPrefs.qbitMode = "off";
   upstreamPrefs.debrid = false;
   delete upstreamPrefs.stConfig;
   delete upstreamPrefs.debridConfig;
@@ -318,7 +325,19 @@ async function buildStremThruProxyManifestUrl(req, prefs) {
     stores: prefs.stConfig.stores.map(s => ({ c: storeCodeMap[s.c] || s.c, t: s.t })),
     name: prefs.addonName || "ProwJack [ST]",
   }), "utf8").toString("base64");
-  return `${prefs.stConfig.url.replace(/\/+$/, "")}/stremio/wrap/${wrapEncoded}/manifest.json`;
+  return `${prefs.stConfig.url.replace(/\/+$/, "")}/stremio/wrap/${encodeURIComponent(wrapEncoded)}/manifest.json`;
+}
+
+function isQbitEnabledForPrefs(prefs, creds = null) {
+  if (prefs?.stConfig) return false;
+  if (prefs?.enableP2P === false) return false;
+  if (!["always", "private"].includes(String(prefs?.qbitMode || ""))) return false;
+  return isQbitConfigured(creds);
+}
+
+function shouldOfferQbitForResult(prefs, isPrivateTracker, creds = null) {
+  if (!isQbitEnabledForPrefs(prefs, creds)) return false;
+  return prefs.qbitMode === "always" || (prefs.qbitMode === "private" && isPrivateTracker);
 }
 
 function toBase64Url(value) {
@@ -2097,7 +2116,7 @@ app.delete("/api/metrics/:indexer", async (req, res) => {
 });
 app.get("/manifest.json", (_, res) => {
   res.json({
-    id: "org.prowjack.pro", version: "3.2.0", name: "ProwJack",
+    id: "org.prowjack.pro", version: "3.2.1", name: "ProwJack",
     description: "Qbittorrent+Prowlarr/Jackett+Debrid+Filtros por keywords e remendo para RD",
     resources: ["stream", "meta"], types: ["movie", "series"],
     idPrefixes: ["tt", "kitsu:", "rssmovie:", "rssmeta:", "rssitem:"],
@@ -2117,11 +2136,21 @@ app.get("/:userConfig/configure", (_, res) => sendConfigurePage(res));
 app.get("/", (_, res) => res.redirect("/configure"));
 app.get("/:userConfig/manifest.json", async (req, res) => {
   const prefs  = await resolvePrefs(req.params.userConfig);
+
+  // Modo StremThru: o manifest real é o do proxy — redireciona diretamente.
+  // Isso faz o Stremio instalar o addon StremThru (com streams debrid) em vez do ProwJack P2P.
+  if (prefs.stConfig) {
+    const proxyManifestUrl = await buildStremThruProxyManifestUrl(req, prefs).catch(() => null);
+    if (proxyManifestUrl) {
+      return res.redirect(302, proxyManifestUrl);
+    }
+  }
+
   const types  = [...new Set((prefs.categories || ["movie","series"]).map(c => c==="movies"?"movie":c==="anime"?"series":c))];
   const name   = prefs.addonName || "ProwJack";
   const isDebridActive = prefs.debrid && prefs.debridConfig &&
     (prefs.debridConfig.torboxKey || prefs.debridConfig.rdKey);
-  const hasP2P = !!prefs.stConfig || (!isDebridActive && prefs.enableP2P !== false);
+  const hasP2P = !isDebridActive && prefs.enableP2P !== false;
 
   const enabledCats = Array.isArray(prefs.categories) && prefs.categories.length ? prefs.categories : ["movie", "series"];
   const catalogs = [];
@@ -2130,15 +2159,13 @@ app.get("/:userConfig/manifest.json", async (req, res) => {
     if (enabledCats.includes("series")) catalogs.push({ type: "series", id: "prowjack_rss_series", name: `${name} — Lançamentos` });
   }
 
-  // Catálogos dos addons de scrap: instale o addon externo separadamente no Stremio.
-  // O ProwJack fornecerá streams filtrados para qualquer conteúdo que você acessar.
   res.json({
-    id: "org.prowjack.pro", version: "3.2.0", name,
+    id: "org.prowjack.pro", version: "3.2.1", name,
     description: "Qbittorrent+Prowlarr/Jackett+Debrid+Filtros por keywords e remendo para RD",
     resources: [
       "catalog",
       { name: "meta",   types, idPrefixes: ["rssmovie:", "rssmeta:", "prowjack:", "rssitem:"] },
-      { name: "stream", types }, // aceita qualquer ID
+      { name: "stream", types },
     ],
     types, idPrefixes: ["tt", "kitsu:", "rssmovie:", "rssmeta:", "prowjack:", "rssitem:"], catalogs,
     behaviorHints: { configurable: true, configurationRequired: false, p2p: hasP2P },
@@ -2566,7 +2593,7 @@ app.get("/:userConfig/qbit/:jobToken", async (req, res) => {
   const job = await loadQbitJob(req.params.jobToken);
   if (!job?.infoHash) return res.status(404).send("Job expirado ou inválido.");
   const qbitCreds = null;
-  if (!isQbitConfigured(qbitCreds)) return res.status(503).send("qBittorrent não configurado.");
+  if (!isQbitEnabledForPrefs(prefs, qbitCreds)) return res.status(404).send("qBittorrent desabilitado para esta configuração.");
 
   try {
     // 1. Verifica se já está disponível para reprodução imediata
@@ -2672,6 +2699,8 @@ async function fetchScrapStreams(manifestUrl, type, id, options = {}) {
           behaviorHints: {
             ...(s.behaviorHints || {}),
             filename: stripSourceBadges(s.behaviorHints?.filename || ""),
+            // notWebReady=true impede exibição no Stremio web/mobile — sempre forçar false
+            notWebReady: false,
           },
         };
         // Extrai título do campo name ou title para scoring de idioma/resolução
@@ -2724,10 +2753,12 @@ function renameScrapStreamForNativeDebrid(stream, prefs = {}) {
 }
 
 const BAD_RE = /\b(cam|hdcam|camrip|workprint)\b/i;
+const BAD_EXT_RE = /\.(iso|r\d{2}|zip|rar|7z|tar|gz|zipx|arj|txt|nfo|jpg|png|pdf|exe|bat|cmd|scr|msi|ps1|vbs|js|jar|com|pif|reg|dll|sys|lnk|url)$/i;
 app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
   const prefs = await resolvePrefs(req.params.userConfig);
   const isStremThruMode = !!prefs.stConfig;
   const qbitCreds = null;
+  const qbitEnabledForPrefs = isQbitEnabledForPrefs(prefs, qbitCreds);
   const { type, id } = req.params;
   console.log(`\n=========================================`);
   console.log(`NOVA BUSCA: [${type}] ${id}`);
@@ -2752,70 +2783,156 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       }
     } catch {}
   }
+  // Lock atômico: se já existe uma Promise em andamento para este cache key,
+  // aguarda ela resolver em vez de disparar nova busca (elimina a race condition).
   if (streamWaiters.has(streamCacheKey)) {
     console.log(`[Stream In-flight] aguardando resultado existente para ${id}`);
-    for (let i = 0; i < 120; i++) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      const waitedStreams = await rc.get(streamCacheKey).catch(() => null);
-      if (!waitedStreams) continue;
-      try {
-        const parsed = JSON.parse(waitedStreams);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          console.log(`[Stream In-flight HIT] ${parsed.length} streams para ${id}`);
-          console.log(`=========================================\n`);
-          return res.json({ streams: parsed });
-        }
-      } catch {}
-    }
+    try {
+      const inflightStreams = await Promise.race([
+        streamWaiters.get(streamCacheKey),
+        new Promise(resolve => setTimeout(() => resolve([]), 120000)),
+      ]);
+      if (Array.isArray(inflightStreams) && inflightStreams.length > 0) {
+        console.log(`[Stream In-flight HIT] ${inflightStreams.length} streams para ${id}`);
+        console.log(`=========================================\n`);
+        return res.json({ streams: inflightStreams });
+      }
+    } catch {}
     console.log(`[Stream In-flight] timeout; retornando vazio temporario para ${id}`);
     console.log(`=========================================\n`);
     return res.json({ streams: [] });
   }
-  streamWaiters.set(streamCacheKey, Date.now());
+
+  // Cria a Promise de lock ANTES de qualquer await — garante atomicidade
+  let _resolveLock;
+  const lockPromise = new Promise(resolve => { _resolveLock = resolve; });
+  streamWaiters.set(streamCacheKey, lockPromise);
+  // releaseLock: resolve a Promise com os streams finais e remove o lock
+  const releaseLock = (streams = []) => {
+    _resolveLock(streams);
+    streamWaiters.delete(streamCacheKey);
+  };
+  const _t0 = Date.now();
 
   try {
     const { parsed, displayTitle, aliases = [], queries, episode, year, search } = await buildQueries(type, id);
     const requestedImdbId = normalizeImdbId(search?.imdbId || parsed?.metaId);
 
+    // streamMeta: usado pelo formatStream em todo o fluxo (incluindo fallback StremThru)
+    const streamMeta = {
+      title: displayTitle,
+      year,
+      formattedSeasons: (type === "series" && parsed.season != null)
+        ? `S${String(parsed.season).padStart(2, "0")}${parsed.episode != null ? `E${String(parsed.episode).padStart(2, "0")}` : ""}`
+        : "",
+    };
+
     const enabledCats = Array.isArray(prefs.categories) && prefs.categories.length ? prefs.categories : ["movie", "series"];
-    if (parsed.isAnime && !enabledCats.includes("anime"))                       { streamWaiters.delete(streamCacheKey); return res.json({ streams: [] }); }
-    if (!parsed.isAnime && type === "series" && !enabledCats.includes("series")) { streamWaiters.delete(streamCacheKey); return res.json({ streams: [] }); }
-    if (type === "movie" && !enabledCats.includes("movie"))                      { streamWaiters.delete(streamCacheKey); return res.json({ streams: [] }); }
+    if (parsed.isAnime && !enabledCats.includes("anime"))                       { releaseLock(); return res.json({ streams: [] }); }
+    if (!parsed.isAnime && type === "series" && !enabledCats.includes("series")) { releaseLock(); return res.json({ streams: [] }); }
+    if (type === "movie" && !enabledCats.includes("movie"))                      { releaseLock(); return res.json({ streams: [] }); }
 
     if (isStremThruMode) {
+      const _stStart = Date.now();
       const maxOut = prefs.maxResults || 20;
       const proxyManifestUrl = await buildStremThruProxyManifestUrl(req, prefs);
-      const proxyStreams = proxyManifestUrl
-        ? await fetchScrapStreams(proxyManifestUrl, type, id, { timeout: 45000, label: "STREMTHRU" })
-        : [];
+
+      // Roda StremThru e busca Jackett em PARALELO.
+      // Se StremThru responder com streams, usa-os. Se falhar/timeout, usa os do Jackett como fallback.
+      const indexersForFallback = await resolveSearchIndexers(prefs, parsed.isAnime);
+      const [proxyStreams, jackettFallbackResults] = await Promise.all([
+        proxyManifestUrl
+          ? fetchScrapStreams(proxyManifestUrl, type, id, { timeout: STREMTHRU_PROXY_TIMEOUT_MS, label: "STREMTHRU" })
+          : Promise.resolve([]),
+        jackettSearch({ parsed, queries, search }, indexersForFallback, prefs),
+      ]);
+      console.log(`[PERF] stremthru=${Date.now() - _stStart}ms`);
+
       if (proxyStreams.length) {
-        proxyStreams.forEach(s => {
+        console.log(`[STREMTHRU] ${proxyStreams.length} streams do proxy retornados`);
+        const finalProxyStreams = proxyStreams.slice(0, maxOut).map(s => {
           if (!s.name || /^ProwJack\b/i.test(s.name)) {
             s.name = `${prefs.addonName || "ProwJack"}\n${s.name?.split("\n").slice(1).join("\n") || "⚡ Links [ST]"}`;
           }
-        });
-        console.log(`[STREMTHRU] ${proxyStreams.length} streams do proxy retornados`);
-        const finalProxyStreams = proxyStreams.slice(0, maxOut).map(s => {
-          delete s._cached;
-          delete s._sourceType;
-          delete s._scrapSource;
-          delete s._stremThruProxy;
-          delete s._title;
-          delete s._seeders;
-          delete s._sizeGb;
-          delete s._sizeBytes;
+          if (s.behaviorHints?.notWebReady) s.behaviorHints.notWebReady = false;
+          delete s._cached; delete s._sourceType; delete s._scrapSource;
+          delete s._stremThruProxy; delete s._title; delete s._seeders;
+          delete s._sizeGb; delete s._sizeBytes;
           return s;
         });
         await rc.set(streamCacheKey, JSON.stringify(finalProxyStreams), 10800).catch(() => {});
         console.log(`StremThru listados: Enviando ${finalProxyStreams.length} streams!`);
         console.log(`=========================================\n`);
-        streamWaiters.delete(streamCacheKey);
+        releaseLock(finalProxyStreams);
         return res.json({ streams: finalProxyStreams });
       }
-      console.log(`[STREMTHRU] Proxy não retornou streams para ${type}/${id}`);
+
+      // StremThru falhou ou retornou vazio — usa resultados do Jackett como fallback
+      console.log(`[STREMTHRU] Proxy não retornou streams — usando fallback Jackett (${jackettFallbackResults.length} brutos)`);
+      // Continua o fluxo normal com jackettFallbackResults como results
+      // (reutiliza o código abaixo injetando os resultados)
+      const _stFallbackResults = jackettFallbackResults;
+
+      // ── Bloco de filtros/resolução do fallback StremThru (espelho do fluxo normal) ──
+      const _stPriorityLang = prefs.priorityLang ?? "pt-br";
+      const _stCandidates = _stFallbackResults
+        .filter(r => r?.InfoHash || r?.MagnetUri || r?.Link)
+        .filter(r => {
+          const isPrio = isPriorityIndexerResult(r, prefs);
+          if (isPrio) r._priorityIndexer = true;
+          return isPrio || !prefs.skipBadReleases || !BAD_RE.test(r.Title || "");
+        })
+        .filter(r => r._priorityIndexer || type !== "movie" || !looksLikeEpisodeRelease(r.Title || ""))
+        .filter(r => {
+          if (r._priorityIndexer || !prefs.onlyDubbed || !_stPriorityLang) return true;
+          const langs = getLangs(r.Title || "", parsed.isAnime);
+          return langs.some(l => l.code === _stPriorityLang);
+        })
+        .map(r => {
+          r._originalScore = ((r._priorityIndexer ? 1 : 0) * 5000000) + score(r, prefs.weights, parsed.isAnime, _stPriorityLang);
+          return r;
+        })
+        .sort((a, b) => b._originalScore - a._originalScore)
+        .slice(0, maxOut * 3);
+
+      console.log(`[DEBUG] StremThru fallback: ${_stFallbackResults.length} brutos → ${_stCandidates.length} candidatos`);
+
+      const _stWithHashes = (await (async () => {
+        const _res = new Array(_stCandidates.length).fill(null);
+        const CONC = 10;
+        let _idx = 0;
+        async function _worker() {
+          while (_idx < _stCandidates.length) {
+            const i = _idx++;
+            const resolved = await resolveInfoHash(_stCandidates[i]);
+            _res[i] = resolved?.infoHash ? { ..._stCandidates[i], _resolved: resolved } : null;
+          }
+        }
+        await Promise.all(Array.from({ length: CONC }, _worker));
+        return _res;
+      })()).filter(Boolean);
+
+      const _stStreams = _stWithHashes.slice(0, maxOut).map(r => {
+        const resolved = r._resolved;
+        if (!resolved.infoHash) return null;
+        const indexerName = r._indexerName || r.Tracker || r.TrackerId || r.Indexer || "Unknown";
+        const { name, description } = formatStream(r, indexerName, parsed.isAnime, prefs, true, streamMeta);
+        let trackerList = [];
+        if (resolved.buffer) { trackerList = extractTrackers(resolved.buffer); }
+        else if (r.MagnetUri) { for (const m of (r.MagnetUri.matchAll(/[&?]tr=([^&]+)/g) || [])) { try { trackerList.push(decodeURIComponent(m[1])); } catch {} } }
+        const sources = (trackerList.length ? trackerList : EXTRA_TRACKERS).map(t => `tracker:${t}`).concat(`dht:${resolved.infoHash}`);
+        return { name, description, infoHash: resolved.infoHash, sources, behaviorHints: { notWebReady: false } };
+      }).filter(Boolean);
+
+      const _stFinal = _stStreams.slice(0, maxOut);
+      console.log(`[DEBUG] StremThru fallback Jackett: ${_stFinal.length} streams finais`);
+      if (_stFinal.length > 0) {
+        await rc.set(streamCacheKey, JSON.stringify(_stFinal), 10800).catch(() => {});
+      }
+      console.log(`[STREMTHRU] Fallback: Enviando ${_stFinal.length} streams P2P!`);
       console.log(`=========================================\n`);
-      streamWaiters.delete(streamCacheKey);
-      return res.json({ streams: [] });
+      releaseLock(_stFinal);
+      return res.json({ streams: _stFinal });
     }
 
     const indexers     = await resolveSearchIndexers(prefs, parsed.isAnime);
@@ -2840,7 +2957,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         usedRssFastPath = true;
         console.log(`[RSS Fast-path] ${results.length} resultados do cache RSS para ${parsed.metaId}`);
       } else {
-        streamWaiters.delete(streamCacheKey);
+        releaseLock();
         return res.json({ streams: [] });
       }
     } else if (parsed.source === "rssitem" && parsed.rssToken) {
@@ -2850,7 +2967,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         results = [{ ...exactItem, _metaIdMatch: true, _titleMatchScore: 1, _rssPreferred: true, _rssOrder: 0 }];
         usedRssFastPath = true;
       } else {
-        streamWaiters.delete(streamCacheKey);
+        releaseLock();
         return res.json({ streams: [] });
       }
     } else if (parsed.source === "rssitem") {
@@ -2867,7 +2984,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         results = exactItems.map((item, idx) => ({ ...item, _metaIdMatch: true, _titleMatchScore: 1, _rssPreferred: true, _rssOrder: idx }));
         usedRssFastPath = true;
       } else {
-        streamWaiters.delete(streamCacheKey);
+        releaseLock();
         return res.json({ streams: [] });
       }
     } else if (requestedImdbId || aliases.length) {
@@ -2924,7 +3041,9 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
     if (!isOwnRssCatalogItem) {
       // Busca Jackett
+      const _tSearch = Date.now();
       const jackettResults = await jackettSearch({ parsed, queries, search }, indexers, prefs);
+      console.log(`[PERF] search=${Date.now() - _tSearch}ms (${jackettResults.length} resultados)`);
       results = [...rssMatchedResults, ...jackettResults];
       if (rssMatchedResults.length) {
         console.log(`[RSS + Live] ${rssMatchedResults.length} resultados RSS combinados com ${jackettResults.length} resultados ao vivo`);
@@ -3132,6 +3251,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     let tbCacheMap = {};
 
     if (isDebridMode && !prefs.stConfig && withHashes.length > 0) {
+      const _tDebrid = Date.now();
       const { mode, torboxKey, rdKey } = prefs.debridConfig;
       const { rdBatchCheckCache, torboxBatchCheckCache } = require("./debrid");
 
@@ -3183,6 +3303,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
         }
       });
       console.log(`[DEBRID] cached=${debridCached.size} uncached=${withHashes.length - debridCached.size}`);
+      console.log(`[PERF] debrid=${Date.now() - _tDebrid}ms`);
     } else if (prefs.stConfig) {
       console.log(`[STREMTHRU] Proxy ativo - cache check desabilitado`);
     }
@@ -3238,27 +3359,29 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       console.log(`[LIMIT] resolvendo ${streamCandidates.length}/${dedupedWithHashes.length} candidatos após cache/prioridade`);
     }
 
-    const streamMeta = {
-      title: displayTitle,
-      year,
-      formattedSeasons: (type === "series" && parsed.season != null)
-        ? `S${String(parsed.season).padStart(2, "0")}${parsed.episode != null ? `E${String(parsed.episode).padStart(2, "0")}` : ""}`
-        : "",
-    };
+    // streamMeta definido antes do bloco StremThru (linha ~2812)
 
     const resolvedAll = await Promise.all(
       streamCandidates.map(async r => {
         try {
-          // Candidato do scrap sem infoHash (link direto, usenet, etc): retorna direto
+          // Scrap sem infoHash (link direto, usenet): no modo debrid não é útil — descartar.
+          // No modo P2P passa direto pois o stream já está resolvido.
           if (r._scrapSource && r._scrapStream && !r._resolved?.infoHash) {
-          return r._scrapStream;
-    }
+            if (isDebridMode) return null;
+            return r._scrapStream;
+          }
           
           const resolved     = r._resolved;
           const indexerName  = r._indexerName || r.Tracker || r.TrackerId || r.Indexer || "Unknown";
           const rdExcluded   = isRdExcludedResult(r, prefs, indexerName);
-          const { name, description: descNoSeeds, resLabel } = formatStream(r, indexerName, parsed.isAnime, prefs, false, streamMeta);
-          const { description } = formatStream(r, indexerName, parsed.isAnime, prefs, true, streamMeta);
+          // Scrap com infoHash: usa name/description originais do stream (já formatados pelo addon externo)
+          const isScrap = !!(r._scrapSource && r._scrapStream);
+          const { name, description: descNoSeeds, resLabel } = isScrap
+            ? { name: r._scrapStream.name || "", description: r._scrapStream.description || "", resLabel: "" }
+            : formatStream(r, indexerName, parsed.isAnime, prefs, false, streamMeta);
+          const { description } = isScrap
+            ? { description: r._scrapStream.description || "" }
+            : formatStream(r, indexerName, parsed.isAnime, prefs, true, streamMeta);
           const matchedFile  = (type === "series" || parsed.isAnime)
             ? pickEpisodeFile(resolved.files, parsed.season, parsed.episode ?? episode, parsed.isAnime)
             : null;
@@ -3275,9 +3398,11 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
             : null);
           const displayFileName = displayFile?.name || r.Title || "";
           const filenameLine = displayFileName ? `📂 ${displayFileName}` : "";
+          // Descarta streams cujo arquivo selecionado não é reproduzível (iso, rar, zip, etc.)
+          if (displayFile?.name && BAD_EXT_RE.test(displayFile.name)) return null;
           const magnet      = buildMagnet(resolved.infoHash, r.MagnetUri, r.Title);
           const publicBase  = getPublicBase(req);
-          const localPlayable = !isDebridMode && !prefs.stConfig && isQbitConfigured(qbitCreds)
+          const localPlayable = !isDebridMode && qbitEnabledForPrefs
             ? await getPlayableLocalFile(resolved.infoHash, matchedFile?.idx ?? null, matchedFile?.name || null, qbitCreds).catch(() => null)
             : null;
 
@@ -3354,8 +3479,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
             if (!debridData) {
               // Tracker privado sem cache no debrid: oferecer qBit se habilitado
-              if (!prefs.stConfig && prefs.enableP2P && isQbitConfigured(qbitCreds) && isPrivateTracker && resolved.buffer &&
-                  (prefs.qbitMode === 'always' || prefs.qbitMode === 'private')) {
+              if (shouldOfferQbitForResult(prefs, isPrivateTracker, qbitCreds) && resolved.buffer) {
                 return buildQbitStream();
               }
               return null;
@@ -3420,13 +3544,9 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
                   behaviorHints: { filename: displayFileName, videoSize: displayFile?.size, notWebReady: true },
                 };
 
-                if (!prefs.stConfig && prefs.enableP2P && isQbitConfigured(qbitCreds)) {
-                  const shouldOfferQbit = prefs.qbitMode === 'always' ||
-                    (prefs.qbitMode === 'private' && isPrivateTracker);
-                  if (shouldOfferQbit) {
-                    const qbitOption = await buildQbitStream();
-                    return [debridOption, qbitOption];
-                  }
+                if (shouldOfferQbitForResult(prefs, isPrivateTracker, qbitCreds)) {
+                  const qbitOption = await buildQbitStream();
+                  return [debridOption, qbitOption];
                 }
 
                 return debridOption;
@@ -3436,14 +3556,22 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
           }
 
           // ── Modo P2P (sem debrid) ──────────────────────────────────────
-          const shouldOfferQbit = !prefs.stConfig && prefs.enableP2P && isQbitConfigured(qbitCreds) &&
-            (prefs.qbitMode === 'always' || (prefs.qbitMode === 'private' && isPrivateTracker));
+          const shouldOfferQbit = shouldOfferQbitForResult(prefs, isPrivateTracker, qbitCreds);
 
           if (shouldOfferQbit && (localPlayable || r.Link || magnet)) {
             const qbitStream = await buildQbitStream();
 
             if (isPrivateTracker && !r.MagnetUri) {
-              return qbitStream;
+              if (!resolved.infoHash) return qbitStream;
+              const sources = EXTRA_TRACKERS.map(t => `tracker:${t}`).concat(`dht:${resolved.infoHash}`);
+              const p2pPrivate = {
+                name, description: [description, filenameLine].filter(Boolean).join("\n"),
+                infoHash: resolved.infoHash, sources,
+                _sourceType: "p2p", _priorityIndexer: !!r._priorityIndexer,
+                behaviorHints: { filename: displayFileName, bingeGroup: `prowjack|${resolved.infoHash}` },
+              };
+              if (matchedFile?.idx != null) p2pPrivate.fileIdx = matchedFile.idx;
+              return [qbitStream, p2pPrivate];
             }
 
             let _qbitTrackers = [];
@@ -3541,7 +3669,9 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
 
     if (prefs.stConfig) {
       const proxyManifestUrl = await buildStremThruProxyManifestUrl(req, prefs);
-      const proxyStreams = proxyManifestUrl ? await fetchScrapStreams(proxyManifestUrl, type, id) : [];
+      const proxyStreams = proxyManifestUrl
+        ? await fetchScrapStreams(proxyManifestUrl, type, id, { timeout: STREMTHRU_PROXY_TIMEOUT_MS, label: "STREMTHRU" })
+        : [];
       if (proxyStreams.length) {
         proxyStreams.forEach(s => {
           s._sourceType = "debrid";
@@ -3687,8 +3817,13 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       delete s.indexer; // Campo não usado pelo Stremio
     });
 
+    if (finalStreams.length > 0) {
+      const topFinal = finalStreams.slice(0, Math.min(5, finalStreams.length))
+        .map(s => `${(s.name || "").split("\n")[0]} => ${(s.behaviorHints?.filename || s.title || s.description || "").slice(0, 60)}`);
+      console.log(`[FINAL] top${topFinal.length}: ${topFinal.join(" | ")}`);
+    }
     if (isDebridMode) {
-      const cached = finalStreams.filter(s => s.url && !s.url.includes('/debrid-add/')).length;
+      const cached = finalStreams.filter(s => s.externalUrl || (s.url && !s.url.includes('/debrid-add/'))).length;
       const queued = finalStreams.filter(s => s.url &&  s.url.includes('/debrid-add/')).length;
       console.log(`[DEBRID] Streams listados: ${cached} ⚡️ cached + ${queued} ⬇️ on-demand`);
     } else {
@@ -3699,17 +3834,19 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     if (finalStreams.length > 0) {
       rc.set(streamCacheKey, JSON.stringify(finalStreams), 10800).catch(() => {});
     }
-    streamWaiters.delete(streamCacheKey);
+    console.log(`[DEBUG] Provider retornou: ${results.length} | Candidatos: ${candidates.length} | Com hash: ${withHashes.length} | Dedupe: ${dedupedWithHashes.length} | Final: ${finalStreams.length}`);
+    console.log(`[PERF] total=${Date.now() - _t0}ms`);
+    releaseLock(finalStreams);
     res.json({ streams: finalStreams });
   } catch (err) {
     console.log(`Erro no processamento: ${err.message}`);
-    streamWaiters.delete(streamCacheKey);
+    releaseLock([]);
     res.json({ streams: [] });
   }
 });
 
 app.listen(ENV.port, () => {
-  console.log(`ProwJack v3.2.0 -> http://localhost:${ENV.port}/configure`);
+  console.log(`ProwJack v3.2.1 -> http://localhost:${ENV.port}/configure`);
   console.log(`   Jackett : ${ENV.jackettUrl}`);
   console.log(`   Redis   : ${ENV.redisUrl}`);
   console.log(`   qBittorrent: ${isQbitConfigured() ? "ativo" : "desativado"}`);

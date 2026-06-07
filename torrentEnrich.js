@@ -16,24 +16,40 @@ const EXTRA_TRACKERS = [
   "https://tracker.ghostchu-services.top:443/announce",
 ];
 
-function bdecode(buf, offset = 0) {
+const MAX_BENCODE_DEPTH = 50;
+const MAX_TORRENT_SIZE  = 10 * 1024 * 1024; // 10 MB
+
+function bdecode(buf, offset = 0, depth = 0) {
+  if (depth > MAX_BENCODE_DEPTH) throw new Error("bdecode: profundidade máxima excedida");
+  if (offset >= buf.length)       throw new Error("bdecode: offset fora do buffer");
   const ch = buf[offset];
   if (ch === 0x69) {
     const end = buf.indexOf(0x65, offset + 1);
+    if (end === -1) throw new Error("bdecode: inteiro não terminado");
     return { value: parseInt(buf.slice(offset + 1, end).toString("ascii"), 10), end: end + 1 };
   }
   if (ch === 0x6c) {
     const list = []; let i = offset + 1;
-    while (buf[i] !== 0x65) { const item = bdecode(buf, i); list.push(item.value); i = item.end; }
+    while (i < buf.length && buf[i] !== 0x65) {
+      const item = bdecode(buf, i, depth + 1);
+      list.push(item.value);
+      i = item.end;
+    }
     return { value: list, end: i + 1 };
   }
   if (ch === 0x64) {
     const dict = {}; let i = offset + 1;
-    while (buf[i] !== 0x65) { const k = bdecode(buf, i); i = k.end; const v = bdecode(buf, i); i = v.end; dict[k.value.toString("ascii")] = v.value; }
+    while (i < buf.length && buf[i] !== 0x65) {
+      const k = bdecode(buf, i, depth + 1); i = k.end;
+      const v = bdecode(buf, i, depth + 1); i = v.end;
+      dict[k.value.toString("ascii")] = v.value;
+    }
     return { value: dict, end: i + 1 };
   }
   const colon = buf.indexOf(0x3a, offset);
+  if (colon === -1) throw new Error("bdecode: string sem separador");
   const len = parseInt(buf.slice(offset, colon).toString("ascii"), 10);
+  if (!Number.isFinite(len) || len < 0 || colon + 1 + len > buf.length) throw new Error("bdecode: comprimento de string inválido");
   return { value: buf.slice(colon + 1, colon + 1 + len), end: colon + 1 + len };
 }
 
@@ -85,6 +101,10 @@ function extractInfoRaw(buf) {
 
 function injectTrackers(buffer, extraTrackers = EXTRA_TRACKERS) {
   try {
+    if (!Buffer.isBuffer(buffer) || buffer.length > MAX_TORRENT_SIZE) {
+      if (buffer?.length > MAX_TORRENT_SIZE) console.warn(`[torrentEnrich] Torrent muito grande (${buffer.length} bytes), ignorando enriquecimento`);
+      return buffer;
+    }
     const torrent = bdecode(buffer, 0).value;
     if (typeof torrent !== "object" || Array.isArray(torrent)) return buffer;
 
