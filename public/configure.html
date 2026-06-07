@@ -184,7 +184,7 @@ hr{border:none;border-top:1px solid var(--bord);margin:14px 0}
   <div class="logo">
     <div class="logo-mark">🎬</div>
     <div>
-      <span class="logo-text">Prow<span>Jack</span><span class="logo-ver">v3.2.0</span></span>
+      <span class="logo-text">Prow<span>Jack</span><span class="logo-ver">v3.2.1</span></span>
       <div style="font-size:11px;color:var(--dim);margin-top:2px">Jackett · Prowlarr · Stremio</div>
     </div>
   </div>
@@ -369,48 +369,8 @@ hr{border:none;border-top:1px solid var(--bord);margin:14px 0}
         <hr/>
 
         <label style="display:flex;align-items:center;gap:9px;cursor:pointer;margin-bottom:10px">
-          <input type="checkbox" id="useNativeDebrid" style="width:15px;height:15px;accent-color:var(--amber)" onchange="toggleDebridMode()"/>
-          <span style="font-size:13px;font-weight:500">Debrid Nativo (TorBox / Real-Debrid direto)</span>
-        </label>
-        <div class="debrid-panel tb-panel" id="nativeDebridConfig">
-          <div class="panel-title tb">Chaves de API</div>
-          <div class="g2">
-            <div>
-              <label class="lbl">TorBox API Key</label>
-              <input type="password" id="tbKey" placeholder="Opcional" style="margin-bottom:0"/>
-            </div>
-            <div>
-              <label class="lbl">Real-Debrid API Key</label>
-              <input type="password" id="rdKey" placeholder="Opcional" style="margin-bottom:0"/>
-            </div>
-          </div>
-          <div class="info mt8">Configure ao menos uma das chaves acima.</div>
-          <hr/>
-          <div class="panel-title rd">Exclusões Real-Debrid</div>
-          <div class="g2">
-            <div>
-              <label class="lbl">Qualidades bloqueadas</label>
-              <input type="text" id="rdExcludeQualities" placeholder="WEB-DL, WEBRip, DVDRip, AMZ"  value="WEB-DL, WEBDL, WEBRip, WEB-Rip, DVDRip, AMZN, DSNP"/>
-            </div>
-            <div>
-              <label class="lbl">Indexers bloqueados</label>
-              <input type="text" id="rdExcludeIndexers" placeholder="rartv, rarbg, eztv"  value="rartv, rarbg, eztv"/>
-            </div>
-            <div>
-              <label class="lbl">Release groups bloqueados</label>
-              <input type="text" id="rdExcludeGroups" placeholder="YTS, Erai-raws"  value="YTS, Erai-raws, CR"/>
-            </div>
-            <div>
-              <label class="lbl">Keywords gerais</label>
-              <input type="text" id="rdExcludeKeywords" placeholder="infringing, termo1, termo2"/>
-            </div>
-          </div>
-          <div class="info mt8">Aplicado somente aos streams do Real-Debrid. TorBox continua usando os mesmos resultados.</div>
-        </div>
-
-        <label style="display:flex;align-items:center;gap:9px;cursor:pointer;margin-bottom:10px">
           <input type="checkbox" id="useStremThru" style="width:15px;height:15px;accent-color:var(--amber)" onchange="toggleDebridMode()"/>
-          <span style="font-size:13px;font-weight:500">Proxy Debrid via StremThru</span>
+          <span style="font-size:13px;font-weight:600">⚡ Proxy Debrid via StremThru <span style="font-size:11px;background:rgba(108,143,255,.18);color:#6c8fff;padding:2px 7px;border-radius:10px;margin-left:4px">Recomendado</span></span>
         </label>
         <div class="debrid-panel st-panel" id="stremThruConfig">
           <div class="panel-title st">StremThru</div>
@@ -453,6 +413,45 @@ hr{border:none;border-top:1px solid var(--bord);margin:14px 0}
               <input type="text" id="stToken2" placeholder="Opcional" style="margin-bottom:0"/>
             </div>
           </div>
+        </div>
+
+        <label style="display:flex;align-items:center;gap:9px;cursor:pointer;margin-bottom:10px">
+          <input type="checkbox" id="useNativeDebrid" style="width:15px;height:15px;accent-color:var(--amber)" onchange="toggleDebridMode()"/>
+          <span style="font-size:13px;font-weight:500">Debrid Nativo (TorBox / Real-Debrid direto)</span>
+        </label>
+        <div class="debrid-panel tb-panel" id="nativeDebridConfig">
+          <div class="g2">
+            <div>
+              <label class="lbl">TorBox API Key</label>
+              <input type="password" id="tbKey" placeholder="Opcional" style="margin-bottom:0"/>
+            </div>
+            <div>
+              <label class="lbl">Real-Debrid API Key</label>
+              <input type="password" id="rdKey" placeholder="Opcional" style="margin-bottom:0"/>
+            </div>
+          </div>
+          <div class="info mt8">Configure ao menos uma das chaves acima.</div>
+          <hr/>
+          <div class="panel-title rd">Exclusões Real-Debrid</div>
+          <div class="g2">
+            <div>
+              <label class="lbl">Qualidades bloqueadas</label>
+              <input type="text" id="rdExcludeQualities" placeholder="WEB-DL, WEBRip, DVDRip, AMZ"  value="WEB-DL, WEBDL, WEBRip, WEB-Rip, DVDRip, AMZN, DSNP"/>
+            </div>
+            <div>
+              <label class="lbl">Indexers bloqueados</label>
+              <input type="text" id="rdExcludeIndexers" placeholder="rartv, rarbg, eztv"  value="rartv, rarbg, eztv"/>
+            </div>
+            <div>
+              <label class="lbl">Release groups bloqueados</label>
+              <input type="text" id="rdExcludeGroups" placeholder="YTS, Erai-raws"  value="YTS, Erai-raws, CR"/>
+            </div>
+            <div>
+              <label class="lbl">Keywords gerais</label>
+              <input type="text" id="rdExcludeKeywords" placeholder="infringing, termo1, termo2"/>
+            </div>
+          </div>
+          <div class="info mt8">Aplicado somente aos streams do Real-Debrid. TorBox continua usando os mesmos resultados.</div>
         </div>
 
         <label style="display:flex;align-items:center;gap:9px;cursor:pointer;margin-bottom:10px">
@@ -507,6 +506,10 @@ const state = {
   jkMode: 'global',
   loadedPrefs: null,
 };
+
+function encodeWrapPayload(value) {
+  return encodeURIComponent(btoa(unescape(encodeURIComponent(String(value || '')))));
+}
 
 // ── Navegação por seções ──────────────────────────────────────────
 function showSection(btn) {
@@ -841,29 +844,27 @@ async function generate(openManifest = false) {
   try {
     const prefs = buildPrefs();
 
-    // StremThru Wrap
+    // StremThru Wrap: exibe a URL direta do proxy StremThru para instalação no Stremio
     if (prefs.stConfig) {
       const { stConfig, debrid, ...prowjackPrefs } = prefs;
       prowjackPrefs.enableP2P = true;
-      prowjackPrefs.qbitMode = 'off';
       const upstreamRef = await saveServerConfig(prowjackPrefs);
       const prowjackManifest = `${location.origin}/${upstreamRef}/manifest.json`;
       const storeCodeMap = { torbox:'tb', realdebrid:'rd', alldebrid:'ad', debridlink:'dl', premiumize:'pm', offcloud:'oc' };
-      const wrapEncoded = btoa(JSON.stringify({
+      const wrapEncoded = encodeWrapPayload(JSON.stringify({
         upstreams: [{ u: prowjackManifest }],
         stores: prefs.stConfig.stores.map(s => ({ c: storeCodeMap[s.c]||s.c, t: s.t })),
-        name: 'ProwJack [ST]',
+        name: prefs.addonName || 'ProwJack [ST]',
       }));
-      prefs.stConfig.proxyManifestUrl = `${prefs.stConfig.url}/stremio/wrap/${wrapEncoded}/manifest.json`;
-      const configRef = await saveServerConfig(prefs);
-      history.replaceState({}, '', `/${configRef}/configure`);
-      const finalUrl = `${location.origin}/${configRef}/manifest.json`;
+      const proxyManifestUrl = `${prefs.stConfig.url.replace(/\/+$/, '')}/stremio/wrap/${wrapEncoded}/manifest.json`;
       if (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
         alert("⚠️ Usando 'localhost' — o StremThru remoto não conseguirá acessar. Use seu IP ou domínio público!");
-      setInstallUrl(finalUrl, `stremio://${location.host}/${configRef}/manifest.json`);
-      toast('✔ URL ProwJack + StremThru gerada!', 'ok');
-      if (openManifest) window.open(finalUrl, '_blank', 'noopener');
-      return finalUrl;
+      // URL final = proxy StremThru direto (sem passar pelo ProwJack)
+      const stremioUrl = `stremio://${new URL(proxyManifestUrl).host}${new URL(proxyManifestUrl).pathname}`;
+      setInstallUrl(proxyManifestUrl, stremioUrl);
+      toast('✔ URL StremThru gerada!', 'ok');
+      if (openManifest) window.open(proxyManifestUrl, '_blank', 'noopener');
+      return proxyManifestUrl;
     }
 
     const configRef = await saveServerConfig(prefs);
