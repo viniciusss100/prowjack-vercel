@@ -3830,8 +3830,8 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
     if (req.hostname && req.hostname.includes("vercel")) {
       finalStreams.unshift({
         name: "⚠️ MIGRAR HOSPEDAGEM",
-        description: "A hospedagem Vercel sera pausada em breve por exceder os limites.\nClique aqui para configurar o ProwJack na nova hospedagem do Hugging Face.",
-        externalUrl: "https://refilla-prowjack.hf.space",
+        description: "A hospedagem Vercel sera pausada em breve por exceder os limites.\nClique aqui para configurar o ProwJack na nova hospedagem.",
+        externalUrl: "https://refilla-prowjack.hf.space/configure",
       });
     }
     if (isDebridMode) {
