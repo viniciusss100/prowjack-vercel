@@ -3831,7 +3831,7 @@ app.get("/:userConfig/stream/:type/:id.json", async (req, res) => {
       finalStreams.unshift({
         name: "⚠️ MIGRAR HOSPEDAGEM",
         description: "A hospedagem Vercel foi descontinuada.\nClique aqui para configurar o ProwJack na nova hospedagem do Hugging Face.",
-        externalUrl: "https://huggingface.co/spaces/seu-usuario/prowjack",
+        externalUrl: "https://refilla-prowjack.hf.space",
       });
     }
     if (isDebridMode) {
