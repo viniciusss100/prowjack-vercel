@@ -288,7 +288,7 @@ hr{border:none;border-top:1px solid var(--bord);margin:14px 0}
         <div class="info" style="margin-top:-4px;margin-bottom:12px">Catálogo RSS requer uma instância persistente (VPS/Docker) ou worker/cron externo alimentando o Redis. Em Vercel/serverless, o poller interno não roda de forma confiável.</div>
 
         <label class="lbl">⭐ Boost por Keywords</label>
-        <input type="text" id="keywordBoost" placeholder="ex: dual-bioma  ou  brremux  (palavras inteiras)" value="DUBLADO|PORTUGUES|POR-BR|BRAZILIAN|dual-alfahd|dual-bioma|dual-riper|dual-pia|dual-c76|dual-sigla|dual-madruga|dual-lcd|dual-anonimo|dual-lmb|dual-eri|dual-bad|dual-plushd|dual-byoutou|dual-sherlock|dual-anonymous07|dual-big|dual-yatogam1|dual-fido|dual-asy|dual-g4ris|dual-rk|dual-master|dual-foxx|dual-gueira|dual-cory|dual-piratadigital|dual-rlee|dual-asm|dual-xprince00|dual-sh4down|dual-azx|dual-bnd|dual-princeputt20|dual-professor_X|dual-aconduta|dual-znm|dual-ntz|dual-shaka|dual-n3g4n|dual-plushd|dual-brhd|dual-sacerdoti|dual-kallango|dual-upd|dual-gmn|dual-filehd|dual-freedomhd|dual-zmg|dual-lapumia|dual-extr3muss|dual-dks|dual-got|dual-100real|dual-nous3r|dual-wtv|dual-vnlls|dual-bdc|dual-izards|dual-rarbr|dual-emmid|dual-estagiario|dual-fantasma223|dual-shelby|dual-joekerr|dual-cbr|dual-xiquexique|dual-oscarniemeyer|dual-olympus|dual-tars|dual-wyrm|dual-adamantium|dual-dalmaciojr|dual-3lton|dual-mdg|dual-cza|dual-tupac|dual-tijuco|dual-gris|dual-ltda|dual-elm4g0|dual-fly|dual-franzopl|dual-troidex|dual-nex|dual-jus|dual-thr|dual-mlh|dual-amantedoharpia|dual-potatin|dual-lukas|dual-lucano22|dual-witchhunter|dual-c0ral|dual-eck|dual-fabr|dual-xar|dual-tossato|dual-spaghettimancer|dual-levaculik|dual-thecs|dual-freddiegellar|dual-ro455|dual-inss|dual-Unknown96|dual-7sprite7|dual-andrehsa|dual-titans|dual-siz3d|dual-Netope"/>
+        <input type="text" id="keywordBoost" placeholder="ex: dual-bioma  ou  brremux  (palavras inteiras)" value="DUBLADO|1-sf|PORTUGUES|POR-BR|BRAZILIAN|dual-(?!audio|lat|spa|fre|eng|turko)"/>
         <div class="info" style="margin-top:-8px;margin-bottom:12px">Cada palavra é verificada como termo completo. Separe por espaço para exigir múltiplas palavras.</div>
 
         <div class="g3">
@@ -415,7 +415,7 @@ hr{border:none;border-top:1px solid var(--bord);margin:14px 0}
           </div>
         </div>
 
-        <label style="display:none;align-items:center;gap:9px;cursor:pointer;margin-bottom:10px">
+        <label style="display:flex;align-items:center;gap:9px;cursor:pointer;margin-bottom:10px">
           <input type="checkbox" id="useNativeDebrid" style="width:15px;height:15px;accent-color:var(--amber)" onchange="toggleDebridMode()"/>
           <span style="font-size:13px;font-weight:500">Debrid Nativo (TorBox / Real-Debrid direto)</span>
         </label>
@@ -454,11 +454,11 @@ hr{border:none;border-top:1px solid var(--bord);margin:14px 0}
           <div class="info mt8">Aplicado somente aos streams do Real-Debrid. TorBox continua usando os mesmos resultados.</div>
         </div>
 
-        <label style="display:none;align-items:center;gap:9px;cursor:pointer;margin-bottom:10px">
+        <label style="display:flex;align-items:center;gap:9px;cursor:pointer;margin-bottom:10px">
           <input type="checkbox" id="enableP2P" style="width:15px;height:15px;accent-color:var(--amber)" onchange="toggleQbitMode()"/>
           <span style="font-size:13px;font-weight:500">qBittorrent HTTP</span>
         </label>
-        <div class="info" style="display:none;margin-left:24px;margin-bottom:10px">Opcional. Só funciona em instância auto-hospedada com <code>QBIT_URL</code>, <code>QBIT_USER</code> e <code>QBIT_PASS</code> no <code>.env</code>. Magnet links nativos continuam ativos sem qBittorrent quando não há Debrid.</div>
+        <div class="info" style="margin-left:24px;margin-bottom:10px">Opcional. Só funciona em instância auto-hospedada com <code>QBIT_URL</code>, <code>QBIT_USER</code> e <code>QBIT_PASS</code> no <code>.env</code>. Magnet links nativos continuam ativos sem qBittorrent quando não há Debrid.</div>
         <div class="debrid-panel qbit-panel" id="qbitModeConfig">
           <div class="panel-title qbit">qBittorrent</div>
           <label class="lbl">Modo</label>
